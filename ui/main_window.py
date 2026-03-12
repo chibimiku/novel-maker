@@ -29,12 +29,22 @@ class NovelCreatorWindow(QMainWindow):
         self.current_editing_node = None  # 当前正在编辑器中编辑的节点字典数据
         self.current_editing_item = None  # 当前在树状视图中选中的 QTreeWidgetItem 实例
         self.current_setting_path = None  # 【新增】当前编辑的设定文件绝对路径
+        self.node_map = {}                # 【新增】节点内存引用的绝对映射表
         
         # 加载配置并初始化 LLM 客户端
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config) if self.config else None
 
         self.init_ui()
+
+    def _get_item_level(self, item):
+        """计算当前树节点的层级深度 (1=章, 2=节, 3=场景)"""
+        level = 1
+        p = item.parent()
+        while p:
+            level += 1
+            p = p.parent()
+        return level
 
     def _load_config(self) -> dict:
         """读取系统配置文件 conf/setting.json"""
@@ -51,80 +61,86 @@ class NovelCreatorWindow(QMainWindow):
         return {}
 
     def init_ui(self):
-        # ================= 1. 顶部菜单栏 ================= #
         menubar = self.menuBar()
         file_menu = menubar.addMenu('文件')
-        
         open_action = file_menu.addAction('打开/创建工作区')
         open_action.triggered.connect(self.open_workspace)
-        
         save_action = file_menu.addAction('保存全部')
         save_action.triggered.connect(self.save_all)
-        
         setting_menu = menubar.addMenu('设置')
-        # 替换为：
         settings_action = setting_menu.addAction('系统配置 (API/模型)')
-        settings_action.triggered.connect(self.open_settings_dialog)
-
-        about_menu = menubar.addMenu('关于')
-
-        # 主部件容器
+        
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
 
-        # ================= 2. 中间三栏工作区 ================= #
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # (1) 最左边：设定目录树
         self.setting_tree = QTreeWidget()
-        self.setting_tree.setHeaderLabel("世界观设定 (需打开工作区)")
-        # 【新增下面这行代码】
-        self.setting_tree.itemClicked.connect(self.on_setting_node_clicked) 
+        self.setting_tree.setHeaderLabel("世界观设定")
+        self.setting_tree.itemClicked.connect(self.on_setting_node_clicked)
         splitter.addWidget(self.setting_tree)
 
-        # (2) 第二个：小说目录树
         self.novel_tree = QTreeWidget()
-        self.novel_tree.setHeaderLabel("小说大纲结构 (需打开工作区)")
+        self.novel_tree.setHeaderLabel("小说大纲结构")
         self.novel_tree.itemClicked.connect(self.on_novel_node_clicked)
         splitter.addWidget(self.novel_tree)
 
-        # (3) 最右边：详情与编辑区
+        # ================= 右侧：拆分概要与正文区 =================
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.addWidget(QLabel("节点内容编辑器 (支持Markdown):"))
         
-        self.editor = QTextEdit()
-        self.editor.setEnabled(False) # 未加载数据前禁用
-        detail_layout.addWidget(self.editor)
+        editor_splitter = QSplitter(Qt.Orientation.Vertical)
         
+        # 上半部：概要 (保存在 JSON 中)
+        summary_widget = QWidget()
+        summary_layout = QVBoxLayout(summary_widget)
+        summary_layout.setContentsMargins(0,0,0,0)
+        summary_layout.addWidget(QLabel("节点概要 (Summary - 保存至系统数据):"))
+        self.summary_editor = QTextEdit()
+        self.summary_editor.setEnabled(False)
+        summary_layout.addWidget(self.summary_editor)
+        editor_splitter.addWidget(summary_widget)
+        
+        # 下半部：正文 (保存在 MD 文件中)
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0,0,0,0)
+        content_layout.addWidget(QLabel("节点正文 (Content - 保存至 .md 文件):"))
+        self.content_editor = QTextEdit()
+        self.content_editor.setEnabled(False)
+        content_layout.addWidget(self.content_editor)
+        editor_splitter.addWidget(content_widget)
+        
+        editor_splitter.setSizes([300, 700])
+        detail_layout.addWidget(editor_splitter)
+        
+        # 底部按钮
         btn_layout = QHBoxLayout()
-        self.btn_generate = QPushButton("🔄 结合上下文生成内容")
+        self.btn_generate = QPushButton("🔄 结合上下文生成正文")
         self.btn_save = QPushButton("💾 保存当前节点")
+        self.btn_delete = QPushButton("🗑️ 删除当前节点")
         
         self.btn_generate.setEnabled(False)
         self.btn_save.setEnabled(False)
+        self.btn_delete.setEnabled(False)
         
-        # 绑定按钮事件
         self.btn_generate.clicked.connect(self.generate_current_node)
         self.btn_save.clicked.connect(self.save_current_node)
+        self.btn_delete.clicked.connect(self.delete_current_node)
         
         btn_layout.addWidget(self.btn_generate)
         btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_delete)
         detail_layout.addLayout(btn_layout)
         
         splitter.addWidget(detail_widget)
-
-        # 设置三栏默认宽度比例
         splitter.setSizes([200, 300, 700])
         main_layout.addWidget(splitter, stretch=4)
 
-        # ================= 3. 下方：Log 显示区 ================= #
         self.log_console = QTextBrowser()
         self.log_console.setFixedHeight(150)
-        self.log_console.append("系统初始化完成。请通过“文件”菜单打开或创建一个工程目录。")
-        if not self.config:
-            self.log_console.append("<font color='orange'>警告：未找到 conf/setting.json 配置文件，AI生成功能将受限。</font>")
+        self.log_console.append("系统初始化完成。")
         main_layout.addWidget(self.log_console, stretch=1)
 
     def open_settings_dialog(self):
@@ -164,8 +180,9 @@ class NovelCreatorWindow(QMainWindow):
 
         self.setting_tree.clear()
         self.novel_tree.clear()
+        self.node_map.clear() # 【新增】每次刷新时清空内存映射表
         
-        # 1. 渲染设定树
+        # 1. 渲染设定树 (保持不变)
         self.setting_tree.setHeaderLabel("世界观设定 (勾选参与上下文)")
         for cat in self.workspace.setting_dirs:
             cat_item = QTreeWidgetItem(self.setting_tree, [cat])
@@ -187,21 +204,28 @@ class NovelCreatorWindow(QMainWindow):
         self.novel_tree.setHeaderLabel("小说大纲结构")
         self.outline_tree_data = self.workspace.load_outline_tree()
         
-        # 【关键修复】强制将 nodes 字段写入原字典，保证 target_list 拿到的是根字典的真实内存引用
         if "nodes" not in self.outline_tree_data:
             self.outline_tree_data["nodes"] = []
         nodes_ref = self.outline_tree_data["nodes"]
         
-        self._build_novel_tree_ui(nodes_ref, self.novel_tree)
+        self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
         self.novel_tree.expandAll()
 
-    def _build_novel_tree_ui(self, nodes: list, parent_widget):
-        """递归构建小说目录树 UI"""
+    def _build_novel_tree_ui(self, nodes: list, parent_widget, level=1):
+        """递归构建小说目录树，按层级控制新增按钮的渲染"""
+        import uuid
+        
+        # 场景的内部（第4级），严格禁止渲染任何子节点和按钮
+        if level > 3:
+            return
+
         for node in nodes:
             title = node.get("title", "未命名节点")
             item = QTreeWidgetItem(parent_widget, [title])
             
-            item.setData(0, Qt.ItemDataRole.UserRole, node)
+            node_id = str(uuid.uuid4())
+            self.node_map[node_id] = node
+            item.setData(0, Qt.ItemDataRole.UserRole, node_id)
             
             status = node.get("_status", "ok")
             if status == "missing":
@@ -212,100 +236,114 @@ class NovelCreatorWindow(QMainWindow):
             if "children" not in node:
                 node["children"] = []
                 
-            self._build_novel_tree_ui(node["children"], item)
+            # 递归下一层，层级 +1
+            self._build_novel_tree_ui(node["children"], item, level + 1)
                 
-        # 同级目录底部预留一个新增按钮
-        btn_text = "+ 新增章..." if isinstance(parent_widget, QTreeWidget) else "+ 新增子节点..."
+        # 根据当前层级提供对应的按钮名称
+        titles = {1: "+ 新增章...", 2: "+ 新增节...", 3: "+ 新增场景..."}
+        btn_text = titles.get(level, "+ 新增节点...")
+        
         add_btn = QTreeWidgetItem(parent_widget, [btn_text])
         add_btn.setForeground(0, Qt.GlobalColor.blue)
-        
-        # 绑定当前层级的列表引用
-        add_btn.setData(0, Qt.ItemDataRole.UserRole, {"_is_add_btn": True, "target_list": nodes})
 
     def on_novel_node_clicked(self, item, column):
-        """处理目录树节点点击事件，读取文件"""
         if not self.workspace:
             return
 
-        node_data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not node_data:
+        if item.text(0).startswith("+"):
+            parent_item = item.parent()
+            if parent_item:
+                parent_node_id = parent_item.data(0, Qt.ItemDataRole.UserRole)
+                real_parent_node = self.node_map.get(parent_node_id)
+                if real_parent_node is not None:
+                    target_list = real_parent_node.setdefault("children", [])
+                    parent_level = self._get_item_level(parent_item)
+                    self.add_new_novel_node(target_list, parent_level + 1)
+            else:
+                if self.outline_tree_data is None:
+                    self.outline_tree_data = {"nodes": []}
+                target_list = self.outline_tree_data.setdefault("nodes", [])
+                self.add_new_novel_node(target_list, 1)
+            return
+
+        node_id = item.data(0, Qt.ItemDataRole.UserRole)
+        real_node = self.node_map.get(node_id)
+        if not real_node:
             return
             
-        if node_data.get("_is_add_btn"):
-            self.add_new_novel_node(node_data["target_list"])
-            return
-            
-        self.current_editing_node = node_data
+        self.current_editing_node = real_node
         self.current_editing_item = item
         self.current_setting_path = None  
+        node_level = self._get_item_level(item)
         
-        rel_path = node_data.get("file_path")
-        if not rel_path:
-            self.editor.setText("该节点尚未配置 'file_path' 属性，无法读取内容。")
-            self.editor.setEnabled(False)
-            self.btn_save.setEnabled(False)
-            self.btn_generate.setEnabled(False)
-            return
-            
-        full_path = os.path.join(self.workspace.text_path, rel_path)
+        self.btn_delete.setEnabled(not bool(real_node.get("children")))
         
-        if os.path.exists(full_path):
-            try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                self.editor.setText(content)
-                self.log_console.append(f"打开文件: {rel_path}")
-            except Exception as e:
-                self.editor.setText(f"读取文件失败: {e}")
-                self.log_console.append(f"<font color='red'>读取错误: {e}</font>")
-        else:
-            self.editor.setText(f"# {node_data.get('title', '未命名')}\n\n(文件尚未生成，请在此输入内容并保存，或使用大模型生成)")
-            self.log_console.append(f"节点对应的文件缺失: {rel_path}")
-            
-        self.editor.setEnabled(True)
+        # === 1. 加载概要 (对所有节点开放) ===
+        self.summary_editor.setText(real_node.get("summary", ""))
+        self.summary_editor.setEnabled(True)
         self.btn_save.setEnabled(True)
-        self.btn_generate.setEnabled(True)
+        
+        # === 2. 加载正文 (仅对第3级开放) ===
+        if node_level == 3:
+            rel_path = real_node.get("file_path")
+            if rel_path:
+                full_path = os.path.join(self.workspace.text_path, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        self.content_editor.setText(f.read())
+                else:
+                    self.content_editor.setText(f"# {real_node.get('title')}\n\n(文件尚未生成)")
+            else:
+                self.content_editor.setText("尚未配置正文路径。")
+                
+            self.content_editor.setEnabled(True)
+            self.btn_generate.setEnabled(True)
+        else:
+            self.content_editor.setText("（当前层级仅支持填写概要，正文请在底层的“场景”节点中生成/编写）")
+            self.content_editor.setEnabled(False)
+            self.btn_generate.setEnabled(False)
 
-    def add_new_novel_node(self, target_list: list):
-        """弹出输入框，创建小说新节点"""
-        title, ok = QInputDialog.getText(self, "新增节点", "请输入新节点名称 (如: 第一章 / 场景1):")
+    def add_new_novel_node(self, target_list: list, level: int):
+        """弹出输入框，按层级创建小说新节点"""
+        titles = {1: "章", 2: "节", 3: "场景"}
+        node_type = titles.get(level, "节点")
+        
+        title, ok = QInputDialog.getText(self, f"新增{node_type}", f"请输入新{node_type}名称:")
         if ok and title.strip():
             title = title.strip()
-            import uuid # 确保引入
-            file_name = f"节点_{uuid.uuid4().hex[:8]}.md"
             
-            initial_content = f"# {title}\n\n请在此输入【{title}】的概要或正文...\n"
-            try:
-                initial_md5 = self.workspace.save_markdown_file(file_name, initial_content)
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"创建本地物理文件失败: {e}")
-                return
-
             new_node = {
                 "title": title,
-                "file_path": file_name,
-                "md5": initial_md5,
+                "summary": "",  # 默认附带空概要
                 "children": [],
                 "_status": "ok"
             }
             
-            # 追加到目标列表
+            # 只有第3级场景才生成 Markdown 正文文件
+            if level == 3:
+                import uuid
+                file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+                initial_content = f"# {title}\n\n请在此输入正文...\n"
+                try:
+                    initial_md5 = self.workspace.save_markdown_file(file_name, initial_content)
+                    new_node["file_path"] = file_name
+                    new_node["md5"] = initial_md5
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"创建本地物理文件失败: {e}")
+                    return
+
             target_list.append(new_node)
             
-            # 【强制兜底】检查根节点关联，防止任何意外的引用断裂
             if "nodes" not in self.outline_tree_data or not self.outline_tree_data["nodes"]:
                 self.outline_tree_data["nodes"] = target_list
             
             try:
-                # 【直接写入文件】绕过可能吞掉报错的底层方法，保证如果报错能立刻弹出对话框
                 with open(self.workspace.tree_json_file, 'w', encoding='utf-8') as f:
                     json.dump(self.outline_tree_data, f, ensure_ascii=False, indent=4)
-                    
-                self.log_console.append(f"成功添加大纲节点: {title}")
+                self.log_console.append(f"成功添加{node_type}: {title}")
                 self.refresh_ui_from_workspace() 
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存大纲 JSON 失败:\n{e}")
-                self.log_console.append(f"<font color='red'>大纲保存失败: {e}</font>")
 
     def on_setting_node_clicked(self, item, column):
         """处理设定树的点击事件（新增设定文件或读取现有设定）"""
@@ -368,56 +406,113 @@ class NovelCreatorWindow(QMainWindow):
             self.log_console.append(f"<font color='red'>读取设定失败: {e}</font>")
 
     def save_current_node(self):
-        """保存当前编辑器内容（支持小说Markdown和设定JSON的双轨保存）"""
         if not self.workspace:
             return
             
-        content = self.editor.toPlainText()
-        
-        # ====== 场景 A: 正在编辑小说正文节点 ======
+        # ====== 场景 A: 保存小说节点 ======
         if self.current_editing_node:
-            rel_path = self.current_editing_node.get("file_path")
-            if not rel_path:
-                QMessageBox.warning(self, "警告", "当前节点无文件路径配置。")
-                return
+            # 1. 始终保存概要到内存字典
+            self.current_editing_node["summary"] = self.summary_editor.toPlainText()
+            
+            # 2. 如果正文框是启用的(证明是场景节点)，则将正文落盘 MD 文件
+            if self.content_editor.isEnabled():
+                content = self.content_editor.toPlainText()
+                rel_path = self.current_editing_node.get("file_path")
+                if rel_path:
+                    try:
+                        new_md5 = self.workspace.save_markdown_file(rel_path, content)
+                        self.current_editing_node["md5"] = new_md5
+                        self.current_editing_node["_status"] = "ok"
+                        if self.current_editing_item:
+                            self.current_editing_item.setForeground(0, Qt.GlobalColor.black)
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"保存正文文件失败:\n{e}")
+                        return
+            
+            # 3. 将包含概要的树结构统一保存至系统 JSON
             try:
-                new_md5 = self.workspace.save_markdown_file(rel_path, content)
-                self.current_editing_node["md5"] = new_md5
-                self.current_editing_node["_status"] = "ok"
-                
-                if self.current_editing_item:
-                    self.current_editing_item.setForeground(0, Qt.GlobalColor.black)
-                
                 self.workspace.save_outline_tree(self.outline_tree_data)
-                self.log_console.append(f"💾 正文保存成功: {rel_path}")
+                self.log_console.append(f"💾 节点保存成功: {self.current_editing_node.get('title')}")
             except Exception as e:
-                self.log_console.append(f"<font color='red'>正文保存失败: {e}</font>")
-                QMessageBox.critical(self, "错误", f"保存正文文件失败:\n{e}")
+                QMessageBox.critical(self, "错误", f"保存大纲树失败:\n{e}")
             return
 
-        # ====== 场景 B: 正在编辑设定 JSON 文件 ======
+        # ====== 场景 B: 保存设定 JSON文件 (与上一版保持一致) ======
         if self.current_setting_path and os.path.exists(self.current_setting_path):
             try:
-                # 写入前先尝试解析 JSON，如果用户手滑漏了引号或逗号，这里会拦截并报错
-                parsed_json = json.loads(content)
-                
+                parsed_json = json.loads(self.summary_editor.toPlainText()) # 这里假设你把设定也加载到上方的框里了
                 with open(self.current_setting_path, 'w', encoding='utf-8') as f:
-                    # 重新格式化并写入，保证缩进美观
                     json.dump(parsed_json, f, ensure_ascii=False, indent=4)
-                    
                 self.log_console.append(f"💾 设定保存成功: {os.path.basename(self.current_setting_path)}")
-                
-                # 将格式化后的漂亮 JSON 重新刷回文本框
-                self.editor.setText(json.dumps(parsed_json, ensure_ascii=False, indent=4))
-                
             except json.JSONDecodeError as e:
-                QMessageBox.warning(self, "JSON 格式错误", f"保存失败！请检查内容是否符合严格的 JSON 格式 (例如漏了引号或逗号):\n{e}")
-            except Exception as e:
-                self.log_console.append(f"<font color='red'>设定保存失败: {e}</font>")
-                QMessageBox.critical(self, "错误", f"保存设定文件失败:\n{e}")
+                QMessageBox.warning(self, "JSON 格式错误", f"保存失败！请检查 JSON 格式:\n{e}")
+            return
+
+    def delete_current_node(self):
+        """处理带有二次确认的叶子节点删除操作"""
+        if not self.current_editing_node or not self.outline_tree_data:
             return
             
-        QMessageBox.warning(self, "警告", "当前没有正在编辑的有效节点。")
+        # 双重保险，防止UI状态异常导致非叶子节点被删
+        if self.current_editing_node.get("children"):
+            QMessageBox.warning(self, "不可删除", "当前节点包含子章节或场景，请先删除底层的子节点！")
+            return
+            
+        node_title = self.current_editing_node.get('title', '未知节点')
+        reply = QMessageBox.question(
+            self, 
+            '确认删除', 
+            f"确定要永久删除节点【{node_title}】吗？\n警告：对应的 Markdown 文件也将被彻底删除！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No
+        )
+                                     
+        if reply == QMessageBox.StandardButton.Yes:
+            target_node = self.current_editing_node
+            
+            # 1. 递归扫描并从内存树列表中移除该字典
+            def remove_from_list(nodes_list):
+                for i, node in enumerate(nodes_list):
+                    if node is target_node: # 内存地址级比对，绝对精准
+                        del nodes_list[i]
+                        return True
+                    if remove_from_list(node.get("children", [])):
+                        return True
+                return False
+                
+            is_removed = remove_from_list(self.outline_tree_data.get("nodes", []))
+            
+            if is_removed:
+                # 2. 尝试删除硬盘上的 Markdown 物理文件
+                rel_path = target_node.get("file_path")
+                if rel_path:
+                    full_path = os.path.join(self.workspace.text_path, rel_path)
+                    if os.path.exists(full_path):
+                        try:
+                            os.remove(full_path)
+                        except Exception as e:
+                            self.log_console.append(f"<font color='orange'>警告：无法删除本地文件 {rel_path} ({e})</font>")
+                
+                # 3. 将更新后的结构写回 JSON，清空UI状态并刷新
+                try:
+                    with open(self.workspace.tree_json_file, 'w', encoding='utf-8') as f:
+                        json.dump(self.outline_tree_data, f, ensure_ascii=False, indent=4)
+                        
+                    self.log_console.append(f"🗑️ 成功删除节点: {node_title}")
+                    
+                    # 清理右侧编辑器和按钮状态
+                    self.current_editing_node = None
+                    self.editor.clear()
+                    self.editor.setEnabled(False)
+                    self.btn_save.setEnabled(False)
+                    self.btn_generate.setEnabled(False)
+                    self.btn_delete.setEnabled(False)
+                    
+                    self.refresh_ui_from_workspace()
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"保存系统大纲 JSON 失败:\n{e}")
+            else:
+                QMessageBox.warning(self, "错误", "在大纲树中未找到该节点，删除操作中断。")
 
     def save_all(self):
         """处理全局保存菜单动作"""

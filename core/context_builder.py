@@ -15,10 +15,6 @@ class ContextBuilder:
     def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list) -> list:
         """
         构建最终发送给大模型的上下文消息列表（OpenAI 格式）
-        :param target_node: 当前需要生成的节点字典引用
-        :param tree_data: 完整的 outline_tree 数据
-        :param checked_setting_paths: 用户在左侧勾选的设定 JSON 文件路径列表
-        :return: 包含 Prompt 的消息列表 [{"role": "user", "content": "..."}]
         """
         # 1. 解析并拼接打钩的世界观设定
         settings_text = self._build_settings_text(checked_setting_paths)
@@ -29,20 +25,25 @@ class ContextBuilder:
         # 3. 拼接上下文结构（大纲关联信息）
         outline_context_text = self._build_outline_context_text(parents, prev_node, next_node)
 
-        # 4. 获取当前节点已有的文本（作为本节概要或扩写基础）
-        target_content = self._read_node_content(target_node)
-        if not target_content.strip():
-            target_content = "(当前节点暂无概要，请根据上下文自由发挥)"
+        # 4. 分离获取当前场景的【概要】和【已有正文】
+        target_summary = target_node.get("summary", "").strip()
+        if not target_summary:
+            target_summary = "(当前场景暂无概要，请根据前后文和设定自由发挥)"
+
+        target_content = self._read_node_content(target_node).strip()
+        # 排除掉只有标题占位符的空文件情况
+        if not target_content or (target_content.startswith("#") and len(target_content.split('\n')) <= 3):
+            target_content = "(当前正文为空，请从头开始撰写本场景正文)"
 
         # 5. 组装终极 Prompt
         prompt = self._assemble_final_prompt(
-            target_title=target_node.get("title", "未命名"),
+            target_title=target_node.get("title", "未命名场景"),
             settings_text=settings_text,
             outline_context_text=outline_context_text,
+            target_summary=target_summary,
             target_content=target_content
         )
 
-        # 返回标准的消息列表格式
         return [{"role": "user", "content": prompt}]
 
     def _build_settings_text(self, setting_paths: list) -> str:
@@ -56,15 +57,17 @@ class ContextBuilder:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                # 获取文件名作为设定类别名
                 setting_name = os.path.basename(path).replace(".json", "")
                 cat_name = os.path.basename(os.path.dirname(path))
                 
                 text_blocks.append(f"【{cat_name} - {setting_name}】")
                 for key, value in data.items():
-                    if value.strip():  # 只加入有内容的字段
+                    # 特别处理字典或列表类型的复合设定值
+                    if isinstance(value, str) and value.strip():  
                         text_blocks.append(f"- {key}: {value}")
-                text_blocks.append("") # 空行分隔
+                    elif isinstance(value, (dict, list)):
+                        text_blocks.append(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
+                text_blocks.append("") 
             except Exception as e:
                 logger.error(f"读取设定文件失败 {path}: {e}")
                 
@@ -78,7 +81,7 @@ class ContextBuilder:
             current_path = []
 
         for i, node in enumerate(nodes):
-            if node is target_node: # 内存地址比对，精确定位
+            if node is target_node: 
                 prev_node = nodes[i-1] if i > 0 else None
                 next_node = nodes[i+1] if i < len(nodes) - 1 else None
                 return current_path, prev_node, next_node
@@ -91,31 +94,44 @@ class ContextBuilder:
         return [], None, None
 
     def _build_outline_context_text(self, parents: list, prev_node: dict, next_node: dict) -> str:
-        """构建上级大纲和前后文概要的提示词文本"""
+        """构建上级大纲（概要）和前后文（概要+正文片段）的提示词文本"""
         blocks = []
         
+        # 1. 父级节点（章、节）：只读取字典里的 summary
         if parents:
-            blocks.append("【所属章节概要】")
+            blocks.append("【所属章节大纲】")
             for p in parents:
                 title = p.get("title", "未命名")
-                content = self._read_node_content(p)
-                # 若上级包含极长文本，可适当截断或让大模型自行提炼，这里我们直接输入前500字作为概要
-                summary = content[:500] + "..." if len(content) > 500 else content
-                summary = summary.strip() or "(无概要)"
-                blocks.append(f"<{title}>:\n{summary}\n")
+                summary = p.get("summary", "").strip() or "(该层级无概要)"
+                blocks.append(f"<{title}> 概要:\n{summary}\n")
 
+        # 2. 上一相邻节点：读取 summary，并读取 MD 文件末尾作为文风和情节衔接
         if prev_node:
             prev_title = prev_node.get("title")
-            prev_content = self._read_node_content(prev_node)
-            summary = prev_content[-500:] # 取上一场景的最后500字作为衔接参考
-            blocks.append(f"【上一相邻节点: {prev_title} 的结尾参考】\n{summary}\n")
+            prev_summary = prev_node.get("summary", "").strip()
+            prev_content = self._read_node_content(prev_node).strip()
+            
+            blocks.append(f"【上一相邻场景: {prev_title}】")
+            if prev_summary:
+                blocks.append(f"剧情概要: {prev_summary}")
+            if prev_content:
+                # 截取最后 500 个字符用于衔接
+                tail = prev_content[-500:] if len(prev_content) > 500 else prev_content
+                blocks.append(f"正文结尾参考:\n...{tail}\n")
 
+        # 3. 下一相邻节点：同理，读取 MD 文件开头
         if next_node:
             next_title = next_node.get("title")
-            next_content = self._read_node_content(next_node)
-            if next_content.strip():
-                summary = next_content[:300]
-                blocks.append(f"【下一相邻节点: {next_title} 的开篇参考】\n{summary}\n")
+            next_summary = next_node.get("summary", "").strip()
+            next_content = self._read_node_content(next_node).strip()
+            
+            blocks.append(f"【下一相邻场景: {next_title}】")
+            if next_summary:
+                blocks.append(f"剧情概要: {next_summary}")
+            if next_content:
+                # 截取开篇 300 个字符
+                head = next_content[:300] if len(next_content) > 300 else next_content
+                blocks.append(f"正文开篇参考:\n{head}...\n")
 
         return "\n".join(blocks) if blocks else "（无相关大纲上下文）"
 
@@ -137,10 +153,10 @@ class ContextBuilder:
                 return ""
         return ""
 
-    def _assemble_final_prompt(self, target_title: str, settings_text: str, outline_context_text: str, target_content: str) -> str:
-        """拼接终极提示词，明确任务和输出格式（含插图约定的占位符要求）"""
+    def _assemble_final_prompt(self, target_title: str, settings_text: str, outline_context_text: str, target_summary: str, target_content: str) -> str:
+        """拼接终极提示词，明确区分概要与正文的任务要求"""
         prompt = f"""
-你是一个专业的小说创作者。请根据提供的世界观设定、大纲上下文，生成当前节点的完整正文内容。
+你是一个专业的小说创作者。请根据提供的世界观设定、大纲上下文，为指定的场景生成完整的小说正文内容。
 
 ### 一、 世界观与设定参考
 {settings_text}
@@ -149,12 +165,16 @@ class ContextBuilder:
 {outline_context_text}
 
 ### 三、 当前生成任务
-你需要生成正文的节点是：【{target_title}】。
-该节点作者已提供的概要或前期草稿如下：
+你需要生成正文的当前场景是：【{target_title}】。
+
+【本场景剧情概要】（你必须严格遵循此情节主线进行创作）：
+{target_summary}
+
+【本场景已有正文草稿】（如果提示为空，请直接撰写；如果有内容，请在此基础上进行润色或往后续写）：
 {target_content}
 
 ### 四、 输出格式与要求
-1. 请根据上述信息，充分发挥创造力，续写或扩写【{target_title}】的正文内容。内容应当连贯、生动、符合人物性格与世界观。
+1. 请根据上述信息，充分发挥创造力，输出【{target_title}】的正文内容。内容应当连贯、生动、符合人物性格与世界观设定。
 2. 必须直接输出小说正文，采用 Markdown 格式排版。
 3. 【插图生成规则】：应当在你认为适合表现画面的位置（如人物初登场、宏大场景、激烈冲突）插入图片描述符。请严格按照以下格式留下引用占位符，务必使用英文描述画面细节以便后续AI画图：
    `![English description of the scene, highly detailed, cinematic lighting](/images/placeholder_xxx.png)`
