@@ -177,24 +177,22 @@ class NovelCreatorWindow(QMainWindow):
                 for file in os.listdir(cat_path):
                     if file.endswith('.json') and file != 'template.json':
                         file_item = QTreeWidgetItem(cat_item, [file.replace('.json', '')])
-                        # 绑定真实路径
                         file_item.setData(0, Qt.ItemDataRole.UserRole, os.path.join(cat_path, file))
 
             add_btn = QTreeWidgetItem(cat_item, ["+ 新增设定..."])
             add_btn.setForeground(0, Qt.GlobalColor.blue)
         self.setting_tree.expandAll()
 
-        # ======= 找到 refresh_ui_from_workspace 方法中的这一段并替换 =======
         # 2. 渲染小说目录树
         self.novel_tree.setHeaderLabel("小说大纲结构")
         self.outline_tree_data = self.workspace.load_outline_tree()
         
-        # 强制确保 nodes 字段在原字典中存在，保证 target_list 拿到的是真实内存引用
+        # 【关键修复】强制将 nodes 字段写入原字典，保证 target_list 拿到的是根字典的真实内存引用
         if "nodes" not in self.outline_tree_data:
             self.outline_tree_data["nodes"] = []
-        nodes = self.outline_tree_data["nodes"]
+        nodes_ref = self.outline_tree_data["nodes"]
         
-        self._build_novel_tree_ui(nodes, self.novel_tree)
+        self._build_novel_tree_ui(nodes_ref, self.novel_tree)
         self.novel_tree.expandAll()
 
     def _build_novel_tree_ui(self, nodes: list, parent_widget):
@@ -203,7 +201,6 @@ class NovelCreatorWindow(QMainWindow):
             title = node.get("title", "未命名节点")
             item = QTreeWidgetItem(parent_widget, [title])
             
-            # 核心机制：将节点字典引用绑定到 UI 元素
             item.setData(0, Qt.ItemDataRole.UserRole, node)
             
             status = node.get("_status", "ok")
@@ -213,15 +210,16 @@ class NovelCreatorWindow(QMainWindow):
                 item.setForeground(0, Qt.GlobalColor.red)
                 
             if "children" not in node:
-                node["children"] = [] # 确保每个节点都有 children 列表，方便后续追加
+                node["children"] = []
                 
             self._build_novel_tree_ui(node["children"], item)
                 
-        # 【修改这里】为新增按钮绑定特殊标记和对应的 nodes 列表引用
+        # 同级目录底部预留一个新增按钮
         btn_text = "+ 新增章..." if isinstance(parent_widget, QTreeWidget) else "+ 新增子节点..."
         add_btn = QTreeWidgetItem(parent_widget, [btn_text])
         add_btn.setForeground(0, Qt.GlobalColor.blue)
-        # 将 "_is_add_btn" 标记和要插入的目标列表打包存入 Data
+        
+        # 绑定当前层级的列表引用
         add_btn.setData(0, Qt.ItemDataRole.UserRole, {"_is_add_btn": True, "target_list": nodes})
 
     def on_novel_node_clicked(self, item, column):
@@ -233,15 +231,13 @@ class NovelCreatorWindow(QMainWindow):
         if not node_data:
             return
             
-        # 拦截：如果点击的是底部的“+ 新增...”按钮，执行新增逻辑并终止向下运行
         if node_data.get("_is_add_btn"):
             self.add_new_novel_node(node_data["target_list"])
             return
             
-        # 正常的小说节点点击逻辑
         self.current_editing_node = node_data
         self.current_editing_item = item
-        self.current_setting_path = None  # 清空设定文件的状态
+        self.current_setting_path = None  
         
         rel_path = node_data.get("file_path")
         if not rel_path:
@@ -271,23 +267,20 @@ class NovelCreatorWindow(QMainWindow):
         self.btn_generate.setEnabled(True)
 
     def add_new_novel_node(self, target_list: list):
-        """弹出输入框，创建小说新节点，并在本地生成对应的 Markdown 物理文件"""
+        """弹出输入框，创建小说新节点"""
         title, ok = QInputDialog.getText(self, "新增节点", "请输入新节点名称 (如: 第一章 / 场景1):")
         if ok and title.strip():
             title = title.strip()
-            # 自动生成带随机哈希的文件名，避免同名章节冲突
+            import uuid # 确保引入
             file_name = f"节点_{uuid.uuid4().hex[:8]}.md"
             
-            # 1. 立刻在物理硬盘上创建对应的 Markdown 文件
             initial_content = f"# {title}\n\n请在此输入【{title}】的概要或正文...\n"
             try:
-                # 调用 workspace_manager 保存并获取初始文件的 MD5
                 initial_md5 = self.workspace.save_markdown_file(file_name, initial_content)
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"创建本地物理文件失败: {e}")
                 return
 
-            # 2. 构建包含真实文件路径和 MD5 的新节点数据
             new_node = {
                 "title": title,
                 "file_path": file_name,
@@ -296,16 +289,23 @@ class NovelCreatorWindow(QMainWindow):
                 "_status": "ok"
             }
             
-            # 3. 将新节点追加到当前层级的列表中
+            # 追加到目标列表
             target_list.append(new_node)
             
-            # 4. 将更新后的树状结构保存到 outline_tree.json 并刷新 UI
+            # 【强制兜底】检查根节点关联，防止任何意外的引用断裂
+            if "nodes" not in self.outline_tree_data or not self.outline_tree_data["nodes"]:
+                self.outline_tree_data["nodes"] = target_list
+            
             try:
-                self.workspace.save_outline_tree(self.outline_tree_data)
-                self.log_console.append(f"成功添加大纲节点并生成文件: {title}")
-                self.refresh_ui_from_workspace() # 刷新UI树，让新节点显示出来
+                # 【直接写入文件】绕过可能吞掉报错的底层方法，保证如果报错能立刻弹出对话框
+                with open(self.workspace.tree_json_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.outline_tree_data, f, ensure_ascii=False, indent=4)
+                    
+                self.log_console.append(f"成功添加大纲节点: {title}")
+                self.refresh_ui_from_workspace() 
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"保存系统大纲树失败: {e}")
+                QMessageBox.critical(self, "错误", f"保存大纲 JSON 失败:\n{e}")
+                self.log_console.append(f"<font color='red'>大纲保存失败: {e}</font>")
 
     def on_setting_node_clicked(self, item, column):
         """处理设定树的点击事件（新增设定文件或读取现有设定）"""
