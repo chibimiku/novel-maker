@@ -37,7 +37,9 @@ class LLMClient:
         text_cfg = self.config.get("text_api", {})
         self.text_type = text_cfg.get("type", "openai").lower()
         self.text_model_name = text_cfg.get("model", "gpt-4o")
-        self.system_instruction = text_cfg.get("instructions", "你是一个专业的AI小说家。")
+        # 【修改点】：强化默认的系统人设约束，防止生成废话
+        default_sys_prompt = "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。"
+        self.system_instruction = text_cfg.get("instructions", default_sys_prompt)
         
         if self.text_type == "openai":
             # 兼容 OpenAI 格式的接口 (如 DeepSeek, Moonshot 等，只需修改 base_url)

@@ -648,6 +648,11 @@ class NovelCreatorWindow(QMainWindow):
         if not self.llm_client:
             QMessageBox.warning(self, "配置缺失", "尚未初始化大模型客户端，请检查 conf/setting.json 文件。")
             return
+        
+        # ================== 【修改点 1：生成前先强制保存】 ==================
+        # 确保界面上刚输入的 summary 能立即更新到内存节点并落盘，防止传给大模型的是空字符串
+        self.save_current_node()
+        # ================================================================
 
         node_title = self.current_editing_node.get('title', '未知节点')
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
@@ -696,6 +701,11 @@ class NovelCreatorWindow(QMainWindow):
         """接收子线程成功的信号"""
         self.content_editor.setText(result)
         self.log_console.append("生成成功！已填入编辑器，请确认后点击保存。")
+
+        # ================== 【修改点 2：生成成功后自动保存】 ==================
+        self.save_current_node()
+        # ==================================================================
+
         self._restore_generate_ui_state()
 
     def on_generate_error(self, error_msg: str):
