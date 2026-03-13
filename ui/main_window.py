@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLabel, QFileDialog, QMessageBox, 
                              QInputDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
 from PyQt6.QtGui import QKeySequence # 【新增】用于绑定快捷键
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # 导入核心逻辑层组件
 # 假设运行入口在项目根目录，core 文件夹与 ui 文件夹平级
@@ -17,6 +17,27 @@ from core.workspace_manager import WorkspaceManager
 from core.context_builder import ContextBuilder
 from core.llm_client import LLMClient
 from ui.settings_dialog import SettingsDialog
+
+class GenerateTaskThread(QThread):
+    # 定义两个信号，用于向主线程传递成功的结果或失败的错误信息
+    success_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, llm_client, prompt_content, parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.prompt_content = prompt_content
+
+    def run(self):
+        """线程启动后自动执行的方法"""
+        try:
+            # 这里执行耗时的网络请求，此时不会阻塞主 UI
+            result = self.llm_client.generate_text(self.prompt_content)
+            # 请求完成后，发射成功信号，附带生成的文本
+            self.success_signal.emit(result)
+        except Exception as e:
+            # 如果发生异常，发射错误信号
+            self.error_signal.emit(str(e))
 
 class NovelCreatorWindow(QMainWindow):
     def __init__(self):
@@ -167,8 +188,8 @@ class NovelCreatorWindow(QMainWindow):
         param_layout.addWidget(QLabel(" 目标生成字数:"))
         self.spin_word_count = QSpinBox()
         self.spin_word_count.setRange(50, 20000) # 允许范围：500 - 20000字
-        self.spin_word_count.setSingleStep(50)   # 每次加减 500
-        self.spin_word_count.setValue(500)       # 默认 5000
+        self.spin_word_count.setSingleStep(500)   # 每次加减 500
+        self.spin_word_count.setValue(5000)       # 默认 5000
         param_layout.addWidget(self.spin_word_count)
         
         param_layout.addStretch() # 将控件推到左侧
@@ -620,7 +641,7 @@ class NovelCreatorWindow(QMainWindow):
         return list(set(checked_paths))
 
     def generate_current_node(self):
-        """调用大模型生成正文"""
+        """调用大模型生成正文（使用 QThread 异步执行）"""
         if not self.current_editing_node or not self.outline_tree_data:
             return
             
@@ -630,13 +651,17 @@ class NovelCreatorWindow(QMainWindow):
 
         node_title = self.current_editing_node.get('title', '未知节点')
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
+        
+        # 禁用相关按钮，防止用户在生成期间重复点击或误操作
         self.btn_generate.setEnabled(False) 
+        self.btn_save.setEnabled(False)
+        self.btn_delete.setEnabled(False)
         
         # 1. 实例化 Builder 并获取勾选的设定
         builder = ContextBuilder(self.workspace)
         checked_paths = self.get_checked_settings()
         
-        # 2. 构建 Prompt 消息（【修改】传入 UI 设置的参数）
+        # 2. 构建 Prompt 消息
         messages = builder.build_generation_prompt(
             self.current_editing_node, 
             self.outline_tree_data, 
@@ -645,29 +670,49 @@ class NovelCreatorWindow(QMainWindow):
             word_count=self.spin_word_count.value()
         )
         
-        self.log_console.append("发送请求至大语言模型，请稍候...")
+        prompt_content = messages[-1]["content"]
         
-        try:
-            # 3. 发送请求获取内容
-            prompt_content = messages[-1]["content"]
-            
-            # 【修复点 1：将构建好的 Prompt 打印到 UI 日志框】
-            self.log_console.append("========== 发送给大模型的完整 Prompt ==========")
-            self.log_console.append(prompt_content)
-            self.log_console.append("=================================================")
-            QApplication.processEvents() # 强制刷新 UI，确保日志立刻显示在界面上
-            
-            result = self.llm_client.generate_text(prompt_content)
-            
-            # 【修复点 2：将 self.editor 修改为正确的 self.content_editor】
-            self.content_editor.setText(result)
-            self.log_console.append("生成成功！已填入编辑器，请确认后点击保存。")
-            
-        except Exception as e:
-            self.log_console.append(f"<font color='red'>生成失败: {e}</font>")
-            QMessageBox.critical(self, "生成错误", str(e))
-        finally:
-            self.btn_generate.setEnabled(True)
+        self.log_console.append("========== 发送给大模型的完整 Prompt ==========")
+        self.log_console.append(prompt_content)
+        self.log_console.append("=================================================")
+        self.log_console.append("发送请求至大语言模型，后台处理中，请稍候...")
+        
+        # 注意：不再需要 QApplication.processEvents()，因为主线程已经不会被阻塞了
+
+        # 3. 创建并启动后台任务线程
+        # 必须将线程实例挂载到 self 上，防止它在方法结束后被 Python 垃圾回收销毁
+        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        
+        # 连接信号与槽（回调函数）
+        self.generate_thread.success_signal.connect(self.on_generate_success)
+        self.generate_thread.error_signal.connect(self.on_generate_error)
+        
+        # 启动线程
+        self.generate_thread.start()
+
+    # ================= 新增：异步生成的回调方法 =================
+
+    def on_generate_success(self, result: str):
+        """接收子线程成功的信号"""
+        self.content_editor.setText(result)
+        self.log_console.append("生成成功！已填入编辑器，请确认后点击保存。")
+        self._restore_generate_ui_state()
+
+    def on_generate_error(self, error_msg: str):
+        """接收子线程失败的信号"""
+        self.log_console.append(f"<font color='red'>生成失败: {error_msg}</font>")
+        QMessageBox.critical(self, "生成错误", f"大模型请求失败:\n{error_msg}")
+        self._restore_generate_ui_state()
+
+    def _restore_generate_ui_state(self):
+        """恢复界面按钮状态并清理线程"""
+        self.btn_generate.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        # 只有当没有子节点时才允许删除
+        self.btn_delete.setEnabled(not bool(self.current_editing_node.get("children")))
+        
+        # 释放线程引用
+        self.generate_thread = None
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
