@@ -71,9 +71,9 @@ class WorkspaceManager:
         try:
             with open(self.tree_json_file, 'r', encoding='utf-8') as f:
                 tree_data = json.load(f)
-            
             # 递归校验树中节点的 MD5，标记文件是否被外部修改或缺失
-            self._verify_tree_md5(tree_data.get("nodes", []))
+            # 【修改点 3】：传入起始层级 level=1
+            self._verify_tree_md5(tree_data.get("nodes", []), level=1)
             return tree_data
             
         except Exception as e:
@@ -113,26 +113,31 @@ class WorkspaceManager:
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
 
-    def _verify_tree_md5(self, nodes: list):
+    def _verify_tree_md5(self, nodes: list, level: int = 1):
         """
         递归遍历节点，检查文件是否存在以及 MD5 是否匹配。
-        将状态直接注入到内存中的节点数据里，供 UI 层读取。
+		将状态直接注入到内存中的节点数据里，供 UI 层读取。
+        【修改点 3】：通过 level 参数，只对第3层级的节点进行物理文件校验。
         """
         for node in nodes:
-            # 章、节、场景都可以有对应的文件路径
-            rel_path = node.get("file_path")
-            if rel_path:
-                full_path = os.path.join(self.text_path, rel_path)
-                if not os.path.exists(full_path):
-                    node["_status"] = "missing"  # UI可据此将节点置灰
-                else:
-                    current_md5 = self.calculate_md5(full_path)
-                    if current_md5 != node.get("md5"):
-                        node["_status"] = "modified_externally" # UI可提示用户有外部修改
-                        node["md5"] = current_md5 # 可选：自动更新内存中的MD5
+            if level == 3: # 仅对“场景”级别检查实体文件
+                rel_path = node.get("file_path")
+                if rel_path:
+                    full_path = os.path.join(self.text_path, rel_path)
+                    if not os.path.exists(full_path):
+                        node["_status"] = "missing"  
                     else:
-                        node["_status"] = "ok"
-            
-            # 递归处理子节点
+                        current_md5 = self.calculate_md5(full_path)
+                        if current_md5 != node.get("md5"):
+                            node["_status"] = "modified_externally" 
+                            node["md5"] = current_md5 
+                        else:
+                            node["_status"] = "ok"
+                else:
+                    node["_status"] = "missing" # 没有分配文件路径也视作缺失
+            else:
+                node["_status"] = "ok" # 对于第1级和第2级，固定为黑字正常状态
+
+            # 递归处理子节点时，层级+1
             if "children" in node:
-                self._verify_tree_md5(node["children"])
+                self._verify_tree_md5(node["children"], level + 1)

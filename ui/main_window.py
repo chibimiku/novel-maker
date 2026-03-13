@@ -29,7 +29,7 @@ class GenerateTaskThread(QThread):
         self.prompt_content = prompt_content
 
     def run(self):
-        """线程启动后自动执行的方法"""
+        # 线程启动后自动执行的方法
         try:
             # 这里执行耗时的网络请求，此时不会阻塞主 UI
             result = self.llm_client.generate_text(self.prompt_content)
@@ -54,7 +54,10 @@ class NovelCreatorWindow(QMainWindow):
         self.node_map = {}                # 【新增】节点内存引用的绝对映射表
         self._updating_settings = False   
         
-        # 加载配置并初始化 LLM 客户端
+        # 【新增】批量生成相关的状态变量
+        self.batch_generate_queue = []
+        self.is_batch_generating = False
+        
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config) if self.config else None
 
@@ -100,7 +103,7 @@ class NovelCreatorWindow(QMainWindow):
             print(f"保存系统状态失败: {e}")
 
     def _get_item_level(self, item):
-        """计算当前树节点的层级深度 (1=章, 2=节, 3=场景)"""
+        # 计算当前树节点的层级深度 (1=章, 2=节, 3=场景)"""
         level = 1
         p = item.parent()
         while p:
@@ -109,7 +112,7 @@ class NovelCreatorWindow(QMainWindow):
         return level
 
     def _load_config(self) -> dict:
-        """读取系统配置文件 conf/setting.json"""
+        # 读取系统配置文件 conf/setting.json"""
         # 假设 ui 目录的上一级是项目根目录，conf 目录在根目录下
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config_path = os.path.join(base_dir, "conf", "setting.json")
@@ -125,13 +128,21 @@ class NovelCreatorWindow(QMainWindow):
     def init_ui(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu('文件')
-        open_action = file_menu.addAction('打开/创建工作区')
-        open_action.triggered.connect(self.open_workspace)
+        
+        # 【修改点 2】：分离新建工作区和加载工作区逻辑
+        new_action = file_menu.addAction('新建工作区')
+        new_action.triggered.connect(self.new_workspace)
+        
+        load_action = file_menu.addAction('加载工作区')
+        load_action.triggered.connect(self.load_workspace)
+        
         save_action = file_menu.addAction('保存全部')
         save_action.setShortcut(QKeySequence("Ctrl+S")) # 【新增】绑定 Ctrl+S 快捷键
         save_action.triggered.connect(self.save_all)
         setting_menu = menubar.addMenu('设置')
         settings_action = setting_menu.addAction('系统配置 (API/模型)')
+        # 【修改点 1】：修复点击设置没有反应的问题，绑定打开对话框事件
+        settings_action.triggered.connect(self.open_settings_dialog)
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -229,18 +240,22 @@ class NovelCreatorWindow(QMainWindow):
         
         # 底部按钮
         btn_layout = QHBoxLayout()
+        # 【新增】批量生成按钮
+        self.btn_batch_generate = QPushButton("🚀 批量生成缺失场景")
         self.btn_generate = QPushButton("🔄 结合上下文生成正文")
         self.btn_save = QPushButton("💾 保存当前节点")
         self.btn_delete = QPushButton("🗑️ 删除当前节点")
+        
+        self.btn_batch_generate.clicked.connect(self.start_batch_generate)
+        self.btn_generate.clicked.connect(self.generate_current_node)
+        self.btn_save.clicked.connect(self.save_current_node)
+        self.btn_delete.clicked.connect(self.delete_current_node)
         
         self.btn_generate.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
         
-        self.btn_generate.clicked.connect(self.generate_current_node)
-        self.btn_save.clicked.connect(self.save_current_node)
-        self.btn_delete.clicked.connect(self.delete_current_node)
-        
+        btn_layout.addWidget(self.btn_batch_generate)
         btn_layout.addWidget(self.btn_generate)
         btn_layout.addWidget(self.btn_save)
         btn_layout.addWidget(self.btn_delete)
@@ -257,14 +272,14 @@ class NovelCreatorWindow(QMainWindow):
 
     # ================= 【新增】UI 辅助方法 ================= #
     def update_word_count(self):
-        """实时更新正文字数统计"""
+        # 实时更新正文字数统计"""
         text = self.content_editor.toPlainText()
         # 简单过滤掉换行和空格，更接近实际汉字/有效字符数
         clean_text = text.replace(' ', '').replace('\n', '').replace('\t', '')
         self.word_count_label.setText(f"当前字数: {len(clean_text)}")
 
     def on_setting_item_changed(self, item, column):
-        """【修改】处理设定树的勾选状态联动"""
+        # 【修改】处理设定树的勾选状态联动"""
         if self._updating_settings:
             return
         self._updating_settings = True
@@ -306,7 +321,7 @@ class NovelCreatorWindow(QMainWindow):
         self._updating_settings = False
 
     def _cleanup_tree_add_buttons(self, parent_item=None):
-        """【修改】拖拽后保证“+ 新增”按钮始终处于列表末尾"""
+        # 【修改】拖拽后保证“+ 新增”按钮始终处于列表末尾"""
         target = parent_item if parent_item else self.novel_tree.invisibleRootItem()
         
         add_btn_index = -1
@@ -326,7 +341,7 @@ class NovelCreatorWindow(QMainWindow):
                 self._cleanup_tree_add_buttons(child)
 
     def sync_tree_data_from_ui(self):
-        """【修改】将UI界面上的树状结构反向同步回 JSON 内存模型并保存"""
+        # 【修改】将UI界面上的树状结构反向同步回 JSON 内存模型并保存"""
         if not self.workspace or self.outline_tree_data is None:
             return
             
@@ -344,7 +359,7 @@ class NovelCreatorWindow(QMainWindow):
         self.log_console.append("系统通知：节点位置结构已自动保存。")
 
     def _build_node_data_from_item(self, item):
-        """【修改】递归辅助函数：从 UI Item 重建字典数据"""
+        # 【修改】递归辅助函数：从 UI Item 重建字典数据"""
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
         node_data = self.node_map.get(node_id)
         if not node_data:
@@ -364,7 +379,7 @@ class NovelCreatorWindow(QMainWindow):
     # ================= UI 交互与业务逻辑 ================= #
 
     def open_settings_dialog(self):
-        """打开设置对话框，保存后自动重载配置"""
+        # 打开设置对话框，保存后自动重载配置"""
         dialog = SettingsDialog(self)
         # 如果用户点击了"保存配置"并成功写入，dialog.exec() 会返回 QDialog.DialogCode.Accepted
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -373,20 +388,36 @@ class NovelCreatorWindow(QMainWindow):
             self.config = self._load_config()
             self.llm_client = LLMClient(self.config) if self.config else None
             self.log_console.append("模型客户端初始化完成！")
+	# ================= UI 交互与业务逻辑 ================= #
+    # ================= 【修改点 2：拆分的新建/加载逻辑】 =================
+    def new_workspace(self):
+        # 弹出文件夹选择框，初始化新的工作区（要求空文件夹）"""
+        folder_path = QFileDialog.getExistingDirectory(self, "选择空文件夹创建新工作区")
+        if folder_path:
+            # 检查文件夹是否为空
+            if os.listdir(folder_path):
+                QMessageBox.warning(self, "操作取消", "为了防止意外覆盖文件，请选择一个【空文件夹】来初始化新工作区！")
+                return
+            
+            try:
+                # 只有新建工作区时才执行 init_workspace 生成基础目录和配置
+                temp_workspace = WorkspaceManager(folder_path)
+                temp_workspace.init_workspace() 
+                self._load_workspace_by_path(folder_path)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"初始化新工作区失败:\n{str(e)}")
 
-    # ================= UI 交互与业务逻辑 ================= #
-
-    def open_workspace(self):
-        """弹出文件夹选择框，初始化工作区"""
-        folder_path = QFileDialog.getExistingDirectory(self, "选择或创建小说工程目录")
+    def load_workspace(self):
+        # 弹出文件夹选择框，加载已有工作区"""
+        folder_path = QFileDialog.getExistingDirectory(self, "选择已有的工作区目录")
         if folder_path:
             self._load_workspace_by_path(folder_path)
 
     def _load_workspace_by_path(self, folder_path):
-        """核心加载工作区逻辑"""
+        # 核心加载工作区逻辑（不再自动 init_workspace）"""
         try:
             self.workspace = WorkspaceManager(folder_path)
-            self.workspace.init_workspace()
+            # 移除这里的 init_workspace 调用，防止在加载现有目录时创建冗余结构
             
             self._save_sys_state(folder_path) # 【新增】保存到最近工作区列表
             
@@ -397,9 +428,10 @@ class NovelCreatorWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法加载工作区:\n{str(e)}")
             self.log_console.append(f"<font color='red'>工作区加载失败: {e}</font>")
+    # ===============================================================
 
     def refresh_ui_from_workspace(self):
-        """清空现有树并从 workspace 重新加载数据渲染"""
+        ### 清空现有树并从 workspace 重新加载数据渲染"""
         if not self.workspace:
             return
 
@@ -409,8 +441,12 @@ class NovelCreatorWindow(QMainWindow):
         
         # 1. 渲染设定树 (保持不变)
         self.setting_tree.setHeaderLabel("世界观设定 (勾选参与上下文)")
-        self._updating_settings = True # 建树时禁止触发信号
-        for cat in self.workspace.setting_dirs:
+        self._updating_settings = True 
+        
+        # 即使加载不完整的目录，使用 getattr 或默认目录，这里简单兼容
+        setting_dirs = getattr(self.workspace, 'setting_dirs', ["公共设定", "人物设定", "名词设定", "地点设定", "其他设定"])
+        
+        for cat in setting_dirs:
             cat_item = QTreeWidgetItem(self.setting_tree, [cat])
             cat_item.setFlags(cat_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             cat_item.setCheckState(0, Qt.CheckState.Checked)
@@ -445,7 +481,7 @@ class NovelCreatorWindow(QMainWindow):
         self.novel_tree.expandAll()
 
     def _build_novel_tree_ui(self, nodes: list, parent_widget, level=1):
-        """递归构建小说目录树，按层级控制新增按钮的渲染"""
+        # 递归构建小说目录树，按层级控制新增按钮的渲染"""
         import uuid
         
         # 场景的内部（第4级），严格禁止渲染任何子节点和按钮
@@ -467,10 +503,17 @@ class NovelCreatorWindow(QMainWindow):
             item.setData(0, Qt.ItemDataRole.UserRole, node_id)
             
             status = node.get("_status", "ok")
-            if status == "missing":
-                item.setForeground(0, Qt.GlobalColor.gray)
-            elif status == "modified_externally":
-                item.setForeground(0, Qt.GlobalColor.red)
+            
+            # 【修改点 3】：基于层级进行渲染，仅第3级缺失文件变色，1/2级固定黑色
+            if level == 3:
+                if status == "missing":
+                    item.setForeground(0, Qt.GlobalColor.gray)
+                elif status == "modified_externally":
+                    item.setForeground(0, Qt.GlobalColor.red)
+                else:
+                    item.setForeground(0, Qt.GlobalColor.black)
+            else:
+                item.setForeground(0, Qt.GlobalColor.black)
                 
             if "children" not in node:
                 node["children"] = []
@@ -489,6 +532,11 @@ class NovelCreatorWindow(QMainWindow):
 
     def on_novel_node_clicked(self, item, column):
         if not self.workspace:
+            return
+        
+        # 防止在批量生成时误触修改状态
+        if self.is_batch_generating:
+            QMessageBox.warning(self, "提示", "批量生成中，请先停止任务后再手动操作节点。")
             return
 
         if item.text(0).startswith("+"):
@@ -547,7 +595,7 @@ class NovelCreatorWindow(QMainWindow):
         self.update_word_count() # 【修改】更新字数
 
     def add_new_novel_node(self, target_list: list, level: int):
-        """弹出输入框，按层级创建小说新节点"""
+        # 弹出输入框，按层级创建小说新节点"""
         titles = {1: "章", 2: "节", 3: "场景"}
         node_type = titles.get(level, "节点")
         
@@ -589,7 +637,7 @@ class NovelCreatorWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"保存大纲 JSON 失败:\n{e}")
 
     def on_setting_node_clicked(self, item, column):
-        """处理设定树的点击事件（新增设定文件或读取现有设定）"""
+        # 处理设定树的点击事件（新增设定文件或读取现有设定）"""
         if not self.workspace:
             return
 
@@ -693,7 +741,7 @@ class NovelCreatorWindow(QMainWindow):
             return
 
     def delete_current_node(self):
-        """处理带有二次确认的叶子节点删除操作"""
+        # 处理带有二次确认的叶子节点删除操作"""
         if not self.current_editing_node or not self.outline_tree_data:
             return
             
@@ -764,7 +812,7 @@ class NovelCreatorWindow(QMainWindow):
                 QMessageBox.warning(self, "错误", "在大纲树中未找到该节点，删除操作中断。")
 
     def save_all(self):
-        """处理全局保存菜单动作 (Ctrl+S 触发)"""
+        # 处理全局保存菜单动作 (Ctrl+S 触发)"""
         if self.workspace and self.outline_tree_data:
             self.workspace.save_outline_tree(self.outline_tree_data)
             
@@ -780,7 +828,7 @@ class NovelCreatorWindow(QMainWindow):
     # ================= AI 生成核心逻辑 ================= #
 
     def get_checked_settings(self) -> list:
-        """遍历设定树，获取所有打钩的 JSON 文件路径"""
+        # 遍历设定树，获取所有打钩的 JSON 文件路径"""
         checked_paths = []
         root = self.setting_tree.invisibleRootItem()
         if not root:
@@ -797,8 +845,110 @@ class NovelCreatorWindow(QMainWindow):
                         checked_paths.append(path)
         return list(set(checked_paths))
 
+    # ================= 【新增】批量生成核心逻辑 =================
+    def _get_missing_level3_nodes(self, nodes, level=1):
+        """递归寻找所有状态为 missing 的第 3 级（场景）节点"""
+        missing = []
+        for node in nodes:
+            if level == 3 and node.get("_status") == "missing":
+                missing.append(node)
+            if "children" in node:
+                missing.extend(self._get_missing_level3_nodes(node["children"], level + 1))
+        return missing
+
+    def _find_item_by_data(self, parent_item, search_data):
+        """辅助函数：通过 UserRole 数据定位树状图中的 UI 节点"""
+        for i in range(parent_item.childCount()):
+            item = parent_item.child(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == search_data:
+                return item
+            found = self._find_item_by_data(item, search_data)
+            if found:
+                return found
+        return None
+
+    def start_batch_generate(self):
+        """处理点击批量生成按钮的事件"""
+        if self.is_batch_generating:
+            # 执行取消逻辑
+            self.is_batch_generating = False
+            self.batch_generate_queue.clear()
+            self.btn_batch_generate.setText("🚀 批量生成缺失场景")
+            self.log_console.append("<font color='orange'>⚠️ 已发送停止指令，将在当前节点完成后终止批量任务。</font>")
+            return
+
+        if not self.workspace or not self.outline_tree_data:
+            QMessageBox.warning(self, "提示", "请先打开并加载一个工作区！")
+            return
+
+        missing_nodes = self._get_missing_level3_nodes(self.outline_tree_data.get("nodes", []))
+        if not missing_nodes:
+            QMessageBox.information(self, "提示", "当前没有缺失正文的场景节点（没有灰色节点）。")
+            return
+
+        reply = QMessageBox.question(
+            self, 
+            "确认批量生成", 
+            f"大纲中找到了 {len(missing_nodes)} 个缺失文件（灰色）的场景。\n确认开始依次自动生成吗？这可能需要较长时间。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.batch_generate_queue = missing_nodes
+            self.is_batch_generating = True
+            self.btn_batch_generate.setText("🛑 停止批量生成")
+            self._process_next_batch_node()
+
+    def _process_next_batch_node(self):
+        """从队列中抽取下一个节点并触发生成"""
+        if not self.is_batch_generating:
+            return
+
+        # 队列执行完毕的处理
+        if not self.batch_generate_queue:
+            self.is_batch_generating = False
+            self.btn_batch_generate.setText("🚀 批量生成缺失场景")
+            self.btn_generate.setEnabled(True)
+            self.btn_save.setEnabled(True)
+            self.log_console.append("<b><font color='green'>🎉 批量生成任务全部完成！</font></b>")
+            QMessageBox.information(self, "完成", "批量生成已结束。")
+            return
+
+        # 取出队列第一个节点
+        next_node = self.batch_generate_queue.pop(0)
+        self.log_console.append(f"<hr><b>⏳ 正在自动处理节点: {next_node.get('title')} (队列剩余 {len(self.batch_generate_queue)} 个)</b>")
+
+        # 将当前编辑环境切换到目标节点
+        self.current_editing_node = next_node
+        self.current_setting_path = None
+
+        # 同步该节点的数据到右侧 UI 编辑器中，保证 ContextBuilder 抓取到正确的数据
+        self.summary_editor.setText(next_node.get("summary", ""))
+        self.summary_editor.setEnabled(True)
+        self.content_editor.setText("（自动批量生成中，请稍候...）")
+        self.content_editor.setEnabled(True)
+
+        # 尝试在左侧树状视图中高亮选中该节点，方便用户追踪进度
+        node_id = None
+        for nid, n in self.node_map.items():
+            if n is next_node:
+                node_id = nid
+                break
+
+        if node_id:
+            item = self._find_item_by_data(self.novel_tree.invisibleRootItem(), node_id)
+            if item:
+                self.current_editing_item = item
+                self.novel_tree.setCurrentItem(item)
+
+        # 触发单节点的生成逻辑
+        self.generate_current_node()
+
+    # ================= 原有 AI 生成逻辑（微调回调流） =================
+
     def generate_current_node(self):
-        """调用大模型生成正文（使用 QThread 异步执行）"""
+        # 调用大模型生成正文（使用 QThread 异步执行）"""
         if not self.current_editing_node or not self.outline_tree_data:
             return
             
@@ -856,30 +1006,39 @@ class NovelCreatorWindow(QMainWindow):
     # ================= 新增：异步生成的回调方法 =================
 
     def on_generate_success(self, result: str):
-        """接收子线程成功的信号"""
+        # 接收子线程成功的信号"""
         self.content_editor.setText(result)
-        self.log_console.append("生成成功！已填入编辑器，请确认后点击保存。")
+        self.log_console.append("生成成功！已填入编辑器并自动保存。")
 
         # ================== 【修改点 2：生成成功后自动保存】 ==================
         self.save_current_node()
         # ==================================================================
 
         self._restore_generate_ui_state()
+        
+        # 【修改】如果处于批量生成模式，触发下一个
+        if self.is_batch_generating:
+            self._process_next_batch_node()
 
     def on_generate_error(self, error_msg: str):
-        """接收子线程失败的信号"""
+        # 接收子线程失败的信号"""
         self.log_console.append(f"<font color='red'>生成失败: {error_msg}</font>")
-        QMessageBox.critical(self, "生成错误", f"大模型请求失败:\n{error_msg}")
+        if not self.is_batch_generating:
+            QMessageBox.critical(self, "生成错误", f"大模型请求失败:\n{error_msg}")
         self._restore_generate_ui_state()
+        
+        # 【修改】如果处于批量生成模式，记录错误并继续往下跑
+        if self.is_batch_generating:
+            self.log_console.append("<font color='orange'>⚠️ 当前节点生成失败，跳过并处理下一个...</font>")
+            self._process_next_batch_node()
 
     def _restore_generate_ui_state(self):
-        """恢复界面按钮状态并清理线程"""
-        self.btn_generate.setEnabled(True)
-        self.btn_save.setEnabled(True)
-        # 只有当没有子节点时才允许删除
-        self.btn_delete.setEnabled(not bool(self.current_editing_node.get("children")))
-        
-        # 释放线程引用
+        # 【修改】只有在非批量状态下，才立即恢复按钮启用状态
+        if not self.is_batch_generating:
+            self.btn_generate.setEnabled(True)
+            self.btn_save.setEnabled(True)
+            if self.current_editing_node:
+                self.btn_delete.setEnabled(not bool(self.current_editing_node.get("children")))
         self.generate_thread = None
 
 if __name__ == '__main__':
