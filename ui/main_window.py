@@ -391,14 +391,15 @@ class NovelCreatorWindow(QMainWindow):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            self.editor.setText(content)
+            self.summary_editor.setText(content)
             self.log_console.append(f"打开设定文件: {os.path.basename(file_path)}")
             
             # 更新状态变量，清空小说节点的状态，记录当前设定的路径
             self.current_editing_node = None 
             self.current_setting_path = file_path
             
-            self.editor.setEnabled(True)
+            self.summary_editor.setEnabled(True)
+            self.content_editor.setEnabled(False)
             self.btn_save.setEnabled(True)
             self.btn_generate.setEnabled(False) # 设定文件是纯JSON数据，无需让AI续写正文
             
@@ -501,9 +502,14 @@ class NovelCreatorWindow(QMainWindow):
                     self.log_console.append(f"🗑️ 成功删除节点: {node_title}")
                     
                     # 清理右侧编辑器和按钮状态
+                    # 【修复点 3：清理右侧编辑器和按钮状态，修改错误的变量名】
                     self.current_editing_node = None
-                    self.editor.clear()
-                    self.editor.setEnabled(False)
+                    
+                    # 分别清空和禁用两个编辑框
+                    self.summary_editor.clear()
+                    self.summary_editor.setEnabled(False)
+                    self.content_editor.clear()
+                    self.content_editor.setEnabled(False)
                     self.btn_save.setEnabled(False)
                     self.btn_generate.setEnabled(False)
                     self.btn_delete.setEnabled(False)
@@ -568,16 +574,21 @@ class NovelCreatorWindow(QMainWindow):
         )
         
         self.log_console.append("发送请求至大语言模型，请稍候...")
-        QApplication.processEvents() # 强制刷新 UI，避免界面卡死导致的 Log 不显示
         
         try:
             # 3. 发送请求获取内容
-            # 注意：在生产环境中，网络请求应放入 QThread 中执行，以免阻塞主线程 UI
             prompt_content = messages[-1]["content"]
+            
+            # 【修复点 1：将构建好的 Prompt 打印到 UI 日志框】
+            self.log_console.append("========== 发送给大模型的完整 Prompt ==========")
+            self.log_console.append(prompt_content)
+            self.log_console.append("=================================================")
+            QApplication.processEvents() # 强制刷新 UI，确保日志立刻显示在界面上
+            
             result = self.llm_client.generate_text(prompt_content)
             
-            # 将生成结果写入编辑器
-            self.editor.setText(result)
+            # 【修复点 2：将 self.editor 修改为正确的 self.content_editor】
+            self.content_editor.setText(result)
             self.log_console.append("生成成功！已填入编辑器，请确认后点击保存。")
             
         except Exception as e:

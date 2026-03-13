@@ -1,10 +1,27 @@
+import os
 import logging
+from datetime import datetime
 from openai import OpenAI
 from google import genai
 
-# 设置基础日志记录
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ================= 新增：日志目录与文件配置 =================
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True) # 如果 log 目录不存在则自动创建
+
+# 按天生成日志文件，例如：log/llm_output_20260313.log
+log_filename = os.path.join(log_dir, f"llm_output_{datetime.now().strftime('%Y%m%d')}.log")
+
+# 配置日志：同时输出到文件和控制台，并指定 utf-8 编码防止中文乱码
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
+# =========================================================
 
 class LLMClient:
     def __init__(self, config: dict):
@@ -58,9 +75,6 @@ class LLMClient:
     def generate_text(self, prompt: str, context_messages: list = None) -> str:
         """
         生成小说正文或概要
-        :param prompt: 当前的请求提示词
-        :param context_messages: 历史上下文记录 (OpenAI 格式的 [{"role": "user", "content": "..."}] 列表)
-        :return: 生成的 Markdown 文本
         """
         if context_messages is None:
             context_messages = []
@@ -74,12 +88,15 @@ class LLMClient:
                 response = self.text_client.chat.completions.create(
                     model=self.text_model_name,
                     messages=messages,
-                    temperature=0.7 # 小说创作可以适当提高随机性
+                    temperature=0.7
                 )
-                return response.choices[0].message.content
+                
+                # 【修改点】：提取文本，写入日志后再返回
+                result = response.choices[0].message.content
+                logger.info(f"\n========== {self.text_model_name} 原始返回 ==========\n{result}\n==================================================\n")
+                return result
 
             elif self.text_type == "gemini":
-                # 将 OpenAI 格式的 context 转换为 Gemini 的 history 格式
                 history = []
                 for msg in context_messages:
                     role = "user" if msg["role"] == "user" else "model"
@@ -87,7 +104,11 @@ class LLMClient:
                 
                 chat = self.gemini_text_model.start_chat(history=history)
                 response = chat.send_message(prompt)
-                return response.text
+                
+                # 【修改点】：提取文本，写入日志后再返回
+                result = response.text
+                logger.info(f"\n========== Gemini 原始返回 ==========\n{result}\n=======================================\n")
+                return result
                 
         except Exception as e:
             logger.error(f"文本生成失败: {e}")
