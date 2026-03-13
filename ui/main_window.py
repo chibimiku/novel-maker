@@ -29,14 +29,15 @@ class GenerateTaskThread(QThread):
         self.prompt_content = prompt_content
 
     def run(self):
-        # 线程启动后自动执行的方法
         try:
-            # 这里执行耗时的网络请求，此时不会阻塞主 UI
             result = self.llm_client.generate_text(self.prompt_content)
-            # 请求完成后，发射成功信号，附带生成的文本
-            self.success_signal.emit(result)
+            # 【防雪崩修复】：拦截 llm_client 返回的文本格式错误信息
+            if result.strip().startswith("> **生成失败:**"):
+                error_msg = result.replace("> **生成失败:**", "").strip()
+                self.error_signal.emit(error_msg)
+            else:
+                self.success_signal.emit(result)
         except Exception as e:
-            # 如果发生异常，发射错误信号
             self.error_signal.emit(str(e))
 
 class NovelCreatorWindow(QMainWindow):
@@ -583,7 +584,8 @@ class NovelCreatorWindow(QMainWindow):
                 else:
                     self.content_editor.setText(f"# {real_node.get('title')}\n\n(文件尚未生成)")
             else:
-                self.content_editor.setText("尚未配置正文路径。")
+                # 【修复点】：改成标准标题格式，避免大段非剧情文字干扰 AI
+                self.content_editor.setText(f"# {real_node.get('title')}\n\n(尚未配置正文路径，在此输入内容并保存后将自动生成)")
                 
             self.content_editor.setEnabled(True)
             self.btn_generate.setEnabled(True)
@@ -701,27 +703,31 @@ class NovelCreatorWindow(QMainWindow):
         if not self.workspace:
             return
             
-        # ====== 场景 A: 保存小说节点 ======
         if self.current_editing_node:
-            # 1. 始终保存概要到内存字典
             self.current_editing_node["summary"] = self.summary_editor.toPlainText()
             
-            # 2. 如果正文框是启用的(证明是场景节点)，则将正文落盘 MD 文件
             if self.content_editor.isEnabled():
                 content = self.content_editor.toPlainText()
                 rel_path = self.current_editing_node.get("file_path")
-                if rel_path:
-                    try:
-                        new_md5 = self.workspace.save_markdown_file(rel_path, content)
-                        self.current_editing_node["md5"] = new_md5
-                        self.current_editing_node["_status"] = "ok"
-                        if self.current_editing_item:
-                            self.current_editing_item.setForeground(0, Qt.GlobalColor.black)
-                    except Exception as e:
-                        QMessageBox.critical(self, "错误", f"保存正文文件失败:\n{e}")
-                        return
+                
+                # 【修复点】：如果没有配置文件路径，则自动生成一个并绑定
+                if not rel_path:
+                    import uuid
+                    rel_path = f"场景_{uuid.uuid4().hex[:8]}.md"
+                    self.current_editing_node["file_path"] = rel_path
+                    
+                try:
+                    # 将内容写入新生成或已有的路径中
+                    new_md5 = self.workspace.save_markdown_file(rel_path, content)
+                    self.current_editing_node["md5"] = new_md5
+                    self.current_editing_node["_status"] = "ok"
+                    # 恢复树状图节点的颜色为黑色
+                    if self.current_editing_item:
+                        self.current_editing_item.setForeground(0, Qt.GlobalColor.black)
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"保存正文文件失败:\n{e}")
+                    return
             
-            # 3. 将包含概要的树结构统一保存至系统 JSON
             try:
                 self.workspace.save_outline_tree(self.outline_tree_data)
                 self.log_console.append(f"💾 节点保存成功: {self.current_editing_node.get('title')}")
@@ -729,10 +735,9 @@ class NovelCreatorWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"保存大纲树失败:\n{e}")
             return
 
-        # ====== 场景 B: 保存设定 JSON文件 (与上一版保持一致) ======
         if self.current_setting_path and os.path.exists(self.current_setting_path):
             try:
-                parsed_json = json.loads(self.summary_editor.toPlainText()) # 这里假设你把设定也加载到上方的框里了
+                parsed_json = json.loads(self.summary_editor.toPlainText()) 
                 with open(self.current_setting_path, 'w', encoding='utf-8') as f:
                     json.dump(parsed_json, f, ensure_ascii=False, indent=4)
                 self.log_console.append(f"💾 设定保存成功: {os.path.basename(self.current_setting_path)}")
@@ -923,10 +928,12 @@ class NovelCreatorWindow(QMainWindow):
         self.current_editing_node = next_node
         self.current_setting_path = None
 
-        # 同步该节点的数据到右侧 UI 编辑器中，保证 ContextBuilder 抓取到正确的数据
         self.summary_editor.setText(next_node.get("summary", ""))
         self.summary_editor.setEnabled(True)
-        self.content_editor.setText("（自动批量生成中，请稍候...）")
+        
+        # 【修复点】：千万不要直接填入“生成中...”，会被保存进物理文件并污染AI的上下文。
+        # 这里填入标准的空标题，ContextBuilder 内部判定时会自动将其当做空文件处理。
+        self.content_editor.setText(f"# {next_node.get('title')}\n\n")
         self.content_editor.setEnabled(True)
 
         # 尝试在左侧树状视图中高亮选中该节点，方便用户追踪进度
@@ -942,8 +949,11 @@ class NovelCreatorWindow(QMainWindow):
                 self.current_editing_item = item
                 self.novel_tree.setCurrentItem(item)
 
-        # 触发单节点的生成逻辑
+        # 触发单节点的生成逻辑 (这一步会先抽取当前编辑器内容进行 save_current_node)
         self.generate_current_node()
+        
+        # 【修复点】：在触发生成、上下文已经构建并发送给大模型后，再更新 UI 提示给用户看。
+        self.content_editor.setText("（自动批量生成中，请稍候...）")
 
     # ================= 原有 AI 生成逻辑（微调回调流） =================
 
