@@ -52,7 +52,7 @@ class NovelCreatorWindow(QMainWindow):
         self.current_editing_item = None  # 当前在树状视图中选中的 QTreeWidgetItem 实例
         self.current_setting_path = None  # 【新增】当前编辑的设定文件绝对路径
         self.node_map = {}                # 【新增】节点内存引用的绝对映射表
-		self._updating_settings = False   
+        self._updating_settings = False   
         
         # 加载配置并初始化 LLM 客户端
         self.config = self._load_config()
