@@ -12,7 +12,8 @@ class ContextBuilder:
         """
         self.workspace = workspace_manager
 
-    def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list, generate_image: bool = True, word_count: int = 5000) -> list:
+    # 【修改点 1】：新增 include_next 参数
+    def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list, generate_image: bool = True, word_count: int = 5000, include_next: bool = True) -> list:
         """
         构建最终发送给大模型的上下文消息列表（OpenAI 格式）
         """
@@ -23,7 +24,8 @@ class ContextBuilder:
         parents, prev_node, next_node = self._find_node_context(tree_data.get("nodes", []), target_node)
         
         # 3. 拼接上下文结构（大纲关联信息）
-        outline_context_text = self._build_outline_context_text(parents, prev_node, next_node)
+        # 【修改点 2】：根据 UI 传来的开关，决定是否丢弃 next_node 的信息
+        outline_context_text = self._build_outline_context_text(parents, prev_node, next_node if include_next else None)
 
         # 4. 分离获取当前场景的【概要】和【已有正文】
         target_summary = target_node.get("summary", "").strip()
@@ -195,6 +197,7 @@ class ContextBuilder:
 ### 三、 当前生成任务
 你需要生成正文的当前场景是：【{target_title}】。
 【字数要求】：请务必生成大约 {word_count} 字左右的内容，细节要丰满。
+【剧情延续性警告】：本场景仅为宏大故事链条中的一个过渡或阶段。请务必保持故事的开放性、悬念与发展空间，严禁在本场景中强行完结整个故事或写出类似大结局的总结性段落！
 
 【本场景剧情概要】（你必须严格遵循此情节主线进行创作）：
 {target_summary}

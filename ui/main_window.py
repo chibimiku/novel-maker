@@ -52,6 +52,7 @@ class NovelCreatorWindow(QMainWindow):
         self.current_editing_item = None  # 当前在树状视图中选中的 QTreeWidgetItem 实例
         self.current_setting_path = None  # 【新增】当前编辑的设定文件绝对路径
         self.node_map = {}                # 【新增】节点内存引用的绝对映射表
+		self._updating_settings = False   
         
         # 加载配置并初始化 LLM 客户端
         self.config = self._load_config()
@@ -209,6 +210,11 @@ class NovelCreatorWindow(QMainWindow):
         self.cb_gen_image = QCheckBox("生成图片占位符")
         self.cb_gen_image.setChecked(False) # 【修改】取消默认勾选
         param_layout.addWidget(self.cb_gen_image)
+        
+        # 【修改点 1】：加入后续节点开关
+        self.cb_include_next = QCheckBox("纳入后续节点上下文")
+        self.cb_include_next.setChecked(True) 
+        param_layout.addWidget(self.cb_include_next)
         
         param_layout.addWidget(QLabel(" 目标生成字数:"))
         self.spin_word_count = QSpinBox()
@@ -450,8 +456,11 @@ class NovelCreatorWindow(QMainWindow):
             title = node.get("title", "未命名节点")
             item = QTreeWidgetItem(parent_widget, [title])
             
-            # 【修改】允许常规节点可被拖拽和接受拖放
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+            # 【修改点 2】：利用标志位控制。针对第三级节点，移除其作为拖放目标的属性，从而杜绝下挂子节点
+            if level == 3:
+                item.setFlags((item.flags() | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled)
+            else:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
             
             node_id = str(uuid.uuid4())
             self.node_map[node_id] = node
@@ -820,7 +829,8 @@ class NovelCreatorWindow(QMainWindow):
             self.outline_tree_data, 
             checked_paths,
             generate_image=self.cb_gen_image.isChecked(),
-            word_count=self.spin_word_count.value()
+            word_count=self.spin_word_count.value(),
+            include_next=self.cb_include_next.isChecked()
         )
         
         prompt_content = messages[-1]["content"]
