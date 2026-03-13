@@ -141,10 +141,25 @@ class NovelCreatorWindow(QMainWindow):
         self.setting_tree = QTreeWidget()
         self.setting_tree.setHeaderLabel("世界观设定")
         self.setting_tree.itemClicked.connect(self.on_setting_node_clicked)
+        # 【修改】绑定项改变信号，处理父子勾选联动
+        self.setting_tree.itemChanged.connect(self.on_setting_item_changed)
         splitter.addWidget(self.setting_tree)
 
         self.novel_tree = QTreeWidget()
         self.novel_tree.setHeaderLabel("小说大纲结构")
+        
+        # 【修改】开启大纲树的拖拽支持
+        self.novel_tree.setDragEnabled(True)
+        self.novel_tree.setAcceptDrops(True)
+        self.novel_tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
+        # 劫持 dropEvent 以便在拖放结束后更新底层 JSON 数据
+        original_drop_event = self.novel_tree.dropEvent
+        def custom_drop_event(event):
+            original_drop_event(event)
+            self._cleanup_tree_add_buttons() # 修复按钮视觉位置
+            self.sync_tree_data_from_ui()    # 同步并保存数据
+        self.novel_tree.dropEvent = custom_drop_event
+        
         self.novel_tree.itemClicked.connect(self.on_novel_node_clicked)
         splitter.addWidget(self.novel_tree)
 
@@ -168,9 +183,19 @@ class NovelCreatorWindow(QMainWindow):
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
         content_layout.setContentsMargins(0,0,0,0)
-        content_layout.addWidget(QLabel("节点正文 (Content - 保存至 .md 文件):"))
+        
+        # 【修改】增加字数统计标签布局
+        content_header_layout = QHBoxLayout()
+        content_header_layout.addWidget(QLabel("节点正文 (Content - 保存至 .md 文件):"))
+        self.word_count_label = QLabel("当前字数: 0")
+        self.word_count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.word_count_label.setStyleSheet("color: gray;")
+        content_header_layout.addWidget(self.word_count_label)
+        content_layout.addLayout(content_header_layout)
+        
         self.content_editor = QTextEdit()
         self.content_editor.setEnabled(False)
+        self.content_editor.textChanged.connect(self.update_word_count) # 绑定字数统计
         content_layout.addWidget(self.content_editor)
         editor_splitter.addWidget(content_widget)
         
@@ -178,11 +203,11 @@ class NovelCreatorWindow(QMainWindow):
         detail_layout.addWidget(editor_splitter)
 
 
-        # ================= 【新增】生成参数控制栏 =================
+        # ================= 生成参数控制栏 =================
         param_layout = QHBoxLayout()
         
         self.cb_gen_image = QCheckBox("生成图片占位符")
-        self.cb_gen_image.setChecked(True)
+        self.cb_gen_image.setChecked(False) # 【修改】取消默认勾选
         param_layout.addWidget(self.cb_gen_image)
         
         param_layout.addWidget(QLabel(" 目标生成字数:"))
@@ -223,6 +248,114 @@ class NovelCreatorWindow(QMainWindow):
         self.log_console.setFixedHeight(150)
         self.log_console.append("系统初始化完成。")
         main_layout.addWidget(self.log_console, stretch=1)
+
+    # ================= 【新增】UI 辅助方法 ================= #
+    def update_word_count(self):
+        """实时更新正文字数统计"""
+        text = self.content_editor.toPlainText()
+        # 简单过滤掉换行和空格，更接近实际汉字/有效字符数
+        clean_text = text.replace(' ', '').replace('\n', '').replace('\t', '')
+        self.word_count_label.setText(f"当前字数: {len(clean_text)}")
+
+    def on_setting_item_changed(self, item, column):
+        """【修改】处理设定树的勾选状态联动"""
+        if self._updating_settings:
+            return
+        self._updating_settings = True
+
+        state = item.checkState(column)
+        
+        # 1. 如果改变的是父节点（分类），将状态同步给子节点
+        if item.parent() is None:
+            for i in range(item.childCount()):
+                child = item.child(i)
+                # 跳过“+ 新增”按钮
+                if not child.text(0).startswith("+"):
+                    child.setCheckState(0, state)
+                    
+        # 2. 如果改变的是子节点（文件），向上计算父节点状态
+        else:
+            parent = item.parent()
+            all_checked = True
+            all_unchecked = True
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if child.text(0).startswith("+"):
+                    continue
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    all_unchecked = False
+                elif child.checkState(0) == Qt.CheckState.Unchecked:
+                    all_checked = False
+                else: # PartiallyChecked
+                    all_checked = False
+                    all_unchecked = False
+
+            if all_checked:
+                parent.setCheckState(0, Qt.CheckState.Checked)
+            elif all_unchecked:
+                parent.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+        self._updating_settings = False
+
+    def _cleanup_tree_add_buttons(self, parent_item=None):
+        """【修改】拖拽后保证“+ 新增”按钮始终处于列表末尾"""
+        target = parent_item if parent_item else self.novel_tree.invisibleRootItem()
+        
+        add_btn_index = -1
+        for i in range(target.childCount()):
+            child = target.child(i)
+            if child.text(0).startswith("+"):
+                add_btn_index = i
+                break
+                
+        if add_btn_index != -1 and add_btn_index < target.childCount() - 1:
+            add_btn = target.takeChild(add_btn_index)
+            target.addChild(add_btn)
+            
+        for i in range(target.childCount()):
+            child = target.child(i)
+            if not child.text(0).startswith("+"):
+                self._cleanup_tree_add_buttons(child)
+
+    def sync_tree_data_from_ui(self):
+        """【修改】将UI界面上的树状结构反向同步回 JSON 内存模型并保存"""
+        if not self.workspace or self.outline_tree_data is None:
+            return
+            
+        new_nodes = []
+        root = self.novel_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            if item.text(0).startswith("+"): continue
+            node_data = self._build_node_data_from_item(item)
+            if node_data:
+                new_nodes.append(node_data)
+                
+        self.outline_tree_data["nodes"] = new_nodes
+        self.workspace.save_outline_tree(self.outline_tree_data)
+        self.log_console.append("系统通知：节点位置结构已自动保存。")
+
+    def _build_node_data_from_item(self, item):
+        """【修改】递归辅助函数：从 UI Item 重建字典数据"""
+        node_id = item.data(0, Qt.ItemDataRole.UserRole)
+        node_data = self.node_map.get(node_id)
+        if not node_data:
+            return None
+            
+        new_children = []
+        for i in range(item.childCount()):
+            child_item = item.child(i)
+            if child_item.text(0).startswith("+"): continue
+            child_data = self._build_node_data_from_item(child_item)
+            if child_data:
+                new_children.append(child_data)
+                
+        node_data["children"] = new_children
+        return node_data
+
+    # ================= UI 交互与业务逻辑 ================= #
 
     def open_settings_dialog(self):
         """打开设置对话框，保存后自动重载配置"""
@@ -270,6 +403,7 @@ class NovelCreatorWindow(QMainWindow):
         
         # 1. 渲染设定树 (保持不变)
         self.setting_tree.setHeaderLabel("世界观设定 (勾选参与上下文)")
+        self._updating_settings = True # 建树时禁止触发信号
         for cat in self.workspace.setting_dirs:
             cat_item = QTreeWidgetItem(self.setting_tree, [cat])
             cat_item.setFlags(cat_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -281,9 +415,16 @@ class NovelCreatorWindow(QMainWindow):
                     if file.endswith('.json') and file != 'template.json':
                         file_item = QTreeWidgetItem(cat_item, [file.replace('.json', '')])
                         file_item.setData(0, Qt.ItemDataRole.UserRole, os.path.join(cat_path, file))
+                        # 【修改】子节点同样开启勾选
+                        file_item.setFlags(file_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        file_item.setCheckState(0, Qt.CheckState.Checked)
 
             add_btn = QTreeWidgetItem(cat_item, ["+ 新增设定..."])
             add_btn.setForeground(0, Qt.GlobalColor.blue)
+            # 禁止勾选“新增”按钮
+            add_btn.setFlags(add_btn.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            
+        self._updating_settings = False
         self.setting_tree.expandAll()
 
         # 2. 渲染小说目录树
@@ -309,6 +450,9 @@ class NovelCreatorWindow(QMainWindow):
             title = node.get("title", "未命名节点")
             item = QTreeWidgetItem(parent_widget, [title])
             
+            # 【修改】允许常规节点可被拖拽和接受拖放
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+            
             node_id = str(uuid.uuid4())
             self.node_map[node_id] = node
             item.setData(0, Qt.ItemDataRole.UserRole, node_id)
@@ -331,6 +475,8 @@ class NovelCreatorWindow(QMainWindow):
         
         add_btn = QTreeWidgetItem(parent_widget, [btn_text])
         add_btn.setForeground(0, Qt.GlobalColor.blue)
+        # 【修改】严格禁止“+新增”按钮被拖拽或接收拖放
+        add_btn.setFlags(add_btn.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
 
     def on_novel_node_clicked(self, item, column):
         if not self.workspace:
@@ -388,6 +534,8 @@ class NovelCreatorWindow(QMainWindow):
             self.content_editor.setText("（当前层级仅支持填写概要，正文请在底层的“场景”节点中生成/编写）")
             self.content_editor.setEnabled(False)
             self.btn_generate.setEnabled(False)
+            
+        self.update_word_count() # 【修改】更新字数
 
     def add_new_novel_node(self, target_list: list, level: int):
         """弹出输入框，按层级创建小说新节点"""
@@ -633,8 +781,8 @@ class NovelCreatorWindow(QMainWindow):
             cat_item = root.child(i)
             for j in range(cat_item.childCount()):
                 file_item = cat_item.child(j)
-                # 检查该文件节点本身或其父级分类是否被勾选
-                if file_item.checkState(0) == Qt.CheckState.Checked or cat_item.checkState(0) == Qt.CheckState.Checked:
+                # 【修改】子节点勾选或处于部分勾选状态都会被包含进上下文
+                if file_item.checkState(0) == Qt.CheckState.Checked:
                     path = file_item.data(0, Qt.ItemDataRole.UserRole)
                     if path and os.path.exists(path):
                         checked_paths.append(path)
