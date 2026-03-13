@@ -985,7 +985,10 @@ class NovelCreatorWindow(QMainWindow):
         
         prompt_content = messages[-1]["content"]
         
-        self.log_console.append("========== 发送给大模型的完整 Prompt ==========")
+        # 【修改】分别打印 System 指令和 User 提示词，避免产生未生效的错觉
+        self.log_console.append("========== [System] 模型系统指令 (Instructions) ==========")
+        self.log_console.append(self.llm_client.system_instruction)
+        self.log_console.append("========== [User] 上下文与生成提示词 ==========")
         self.log_console.append(prompt_content)
         self.log_console.append("=================================================")
         self.log_console.append("发送请求至大语言模型，后台处理中，请稍候...")
