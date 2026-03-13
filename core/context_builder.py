@@ -12,14 +12,14 @@ class ContextBuilder:
         """
         self.workspace = workspace_manager
 
-    def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list) -> list:
+    def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list, generate_image: bool = True, word_count: int = 5000) -> list:
         """
         构建最终发送给大模型的上下文消息列表（OpenAI 格式）
         """
         # 1. 解析并拼接打钩的世界观设定
         settings_text = self._build_settings_text(checked_setting_paths)
 
-        # 2. 在大纲树中寻找当前节点的位置，获取父节点（章/节）和兄弟节点（上一场景/下一场景）
+        # 2. 在大纲树中寻找当前节点的位置
         parents, prev_node, next_node = self._find_node_context(tree_data.get("nodes", []), target_node)
         
         # 3. 拼接上下文结构（大纲关联信息）
@@ -31,17 +31,18 @@ class ContextBuilder:
             target_summary = "(当前场景暂无概要，请根据前后文和设定自由发挥)"
 
         target_content = self._read_node_content(target_node).strip()
-        # 排除掉只有标题占位符的空文件情况
         if not target_content or (target_content.startswith("#") and len(target_content.split('\n')) <= 3):
             target_content = "(当前正文为空，请从头开始撰写本场景正文)"
 
-        # 5. 组装终极 Prompt
+        # 5. 组装终极 Prompt，传入新增的参数
         prompt = self._assemble_final_prompt(
             target_title=target_node.get("title", "未命名场景"),
             settings_text=settings_text,
             outline_context_text=outline_context_text,
             target_summary=target_summary,
-            target_content=target_content
+            target_content=target_content,
+            generate_image=generate_image,
+            word_count=word_count
         )
 
         return [{"role": "user", "content": prompt}]
@@ -153,8 +154,17 @@ class ContextBuilder:
                 return ""
         return ""
 
-    def _assemble_final_prompt(self, target_title: str, settings_text: str, outline_context_text: str, target_summary: str, target_content: str) -> str:
+    def _assemble_final_prompt(self, target_title: str, settings_text: str, outline_context_text: str, target_summary: str, target_content: str, generate_image: bool, word_count: int) -> str:
         """拼接终极提示词，明确区分概要与正文的任务要求"""
+        
+        # 动态处理图片生成规则
+        image_rule = ""
+        if generate_image:
+            image_rule = """
+3. 【插图生成规则】：应当在你认为适合表现画面的位置（如人物初登场、宏大场景、激烈冲突）插入图片描述符。请严格按照以下格式留下引用占位符，务必使用英文描述画面细节以便后续AI画图：
+   `![English description of the scene, highly detailed, cinematic lighting](/images/placeholder_xxx.png)`
+   请自行替换描述内容和 xxx 的占位编号。"""
+
         prompt = f"""
 你是一个专业的小说创作者。请根据提供的世界观设定、大纲上下文，为指定的场景生成完整的小说正文内容。
 
@@ -166,6 +176,7 @@ class ContextBuilder:
 
 ### 三、 当前生成任务
 你需要生成正文的当前场景是：【{target_title}】。
+【字数要求】：请务必生成大约 {word_count} 字左右的内容，细节要丰满。
 
 【本场景剧情概要】（你必须严格遵循此情节主线进行创作）：
 {target_summary}
@@ -175,9 +186,6 @@ class ContextBuilder:
 
 ### 四、 输出格式与要求
 1. 请根据上述信息，充分发挥创造力，输出【{target_title}】的正文内容。内容应当连贯、生动、符合人物性格与世界观设定。
-2. 必须直接输出小说正文，采用 Markdown 格式排版。
-3. 【插图生成规则】：应当在你认为适合表现画面的位置（如人物初登场、宏大场景、激烈冲突）插入图片描述符。请严格按照以下格式留下引用占位符，务必使用英文描述画面细节以便后续AI画图：
-   `![English description of the scene, highly detailed, cinematic lighting](/images/placeholder_xxx.png)`
-   请自行替换描述内容和 xxx 的占位编号。
+2. 必须直接输出小说正文，采用 Markdown 格式排版。{image_rule}
 """
         return prompt.strip()

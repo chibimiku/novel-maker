@@ -7,7 +7,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit, 
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QFileDialog, QMessageBox, 
-                             QInputDialog) # 【新增】导入 QInputDialog
+                             QInputDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
+from PyQt6.QtGui import QKeySequence # 【新增】用于绑定快捷键
 from PyQt6.QtCore import Qt
 
 # 导入核心逻辑层组件
@@ -36,6 +37,45 @@ class NovelCreatorWindow(QMainWindow):
         self.llm_client = LLMClient(self.config) if self.config else None
 
         self.init_ui()
+
+        # 【新增】自动加载最近的工作区
+        sys_state = self._load_sys_state()
+        recent_workspaces = sys_state.get("recent_workspaces", [])
+        if recent_workspaces and os.path.exists(recent_workspaces[0]):
+            self._load_workspace_by_path(recent_workspaces[0])
+
+    # ================= 新增：系统级状态管理（保存最近工作区） =================
+    def _get_sys_state_path(self):
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base_dir, "conf", "sys_state.json")
+
+    def _load_sys_state(self) -> dict:
+        path = self._get_sys_state_path()
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"recent_workspaces": []}
+
+    def _save_sys_state(self, workspace_path: str):
+        state = self._load_sys_state()
+        recents = state.get("recent_workspaces", [])
+        # 如果已存在，先移出，再插到最前面
+        if workspace_path in recents:
+            recents.remove(workspace_path)
+        recents.insert(0, workspace_path)
+        # 只保留最近 10 个
+        state["recent_workspaces"] = recents[:10]
+        
+        path = self._get_sys_state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"保存系统状态失败: {e}")
 
     def _get_item_level(self, item):
         """计算当前树节点的层级深度 (1=章, 2=节, 3=场景)"""
@@ -66,6 +106,7 @@ class NovelCreatorWindow(QMainWindow):
         open_action = file_menu.addAction('打开/创建工作区')
         open_action.triggered.connect(self.open_workspace)
         save_action = file_menu.addAction('保存全部')
+        save_action.setShortcut(QKeySequence("Ctrl+S")) # 【新增】绑定 Ctrl+S 快捷键
         save_action.triggered.connect(self.save_all)
         setting_menu = menubar.addMenu('设置')
         settings_action = setting_menu.addAction('系统配置 (API/模型)')
@@ -114,6 +155,25 @@ class NovelCreatorWindow(QMainWindow):
         
         editor_splitter.setSizes([300, 700])
         detail_layout.addWidget(editor_splitter)
+
+
+        # ================= 【新增】生成参数控制栏 =================
+        param_layout = QHBoxLayout()
+        
+        self.cb_gen_image = QCheckBox("生成图片占位符")
+        self.cb_gen_image.setChecked(True)
+        param_layout.addWidget(self.cb_gen_image)
+        
+        param_layout.addWidget(QLabel(" 目标生成字数:"))
+        self.spin_word_count = QSpinBox()
+        self.spin_word_count.setRange(50, 20000) # 允许范围：500 - 20000字
+        self.spin_word_count.setSingleStep(50)   # 每次加减 500
+        self.spin_word_count.setValue(500)       # 默认 5000
+        param_layout.addWidget(self.spin_word_count)
+        
+        param_layout.addStretch() # 将控件推到左侧
+        detail_layout.addLayout(param_layout)
+        # ==========================================================
         
         # 底部按钮
         btn_layout = QHBoxLayout()
@@ -160,18 +220,23 @@ class NovelCreatorWindow(QMainWindow):
         """弹出文件夹选择框，初始化工作区"""
         folder_path = QFileDialog.getExistingDirectory(self, "选择或创建小说工程目录")
         if folder_path:
-            try:
-                self.workspace = WorkspaceManager(folder_path)
-                self.workspace.init_workspace()
-                
-                self.log_console.append(f"成功加载工作区: {folder_path}")
-                self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
-                
-                self.refresh_ui_from_workspace()
-                
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"无法加载工作区:\n{str(e)}")
-                self.log_console.append(f"<font color='red'>工作区加载失败: {e}</font>")
+            self._load_workspace_by_path(folder_path)
+
+    def _load_workspace_by_path(self, folder_path):
+        """核心加载工作区逻辑"""
+        try:
+            self.workspace = WorkspaceManager(folder_path)
+            self.workspace.init_workspace()
+            
+            self._save_sys_state(folder_path) # 【新增】保存到最近工作区列表
+            
+            self.log_console.append(f"成功加载工作区: {folder_path}")
+            self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
+            
+            self.refresh_ui_from_workspace()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"无法加载工作区:\n{str(e)}")
+            self.log_console.append(f"<font color='red'>工作区加载失败: {e}</font>")
 
     def refresh_ui_from_workspace(self):
         """清空现有树并从 workspace 重新加载数据渲染"""
@@ -521,13 +586,18 @@ class NovelCreatorWindow(QMainWindow):
                 QMessageBox.warning(self, "错误", "在大纲树中未找到该节点，删除操作中断。")
 
     def save_all(self):
-        """处理全局保存菜单动作"""
+        """处理全局保存菜单动作 (Ctrl+S 触发)"""
         if self.workspace and self.outline_tree_data:
             self.workspace.save_outline_tree(self.outline_tree_data)
-            self.log_console.append("执行全局工作区设定保存...")
-            QMessageBox.information(self, "提示", "工作区系统数据保存成功！")
+            
+            # 顺便尝试把当前正在编辑的节点物理文件也保存一下
+            if self.current_editing_node and self.content_editor.isEnabled():
+                self.save_current_node()
+                
+            self.log_console.append("<b><font color='green'>[系统通知] 执行全局保存成功 (Ctrl+S)。</font></b>")
+            self.statusBar().showMessage("全局保存成功", 1000) # 可选：在底部状态栏闪烁1秒提示
         else:
-            QMessageBox.warning(self, "警告", "当前没有活动的工作区或修改。")
+            self.log_console.append("<font color='orange'>全局保存跳过：当前没有打开工作区。</font>")
 
     # ================= AI 生成核心逻辑 ================= #
 
@@ -566,11 +636,13 @@ class NovelCreatorWindow(QMainWindow):
         builder = ContextBuilder(self.workspace)
         checked_paths = self.get_checked_settings()
         
-        # 2. 构建 Prompt 消息
+        # 2. 构建 Prompt 消息（【修改】传入 UI 设置的参数）
         messages = builder.build_generation_prompt(
             self.current_editing_node, 
             self.outline_tree_data, 
-            checked_paths
+            checked_paths,
+            generate_image=self.cb_gen_image.isChecked(),
+            word_count=self.spin_word_count.value()
         )
         
         self.log_console.append("发送请求至大语言模型，请稍候...")
