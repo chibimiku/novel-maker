@@ -10,6 +10,7 @@ if project_root not in sys.path:
 
 # 导入我们的主窗口类
 from ui.main_window import NovelCreatorWindow
+from ui.theme import get_dark_stylesheet
 
 def setup_global_logging():
     """初始化全局日志配置，将 log 输出到控制台和 /log/app.log 文件"""
@@ -39,6 +40,10 @@ def main():
     # 可选：设置应用程序的全局属性
     app.setApplicationName("AI Novel Creator")
     app.setApplicationVersion("1.0.0")
+    
+    # 应用暗色主题
+    app.setStyle("Fusion")  # Fusion 风格是暗色主题的最佳基础
+    app.setStyleSheet(get_dark_stylesheet())
     
     # 4. 实例化并显示主窗口
     try:

@@ -8,8 +8,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QFileDialog, QMessageBox, 
                              QInputDialog, QDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
-from PyQt6.QtGui import QKeySequence # 【新增】用于绑定快捷键
+from PyQt6.QtGui import QKeySequence, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+# 导入暗色主题配色常量
+from ui.theme import NODE_NORMAL, NODE_MISSING, NODE_ERROR, NODE_ADD_BTN, TEXT_SECONDARY
 
 # 导入核心逻辑层组件
 # 假设运行入口在项目根目录，core 文件夹与 ui 文件夹平级
@@ -202,7 +205,7 @@ class NovelCreatorWindow(QMainWindow):
         content_header_layout.addWidget(QLabel("节点正文 (Content - 保存至 .md 文件):"))
         self.word_count_label = QLabel("当前字数: 0")
         self.word_count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.word_count_label.setStyleSheet("color: gray;")
+        self.word_count_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
         content_header_layout.addWidget(self.word_count_label)
         content_layout.addLayout(content_header_layout)
         
@@ -463,7 +466,7 @@ class NovelCreatorWindow(QMainWindow):
                         file_item.setCheckState(0, Qt.CheckState.Checked)
 
             add_btn = QTreeWidgetItem(cat_item, ["+ 新增设定..."])
-            add_btn.setForeground(0, Qt.GlobalColor.blue)
+            add_btn.setForeground(0, QColor(NODE_ADD_BTN))
             # 禁止勾选“新增”按钮
             add_btn.setFlags(add_btn.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             
@@ -508,13 +511,13 @@ class NovelCreatorWindow(QMainWindow):
             # 【修改点 3】：基于层级进行渲染，仅第3级缺失文件变色，1/2级固定黑色
             if level == 3:
                 if status == "missing":
-                    item.setForeground(0, Qt.GlobalColor.gray)
+                    item.setForeground(0, QColor(NODE_MISSING))
                 elif status == "modified_externally":
-                    item.setForeground(0, Qt.GlobalColor.red)
+                    item.setForeground(0, QColor(NODE_ERROR))
                 else:
-                    item.setForeground(0, Qt.GlobalColor.black)
+                    item.setForeground(0, QColor(NODE_NORMAL))
             else:
-                item.setForeground(0, Qt.GlobalColor.black)
+                item.setForeground(0, QColor(NODE_NORMAL))
                 
             if "children" not in node:
                 node["children"] = []
@@ -527,7 +530,7 @@ class NovelCreatorWindow(QMainWindow):
         btn_text = titles.get(level, "+ 新增节点...")
         
         add_btn = QTreeWidgetItem(parent_widget, [btn_text])
-        add_btn.setForeground(0, Qt.GlobalColor.blue)
+        add_btn.setForeground(0, QColor(NODE_ADD_BTN))
         # 【修改】严格禁止“+新增”按钮被拖拽或接收拖放
         add_btn.setFlags(add_btn.flags() & ~Qt.ItemFlag.ItemIsDragEnabled & ~Qt.ItemFlag.ItemIsDropEnabled)
 
@@ -723,7 +726,7 @@ class NovelCreatorWindow(QMainWindow):
                     self.current_editing_node["_status"] = "ok"
                     # 恢复树状图节点的颜色为黑色
                     if self.current_editing_item:
-                        self.current_editing_item.setForeground(0, Qt.GlobalColor.black)
+                        self.current_editing_item.setForeground(0, QColor(NODE_NORMAL))
                 except Exception as e:
                     QMessageBox.critical(self, "错误", f"保存正文文件失败:\n{e}")
                     return
@@ -1055,7 +1058,10 @@ class NovelCreatorWindow(QMainWindow):
         self.generate_thread = None
 
 if __name__ == '__main__':
+    from ui.theme import get_dark_stylesheet
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(get_dark_stylesheet())
     window = NovelCreatorWindow()
     window.show()
     sys.exit(app.exec())
