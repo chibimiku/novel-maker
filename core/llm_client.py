@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from openai import OpenAI
 from google import genai
+import httpx
 
 # ================= 新增：日志目录与文件配置 =================
 log_dir = "log"
@@ -30,6 +31,18 @@ class LLMClient:
         :param config: 包含 text_api 和 image_api 配置的字典（通常从 setting.json 读取）
         """
         self.config = config
+        # 提取代理配置
+        self.proxy_cfg = self.config.get("proxy", {})
+        self.proxy_enabled = self.proxy_cfg.get("enabled", False)
+        self.proxy_url = self.proxy_cfg.get("url", "http://127.0.0.1:7890")
+
+        # 针对 Gemini 等部分依赖环境变量的库，设置全局代理环境变量
+        if self.proxy_enabled and self.proxy_url:
+            os.environ["HTTP_PROXY"] = self.proxy_url
+            os.environ["HTTPS_PROXY"] = self.proxy_url
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("HTTPS_PROXY", None)
         self._init_text_client()
         self._init_image_client()
 
@@ -42,10 +55,16 @@ class LLMClient:
         self.system_instruction = text_cfg.get("instructions", default_sys_prompt)
         
         if self.text_type == "openai":
+            # 构建 httpx 客户端用于代理
+            http_client = None
+            if self.proxy_enabled and self.proxy_url:
+                http_client = httpx.Client(proxy=self.proxy_url)
             # 兼容 OpenAI 格式的接口 (如 DeepSeek, Moonshot 等，只需修改 base_url)
             self.text_client = OpenAI(
                 api_key=text_cfg.get("api_key"),
-                base_url=text_cfg.get("base_url")
+                base_url=text_cfg.get("base_url"),
+                timeout=text_cfg.get("timeout", 120),
+                http_client=http_client  # 注入定制的 http 客户端
             )
         elif self.text_type == "gemini":
             # 原生 Gemini 接口
@@ -63,9 +82,15 @@ class LLMClient:
         self.img_model_name = img_cfg.get("model", "dall-e-3")
         
         if self.img_type == "openai":
+            # 构建 httpx 客户端用于代理
+            http_client = None
+            if self.proxy_enabled and self.proxy_url:
+                http_client = httpx.Client(proxy=self.proxy_url)
+
             self.img_client = OpenAI(
                 api_key=img_cfg.get("api_key"),
-                base_url=img_cfg.get("base_url")
+                base_url=img_cfg.get("base_url"),
+                http_client=http_client  # 注入定制的 http 客户端
             )
         elif self.img_type == "gemini":
             # Gemini 目前的图像生成通常通过 Vertex AI 或特定的 REST 端点，这里使用通用占位或后续接入
@@ -82,6 +107,10 @@ class LLMClient:
             context_messages = []
 
         try:
+            # === 新增请求日志记录 ===
+            proxy_status = f"[已启用代理: {self.proxy_url}]" if self.proxy_enabled else "[未启用代理]"
+            logger.info(f"==> 准备发起文本生成请求 {proxy_status} | 模型: {self.text_model_name}")
+            # ========================
             if self.text_type == "openai":
                 messages = [{"role": "system", "content": self.system_instruction}]
                 messages.extend(context_messages)
@@ -113,6 +142,12 @@ class LLMClient:
                 return result
                 
         except Exception as e:
+            err_msg = str(e)
+            # 【新增】超时失败处理
+            if "timeout" in err_msg.lower():
+                err_msg = f"请求超时（网络缓慢或模型响应时间过长）。建议在设置中增大超时时间或检查网络。\n详细信息: {err_msg}"
+            else:
+                err_msg = f"{err_msg}\n> 请检查网络、API Key 或模型配置。"
             logger.error(f"文本生成失败: {e}")
             return f"> **生成失败:** {e}\n> 请检查网络、API Key 或模型配置。"
 

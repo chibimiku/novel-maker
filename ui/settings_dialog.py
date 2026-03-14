@@ -3,7 +3,7 @@ import json
 import requests
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QComboBox, QTextEdit, 
-                             QMessageBox, QTabWidget, QWidget, QFormLayout)
+                             QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox)
 from PyQt6.QtCore import Qt
 
 class SettingsDialog(QDialog):
@@ -69,6 +69,12 @@ class SettingsDialog(QDialog):
         self.txt_instruction_input = QTextEdit()
         self.txt_instruction_input.setPlaceholderText("系统提示词，例如：你是一个专业的小说家...")
         self.text_layout.addRow("系统指令 (Instructions):", self.txt_instruction_input)
+
+        self.spin_timeout = QSpinBox()
+        self.spin_timeout.setRange(10, 600) # 允许设置 10秒 到 600秒
+        self.spin_timeout.setSuffix(" 秒")
+        self.text_layout.addRow("请求超时时间 (Timeout):", self.spin_timeout)
+
         
         self.tabs.addTab(self.text_tab, "📝 文本生成模型")
 
@@ -99,6 +105,19 @@ class SettingsDialog(QDialog):
         self.image_layout.addRow("模型名称 (Model):", img_model_layout)
         
         self.tabs.addTab(self.image_tab, "🎨 图像生成模型")
+
+        # --- 网络代理 Tab ---
+        self.proxy_tab = QWidget()
+        self.proxy_layout = QFormLayout(self.proxy_tab)
+        
+        self.cb_enable_proxy = QCheckBox("启用全局 HTTP/HTTPS 代理")
+        self.proxy_layout.addRow(self.cb_enable_proxy)
+        
+        self.proxy_url_input = QLineEdit()
+        self.proxy_url_input.setPlaceholderText("例如: http://127.0.0.1:7890")
+        self.proxy_layout.addRow("代理地址 (URL):", self.proxy_url_input)
+        
+        self.tabs.addTab(self.proxy_tab, "🌐 网络代理")
         
         main_layout.addWidget(self.tabs)
 
@@ -123,12 +142,19 @@ class SettingsDialog(QDialog):
         self.txt_api_key_input.setText(text_cfg.get("api_key", ""))
         self.txt_model_combo.setCurrentText(text_cfg.get("model", "gpt-4o"))
         self.txt_instruction_input.setPlainText(text_cfg.get("instructions", "你是一个专业的AI小说家，擅长根据设定和上下文构建引人入胜的故事。"))
+        self.spin_timeout.setValue(text_cfg.get("timeout", 120)) # 【新增】默认 120 秒
 
         img_cfg = self.config.get("image_api", {})
         self.img_type_combo.setCurrentText(img_cfg.get("type", "openai"))
         self.img_base_url_input.setText(img_cfg.get("base_url", "https://api.openai.com/v1"))
         self.img_api_key_input.setText(img_cfg.get("api_key", ""))
         self.img_model_combo.setCurrentText(img_cfg.get("model", "dall-e-3"))
+
+        proxy_cfg = self.config.get("proxy", {})
+        self.cb_enable_proxy.setChecked(proxy_cfg.get("enabled", False))
+        self.proxy_url_input.setText(proxy_cfg.get("url", "http://127.0.0.1:7890"))
+
+
 
     def fetch_models(self, api_type: str):
         """拉取服务商支持的具体模型类型"""
@@ -153,10 +179,17 @@ class SettingsDialog(QDialog):
             url = base_url if base_url.endswith("/models") else f"{base_url.rstrip('/')}/models"
             headers = {"Authorization": f"Bearer {api_key}"}
             
+            # 动态判断是否需要使用代理
+            proxies = None
+            if self.cb_enable_proxy.isChecked():
+                proxy_url = self.proxy_url_input.text().strip()
+                if proxy_url:
+                    proxies = {"http": proxy_url, "https": proxy_url}
+            
             try:
-                # 设置 5 秒超时，防止界面卡死
-                response = requests.get(url, headers=headers, timeout=5)
-                response.raise_for_status() # 检查 HTTP 错误
+                # 传入 proxies 参数
+                response = requests.get(url, headers=headers, timeout=5, proxies=proxies)
+                response.raise_for_status()
                 
                 data = response.json()
                 models = [item.get("id") for item in data.get("data", []) if "id" in item]
@@ -176,14 +209,21 @@ class SettingsDialog(QDialog):
     def save_config(self):
         """将 UI 中的数据收集并覆写到 setting.json"""
         new_config = {
+            "proxy": {
+                "enabled": self.cb_enable_proxy.isChecked(),
+                "url": self.proxy_url_input.text().strip()
+            },
             "text_api": {
+                # ... 保持你原有的 text_api 内容不变 ...
                 "type": self.txt_type_combo.currentText(),
                 "base_url": self.txt_base_url_input.text().strip(),
                 "api_key": self.txt_api_key_input.text().strip(),
                 "model": self.txt_model_combo.currentText().strip(),
+                "timeout": self.spin_timeout.value(),
                 "instructions": self.txt_instruction_input.toPlainText()
             },
             "image_api": {
+                # ... 保持你原有的 image_api 内容不变 ...
                 "type": self.img_type_combo.currentText(),
                 "base_url": self.img_base_url_input.text().strip(),
                 "api_key": self.img_api_key_input.text().strip(),

@@ -19,6 +19,8 @@ from ui.theme import NODE_NORMAL, NODE_MISSING, NODE_ERROR, NODE_ADD_BTN, TEXT_S
 from core.workspace_manager import WorkspaceManager
 from core.context_builder import ContextBuilder
 from core.llm_client import LLMClient
+from core.html_exporter import HtmlExporter
+import webbrowser # 用于生成后自动在浏览器打开网页
 from ui.settings_dialog import SettingsDialog
 
 class GenerateTaskThread(QThread):
@@ -143,6 +145,8 @@ class NovelCreatorWindow(QMainWindow):
         save_action = file_menu.addAction('保存全部')
         save_action.setShortcut(QKeySequence("Ctrl+S")) # 【新增】绑定 Ctrl+S 快捷键
         save_action.triggered.connect(self.save_all)
+        export_html_action = file_menu.addAction('🌐 导出为可阅读网页 (HTML)')
+        export_html_action.triggered.connect(self.export_to_html)
         setting_menu = menubar.addMenu('设置')
         settings_action = setting_menu.addAction('系统配置 (API/模型)')
         # 【修改点 1】：修复点击设置没有反应的问题，绑定打开对话框事件
@@ -247,20 +251,24 @@ class NovelCreatorWindow(QMainWindow):
         # 【新增】批量生成按钮
         self.btn_batch_generate = QPushButton("🚀 批量生成缺失场景")
         self.btn_generate = QPushButton("🔄 结合上下文生成正文")
+        self.btn_rewrite = QPushButton("✍️ 基于原文重写(扩/缩)")
         self.btn_save = QPushButton("💾 保存当前节点")
         self.btn_delete = QPushButton("🗑️ 删除当前节点")
         
         self.btn_batch_generate.clicked.connect(self.start_batch_generate)
         self.btn_generate.clicked.connect(self.generate_current_node)
+        self.btn_rewrite.clicked.connect(self.rewrite_current_node)
         self.btn_save.clicked.connect(self.save_current_node)
         self.btn_delete.clicked.connect(self.delete_current_node)
         
         self.btn_generate.setEnabled(False)
+        self.btn_rewrite.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
         
         btn_layout.addWidget(self.btn_batch_generate)
         btn_layout.addWidget(self.btn_generate)
+        btn_layout.addWidget(self.btn_rewrite)
         btn_layout.addWidget(self.btn_save)
         btn_layout.addWidget(self.btn_delete)
         detail_layout.addLayout(btn_layout)
@@ -592,10 +600,12 @@ class NovelCreatorWindow(QMainWindow):
                 
             self.content_editor.setEnabled(True)
             self.btn_generate.setEnabled(True)
+            self.btn_rewrite.setEnabled(True) # 【新增】激活重写按钮
         else:
             self.content_editor.setText("（当前层级仅支持填写概要，正文请在底层的“场景”节点中生成/编写）")
             self.content_editor.setEnabled(False)
             self.btn_generate.setEnabled(False)
+            self.btn_rewrite.setEnabled(False) # 【新增】禁用重写按钮
             
         self.update_word_count() # 【修改】更新字数
 
@@ -819,6 +829,38 @@ class NovelCreatorWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "错误", "在大纲树中未找到该节点，删除操作中断。")
 
+    def export_to_html(self):
+        """处理导出 HTML 网页的逻辑"""
+        if not self.workspace or not self.outline_tree_data:
+            QMessageBox.warning(self, "操作失败", "请先加载或新建一个工作区！")
+            return
+            
+        # 导出前最好先做一次保存，保证网页内容是最新的
+        self.save_all()
+        
+        try:
+            exporter = HtmlExporter(self.workspace)
+            output_file = exporter.export()
+            
+            self.log_console.append(f"<b><font color='green'>🎉 网页导出成功！文件已保存至: {output_file}</font></b>")
+            
+            # 询问用户是否立即预览
+            reply = QMessageBox.question(
+                self, 
+                "导出成功", 
+                f"已成功在工程目录的 www 文件夹下生成网页版小说。\n是否立即在浏览器中打开预览？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # 使用系统默认浏览器打开该 HTML 文件
+                webbrowser.open(f"file://{os.path.abspath(output_file)}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出网页失败:\n{str(e)}")
+            self.log_console.append(f"<font color='red'>网页导出异常: {e}</font>")
+
     def save_all(self):
         # 处理全局保存菜单动作 (Ctrl+S 触发)"""
         if self.workspace and self.outline_tree_data:
@@ -874,6 +916,64 @@ class NovelCreatorWindow(QMainWindow):
             if found:
                 return found
         return None
+
+    def rewrite_current_node(self):
+        if not self.current_editing_node:
+            return
+
+        # 检查是否有足够的正文供重写
+        target_content = self.content_editor.toPlainText().strip()
+        if not target_content or (target_content.startswith("#") and len(target_content.split('\n')) <= 3):
+            QMessageBox.warning(self, "无法重写", "当前节点尚未生成有效正文内容。\n请先使用【结合上下文生成正文】或手动输入一段基础剧情。")
+            return
+
+        target_word_count = self.spin_word_count.value()
+
+        # 二次确认拦截
+        reply = QMessageBox.question(
+            self,
+            "确认重写",
+            f"确定要将当前节点的正文重写/扩写为约 {target_word_count} 字吗？\n警告：生成成功后，现有的正文将被不可逆地完全覆盖！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.No:
+            return
+
+        # 保存现有内容，防止意外丢失
+        self.save_current_node()
+
+        self.btn_generate.setEnabled(False)
+        self.btn_rewrite.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self.btn_delete.setEnabled(False)
+
+        node_title = self.current_editing_node.get('title', '未知节点')
+        self.log_console.append(f"开始构建【{node_title}】的重写请求...")
+
+        builder = ContextBuilder(self.workspace)
+        checked_paths = self.get_checked_settings()
+
+        # 调用新增的重写 Prompt 生成器
+        messages = builder.build_rewrite_prompt(
+            self.current_editing_node,
+            self.outline_tree_data,
+            checked_paths,
+            target_word_count
+        )
+
+        prompt_content = messages[-1]["content"]
+        
+        self.log_console.append("========== [User] 重写提示词 ==========")
+        self.log_console.append(prompt_content)
+        self.log_console.append("发送重写请求至大模型，后台处理中，请耐心稍候...")
+
+        # 复用 GenerateTaskThread 进行异步调用
+        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        self.generate_thread.success_signal.connect(self.on_generate_success)
+        self.generate_thread.error_signal.connect(self.on_generate_error)
+        self.generate_thread.start()
 
     def start_batch_generate(self):
         """处理点击批量生成按钮的事件"""
@@ -1053,6 +1153,7 @@ class NovelCreatorWindow(QMainWindow):
         if not self.is_batch_generating:
             self.btn_generate.setEnabled(True)
             self.btn_save.setEnabled(True)
+            self.btn_rewrite.setEnabled(True) # 【新增】恢复重写按钮
             if self.current_editing_node:
                 self.btn_delete.setEnabled(not bool(self.current_editing_node.get("children")))
         self.generate_thread = None
