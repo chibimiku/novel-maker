@@ -75,6 +75,7 @@ docs/build/
 
 # 本地配置文件（特别为你添加）
 conf/setting.json
+conf/sys_state.json
 config.json
 settings.json
 *.local.json
