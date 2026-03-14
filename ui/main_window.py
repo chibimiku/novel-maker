@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit, 
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QFileDialog, QMessageBox, 
-                             QInputDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
+                             QInputDialog, QDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
 from PyQt6.QtGui import QKeySequence # 【新增】用于绑定快捷键
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
