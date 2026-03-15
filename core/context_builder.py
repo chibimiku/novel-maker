@@ -12,6 +12,34 @@ class ContextBuilder:
         """
         self.workspace = workspace_manager
 
+    # 修改 context_builder.py，在类中新增以下方法：
+
+    def build_rewrite_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list, word_count: int) -> list:
+        """构建重写/扩写/缩写的专属上下文"""
+        settings_text = self._build_settings_text(checked_setting_paths)
+        target_title = target_node.get("title", "未命名场景")
+        target_summary = target_node.get("summary", "").strip()
+        target_content = self._read_node_content(target_node).strip()
+
+        prompt = f"""你是一个专业的小说创作者。现在的任务是对一段已有的场景正文进行【重写/扩写/缩写】。
+
+    ### 一、 世界观与设定参考
+    {settings_text}
+
+    ### 二、 当前场景概要
+    【{target_title}】
+    {target_summary if target_summary else "(暂无概要)"}
+
+    ### 三、 原文内容（需要你重写的目标核心）
+    {target_content}
+
+    ### 四、 修改要求（绝对红线）
+    1. 请根据上述设定和概要，将【原文内容】重新改写，使字数达到大约 {word_count} 字左右。
+    2. 你可以补充细节描写、对话、心理活动来扩写，亦可精简冗余内容来缩写，必须保持原有剧情的核心事件和走向不变。
+    3. 严禁任何助手语气与客套话：直接输出重写后的纯小说正文内容，绝不允许添加“好的”、“已为您重写”等废话。
+    """
+        return [{"role": "user", "content": prompt.strip()}]
+
     # 【修改点 1】：新增 include_next 参数
     def build_generation_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list, generate_image: bool = True, word_count: int = 5000, include_next: bool = True) -> list:
         """
