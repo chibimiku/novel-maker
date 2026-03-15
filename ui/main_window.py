@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QFileDialog, QMessageBox, 
                              QInputDialog, QDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
-from PyQt6.QtGui import QKeySequence, QColor
+from PyQt6.QtGui import QKeySequence, QColor, QAction, QShortcut
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # 导入暗色主题配色常量
@@ -108,6 +108,19 @@ class NovelCreatorWindow(QMainWindow):
         except Exception as e:
             print(f"保存系统状态失败: {e}")
 
+    # ================= 【新增功能 ：重复文件检查】 =================
+    def _find_duplicate_paths(self, nodes: list) -> set:
+        """递归遍历大纲，寻找并返回重复使用的 file_path 集合"""
+        path_counts = {}
+        def traverse(node_list):
+            for node in node_list:
+                p = node.get("file_path")
+                if p:
+                    path_counts[p] = path_counts.get(p, 0) + 1
+                traverse(node.get("children", []))
+        traverse(nodes)
+        return set(p for p, count in path_counts.items() if count > 1)
+
     def _get_item_level(self, item):
         # 计算当前树节点的层级深度 (1=章, 2=节, 3=场景)"""
         level = 1
@@ -141,6 +154,11 @@ class NovelCreatorWindow(QMainWindow):
         
         load_action = file_menu.addAction('加载工作区')
         load_action.triggered.connect(self.load_workspace)
+
+        # 【新增功能 1】：重载工作区 (Ctrl+R)
+        reload_action = file_menu.addAction('重载工作区')
+        reload_action.setShortcut(QKeySequence("Ctrl+R"))
+        reload_action.triggered.connect(self.reload_workspace)
         
         save_action = file_menu.addAction('保存全部')
         save_action.setShortcut(QKeySequence("Ctrl+S")) # 【新增】绑定 Ctrl+S 快捷键
@@ -167,6 +185,10 @@ class NovelCreatorWindow(QMainWindow):
 
         self.novel_tree = QTreeWidget()
         self.novel_tree.setHeaderLabel("小说大纲结构")
+
+        # 【新增功能 2】：为大纲树绑定 F2 修改标题快捷键
+        self.rename_shortcut = QShortcut(QKeySequence("F2"), self.novel_tree)
+        self.rename_shortcut.activated.connect(self.rename_current_node)
         
         # 【修改】开启大纲树的拖拽支持
         self.novel_tree.setDragEnabled(True)
@@ -488,6 +510,15 @@ class NovelCreatorWindow(QMainWindow):
         if "nodes" not in self.outline_tree_data:
             self.outline_tree_data["nodes"] = []
         nodes_ref = self.outline_tree_data["nodes"]
+
+        # 【新增功能 3】：在构建树之前，先找出重复的 file_path 并打印警告
+        self._duplicate_paths = self._find_duplicate_paths(nodes_ref)
+        if self._duplicate_paths:
+            self.log_console.append(f"<font color='red'><b>⚠️ 严重警告：检测到多个场景节点指向相同的物理文件！可能导致剧情覆盖或丢失。<br>冲突的底层文件列表：{', '.join(self._duplicate_paths)}<br>请手动在冲突的节点中点击“保存当前节点”以重新生成独立的 MD 文件绑定。</b></font>")
+            QMessageBox.warning(self, "节点冲突警告", "检测到多个大纲节点共用了同一个本地 Markdown 文件（树状图中已标红）。\n请留意控制台警告，并手动编辑处理冲突！")
+
+        self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
+        self.novel_tree.expandAll()
         
         self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
         self.novel_tree.expandAll()
@@ -515,10 +546,15 @@ class NovelCreatorWindow(QMainWindow):
             item.setData(0, Qt.ItemDataRole.UserRole, node_id)
             
             status = node.get("_status", "ok")
+            file_path = node.get("file_path") # 【新增获取 file_path】
             
             # 【修改点 3】：基于层级进行渲染，仅第3级缺失文件变色，1/2级固定黑色
             if level == 3:
-                if status == "missing":
+                # 优先判定冲突：如果文件路径在查出来的重复集合里
+                if file_path and getattr(self, '_duplicate_paths', None) and file_path in self._duplicate_paths:
+                    item.setForeground(0, QColor(NODE_ERROR)) # 使用原有的报错红
+                    node["_status"] = "duplicate_conflict"
+                elif status == "missing":
                     item.setForeground(0, QColor(NODE_MISSING))
                 elif status == "modified_externally":
                     item.setForeground(0, QColor(NODE_ERROR))
@@ -860,6 +896,55 @@ class NovelCreatorWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "导出错误", f"导出网页失败:\n{str(e)}")
             self.log_console.append(f"<font color='red'>网页导出异常: {e}</font>")
+
+    # ================= 【新增功能 1：重载工作区】 =================
+    def reload_workspace(self):
+        """重载当前工作区，丢弃未保存的更改"""
+        if not self.workspace:
+            QMessageBox.information(self, "提示", "当前未打开任何工作区，无法重载。")
+            return
+            
+        reply = QMessageBox.question(
+            self,
+            "重载工作区",
+            "确定要重新加载当前工作区吗？\n警告：由于是强制读取本地硬盘配置，您当前未保存的所有修改（包含正在编辑的正文和概要）都将丢失！",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.log_console.append("开始重载工作区...")
+            self._load_workspace_by_path(self.workspace.workspace_path)
+
+
+    # ================= 【新增功能 2：F2 重命名节点】 =================
+    def rename_current_node(self):
+        """按下 F2 触发，修改当前选中节点的标题并自动保存"""
+        item = self.novel_tree.currentItem()
+        # 如果未选中节点，或者选中的是“+ 新增...”按钮，则忽略
+        if not item or item.text(0).startswith("+"):
+            return
+            
+        node_id = item.data(0, Qt.ItemDataRole.UserRole)
+        real_node = self.node_map.get(node_id)
+        if not real_node:
+            return
+
+        old_title = real_node.get("title", "")
+        # 弹出对话框要求输入新标题
+        new_title, ok = QInputDialog.getText(self, "重命名节点", "请输入新的节点名称:", text=old_title)
+        
+        if ok and new_title.strip() and new_title.strip() != old_title:
+            clean_title = new_title.strip()
+            # 1. 更新内存数据
+            real_node["title"] = clean_title
+            # 2. 更新 UI 显示
+            item.setText(0, clean_title)
+            
+            # 3. 自动保存大纲配置
+            if self.workspace and self.outline_tree_data:
+                self.workspace.save_outline_tree(self.outline_tree_data)
+                self.log_console.append(f"🔄 节点已重命名: 【{old_title}】 -> 【{clean_title}】 (已自动保存大纲)")
 
     def save_all(self):
         # 处理全局保存菜单动作 (Ctrl+S 触发)"""
