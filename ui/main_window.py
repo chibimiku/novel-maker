@@ -344,18 +344,24 @@ class NovelCreatorWindow(QMainWindow):
         # 【修复类型检查】：显式创建 QMenuBar，避免 Pylance 认为其可能为 None
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
-        file_menu = menubar.addMenu('文件')
+        file_menu = QMenu('文件', self)
+        menubar.addMenu(file_menu)
         
         # 【修改点 2】：分离新建工作区和加载工作区逻辑
-        new_action = file_menu.addAction('新建工作区')
+        # 先显式创建 QAction 对象，传入父组件 self
+        new_action = QAction('新建工作区', self)
+        # 再把它添加到菜单中
+        file_menu.addAction(new_action)
         new_action.triggered.connect(self.new_workspace)
         
-        load_action = file_menu.addAction('加载工作区')
+        load_action = QAction('加载工作区', self)
+        file_menu.addAction(load_action)
         load_action.triggered.connect(self.load_workspace)
 
         # 【新增功能 1】：重载工作区 (Ctrl+R)
-        reload_action = file_menu.addAction('重载工作区')
+        reload_action = QAction('重载工作区', self)
         reload_action.setShortcut(QKeySequence("Ctrl+R"))
+        file_menu.addAction(reload_action)
         reload_action.triggered.connect(self.reload_workspace)
         
         save_action = file_menu.addAction('保存全部')
