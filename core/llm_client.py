@@ -99,20 +99,33 @@ class LLMClient:
         else:
              logger.warning(f"未知的图像模型类型配置: {self.img_type}")
 
-    def generate_text(self, prompt: str, context_messages: list = None) -> str:
+    def generate_text(self, prompt: str, context_messages: list = None, override_system_instruction: str = None) -> str:
         """
-        生成小说正文或概要
+        生成文本。支持传入 override_system_instruction 覆盖默认的系统指令。
         """
         if context_messages is None:
             context_messages = []
+
+        # 确定本次请求使用的 System Prompt
+        current_sys_prompt = override_system_instruction if override_system_instruction else self.system_instruction
 
         try:
             # === 新增请求日志记录 ===
             proxy_status = f"[已启用代理: {self.proxy_url}]" if self.proxy_enabled else "[未启用代理]"
             logger.info(f"==> 准备发起文本生成请求 {proxy_status} | 模型: {self.text_model_name}")
-            # ========================
+            
+            # 打印请求日志，方便后续排查
+            logger.info("\n========== [Request 发送] System 指令 ==========")
+            logger.info(current_sys_prompt)
+            logger.info("========== [Request 发送] User 提示词 ==========")
+            logger.info(prompt)
+            if context_messages:
+                logger.info("========== [Request 发送] Context 上下文 ==========")
+                logger.info(context_messages)
+            logger.info("==================================================\n")
+
             if self.text_type == "openai":
-                messages = [{"role": "system", "content": self.system_instruction}]
+                messages = [{"role": "system", "content": current_sys_prompt}]
                 messages.extend(context_messages)
                 messages.append({"role": "user", "content": prompt})
                 
@@ -133,10 +146,18 @@ class LLMClient:
                     role = "user" if msg["role"] == "user" else "model"
                     history.append({"role": role, "parts": [msg["content"]]})
                 
-                chat = self.gemini_text_model.start_chat(history=history)
+                # Gemini 的系统指令是在模型实例化时绑定的。如果有覆盖指令，就临时实例化一个新模型
+                if override_system_instruction:
+                    temp_model = genai.GenerativeModel(
+                        model_name=self.text_model_name,
+                        system_instruction=current_sys_prompt
+                    )
+                    chat = temp_model.start_chat(history=history)
+                else:
+                    chat = self.gemini_text_model.start_chat(history=history)
+                    
                 response = chat.send_message(prompt)
                 
-                # 【修改点】：提取文本，写入日志后再返回
                 result = response.text
                 logger.info(f"\n========== Gemini 原始返回 ==========\n{result}\n=======================================\n")
                 return result

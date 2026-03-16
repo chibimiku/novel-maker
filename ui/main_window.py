@@ -66,6 +66,9 @@ class WorldBuildingThread(QThread):
     def run(self):
         try:
             self.progress_signal.emit("正在分析点子，规划设定目录架构...")
+
+            # 定义世界观生成的专用系统指令，优化后的专用系统指令，强调数组和去格式化
+            json_sys_prompt = "你现在是一个专业的数据结构化助手。你必须严格按照用户的要求输出纯 JSON 格式的数据。绝对不允许使用 Markdown 代码块（严禁出现 ```json 和 ```），严禁包含任何前言或解释说明。请确保你的输出直接以 '[' 开头，以 ']' 结尾。"
             
             # 第一步：获取设定列表
             existing_context = ""
@@ -79,7 +82,7 @@ class WorldBuildingThread(QThread):
                         existing_context += f"【{cat}】: {', '.join(files)}\n"
 
             prompt_1 = self.prompt_1_tpl.format(idea=self.idea, existing_context=existing_context)
-            list_res_raw = self.llm_client.generate_text(prompt_1)
+            list_res_raw = self.llm_client.generate_text(prompt_1, override_system_instruction=json_sys_prompt)
 
             if list_res_raw.strip().startswith("> **生成失败:**"):
                 self.error_signal.emit(list_res_raw)
@@ -122,7 +125,7 @@ class WorldBuildingThread(QThread):
                     cat=cat, name=name, summary=summary, template_str=template_str
                 )
 
-                detail_res_raw = self.llm_client.generate_text(prompt_2)
+                detail_res_raw = self.llm_client.generate_text(prompt_2, override_system_instruction=json_sys_prompt)
                 detail_res = clean_json_string(detail_res_raw)
                 
                 try:
@@ -174,9 +177,10 @@ class IndexGenerateThread(QThread):
             all_content = "\n".join(content_list)
 
             # 【修改】使用传入的模板进行格式化
+            json_sys_prompt = "你现在是一个专业的数据归纳与结构化助手。你必须严格按照用户的要求输出纯 JSON 格式的数据，绝对不允许包含任何多余的解释文本或 Markdown 代码块。"
             prompt = self.prompt_tpl.format(category=self.category, all_content=all_content)
             
-            res_raw = self.llm_client.generate_text(prompt)
+            res_raw = self.llm_client.generate_text(prompt, override_system_instruction=json_sys_prompt)
             res = clean_json_string(res_raw)
             
             try:
@@ -1539,7 +1543,15 @@ class NovelCreatorWindow(QMainWindow):
             p1_tpl = self._get_or_create_prompt_template("world_build_list.txt", default_p1, "世界观分类规划")
             p2_tpl = self._get_or_create_prompt_template("world_build_detail.txt", default_p2, "世界观细节扩写")
             
-            self.wb_thread = WorldBuildingThread(self.llm_client, self.workspace, idea.strip(), mode, p1_tpl, p2_tpl)
+            # 【修改这里】：明确指定参数名，防止错位
+            self.wb_thread = WorldBuildingThread(
+                llm_client=self.llm_client, 
+                workspace=self.workspace, 
+                idea=idea.strip(), 
+                prompt_1_tpl=p1_tpl, 
+                prompt_2_tpl=p2_tpl, 
+                mode=mode
+            )
             self.wb_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
             self.wb_thread.success_signal.connect(self.on_world_building_success)
             self.wb_thread.error_signal.connect(self.on_world_building_error)
