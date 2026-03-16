@@ -23,6 +23,172 @@ from core.html_exporter import HtmlExporter
 import webbrowser # 用于生成后自动在浏览器打开网页
 from ui.settings_dialog import SettingsDialog
 
+# ================= 新增：JSON 原生字符串清洗工具 =================
+def clean_json_string(text: str) -> str:
+    """提取字符串中的 JSON 内容，完全不使用正则表达式"""
+    start_dict = text.find('{')
+    start_list = text.find('[')
+    
+    start_idx = -1
+    if start_dict != -1 and start_list != -1:
+        start_idx = min(start_dict, start_list)
+    elif start_dict != -1:
+        start_idx = start_dict
+    elif start_list != -1:
+        start_idx = start_list
+        
+    if start_idx == -1:
+        return text 
+
+    end_dict = text.rfind('}')
+    end_list = text.rfind(']')
+    end_idx = max(end_dict, end_list)
+    
+    if end_idx != -1 and end_idx >= start_idx:
+        return text[start_idx:end_idx+1]
+    return text
+
+# ================= 新增：世界观批量生成线程 =================
+class WorldBuildingThread(QThread):
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, llm_client, workspace, idea, prompt_1_tpl, prompt_2_tpl, mode="init", parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.workspace = workspace
+        self.idea = idea
+        self.mode = mode # 'init' 为全新生成，'supplement' 为补充生成
+        self.prompt_1_tpl = prompt_1_tpl # 【新增】
+        self.prompt_2_tpl = prompt_2_tpl # 【新增】
+
+    def run(self):
+        try:
+            self.progress_signal.emit("正在分析点子，规划设定目录架构...")
+            
+            # 第一步：获取设定列表
+            existing_context = ""
+            if self.mode == "supplement":
+                existing_context = "当前已有设定的概括如下，请基于这些内容进行针对性补充，避免重复：\n"
+                # 简单读取现有的 index.json 或者文件名
+                for cat in self.workspace.setting_dirs:
+                    cat_path = os.path.join(self.workspace.settings_path, cat)
+                    if os.path.exists(cat_path):
+                        files = [f.replace('.json', '') for f in os.listdir(cat_path) if f.endswith('.json') and f != 'template.json']
+                        existing_context += f"【{cat}】: {', '.join(files)}\n"
+
+            prompt_1 = self.prompt_1_tpl.format(idea=self.idea, existing_context=existing_context)
+            list_res_raw = self.llm_client.generate_text(prompt_1)
+
+            if list_res_raw.strip().startswith("> **生成失败:**"):
+                self.error_signal.emit(list_res_raw)
+                return
+                
+            list_res = clean_json_string(list_res_raw)
+            try:
+                settings_list = json.loads(list_res)
+            except json.JSONDecodeError:
+                self.error_signal.emit("大模型返回的规划列表 JSON 格式解析失败。")
+                return
+
+            if not isinstance(settings_list, list):
+                self.error_signal.emit("大模型返回的数据结构异常，要求数组结构。")
+                return
+
+            total = len(settings_list)
+            self.progress_signal.emit(f"规划完成，共需要生成/补充 {total} 个设定。开始逐一生成细节...")
+
+            # 第二步：循环请求每个设定的细节
+            for idx, item in enumerate(settings_list):
+                cat = item.get("category", "其他设定")
+                name = item.get("name", f"未命名_{idx}")
+                summary = item.get("summary", "")
+                
+                # 确保分类在既定目录中
+                if cat not in self.workspace.setting_dirs:
+                    cat = "其他设定"
+
+                self.progress_signal.emit(f"({idx+1}/{total}) 正在生成细节: {cat} - {name} ...")
+                
+                # 读取模板
+                template_path = os.path.join(self.workspace.settings_path, cat, "template.json")
+                template_str = "{}"
+                if os.path.exists(template_path):
+                    with open(template_path, 'r', encoding='utf-8') as f:
+                        template_str = f.read()
+
+                prompt_2 = self.prompt_2_tpl.format(
+                    cat=cat, name=name, summary=summary, template_str=template_str
+                )
+
+                detail_res_raw = self.llm_client.generate_text(prompt_2)
+                detail_res = clean_json_string(detail_res_raw)
+                
+                try:
+                    detail_data = json.loads(detail_res)
+                    # 补充一个 name 字段防止模板里漏了
+                    detail_data["_node_name"] = name
+                except json.JSONDecodeError:
+                    # 如果这一个节点解析失败，写入纯文本让用户手动修
+                    detail_data = {"错误说明": "AI 生成了非法的 JSON", "raw_content": detail_res}
+
+                # 写入文件
+                file_path = os.path.join(self.workspace.settings_path, cat, f"{name}.json")
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(detail_data, f, ensure_ascii=False, indent=4)
+
+            self.success_signal.emit()
+            
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+# ================= 新增：目录索引生成线程 =================
+class IndexGenerateThread(QThread):
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal(str, str) # category, index_content
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, llm_client, workspace, category, prompt_tpl, parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.workspace = workspace
+        self.category = category
+        self.prompt_tpl = prompt_tpl # 【新增】
+
+    def run(self):
+        try:
+            cat_path = os.path.join(self.workspace.settings_path, self.category)
+            content_list = []
+            
+            for file in os.listdir(cat_path):
+                if file.endswith('.json') and file not in ['template.json', 'index.json']:
+                    with open(os.path.join(cat_path, file), 'r', encoding='utf-8') as f:
+                        content_list.append(f"【文件名】: {file}\n【内容】: {f.read()}\n")
+            
+            if not content_list:
+                self.error_signal.emit(f"目录【{self.category}】下没有有效设定文件，无需生成索引。")
+                return
+
+            self.progress_signal.emit(f"正在读取【{self.category}】内容，构建概括目录...")
+            all_content = "\n".join(content_list)
+
+            # 【修改】使用传入的模板进行格式化
+            prompt = self.prompt_tpl.format(category=self.category, all_content=all_content)
+            
+            res_raw = self.llm_client.generate_text(prompt)
+            res = clean_json_string(res_raw)
+            
+            try:
+                json.loads(res) # 校验是否能正常解析
+            except json.JSONDecodeError:
+                self.error_signal.emit("大模型返回的索引 JSON 解析失败。")
+                return
+                
+            self.success_signal.emit(self.category, res)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
 class GenerateTaskThread(QThread):
     # 定义两个信号，用于向主线程传递成功的结果或失败的错误信息
     success_signal = pyqtSignal(str)
@@ -131,7 +297,7 @@ class NovelCreatorWindow(QMainWindow):
         return level
 
     def _load_config(self) -> dict:
-        # 读取系统配置文件 conf/setting.json"""
+        # 读取系统配置文件 conf/setting.json
         # 假设 ui 目录的上一级是项目根目录，conf 目录在根目录下
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config_path = os.path.join(base_dir, "conf", "setting.json")
@@ -144,8 +310,40 @@ class NovelCreatorWindow(QMainWindow):
                 print(f"读取配置文件失败: {e}")
         return {}
 
+    def _get_or_create_prompt_template(self, template_name: str, default_text: str, desc: str) -> str:
+        #【新增】获取或创建 Prompt 模板
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        prompts_dir = os.path.join(base_dir, "data", "prompts")
+        os.makedirs(prompts_dir, exist_ok=True)
+        
+        file_path = os.path.join(prompts_dir, template_name)
+        
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+                
+        # 如果文件不存在，弹窗要求用户输入/确认
+        text, ok = QInputDialog.getMultiLineText(
+            self, 
+            "需要初始化 Prompt 模板", 
+            f"未找到模板文件：{template_name}\n用途：{desc}\n请核对并确认模板内容：", 
+            default_text
+        )
+        # 如果用户点了取消，默认使用自带的 fallback 文本
+        final_text = text if ok and text.strip() else default_text
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(final_text)
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>保存模板文件失败: {e}</font>")
+            
+        return final_text
+
     def init_ui(self):
-        menubar = self.menuBar()
+        # 【修复类型检查】：显式创建 QMenuBar，避免 Pylance 认为其可能为 None
+        menubar = QMenuBar(self)
+        self.setMenuBar(menubar)
         file_menu = menubar.addMenu('文件')
         
         # 【修改点 2】：分离新建工作区和加载工作区逻辑
@@ -181,6 +379,8 @@ class NovelCreatorWindow(QMainWindow):
         self.setting_tree.itemClicked.connect(self.on_setting_node_clicked)
         # 【修改】绑定项改变信号，处理父子勾选联动
         self.setting_tree.itemChanged.connect(self.on_setting_item_changed)
+        self.setting_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.setting_tree.customContextMenuRequested.connect(self.show_setting_context_menu)
         splitter.addWidget(self.setting_tree)
 
         self.novel_tree = QTreeWidget()
@@ -487,11 +687,20 @@ class NovelCreatorWindow(QMainWindow):
             
             cat_path = os.path.join(self.workspace.settings_path, cat)
             if os.path.exists(cat_path):
-                for file in os.listdir(cat_path):
-                    if file.endswith('.json') and file != 'template.json':
+                files = os.listdir(cat_path)
+                # 如果有 index.json 优先置顶显示
+                if 'index.json' in files:
+                    index_item = QTreeWidgetItem(cat_item, ["🌟 总体概括 (index)"])
+                    index_item.setData(0, Qt.ItemDataRole.UserRole, os.path.join(cat_path, 'index.json'))
+                    # 默认不自动勾选 index，防止挤占正文上下文 token
+                    index_item.setFlags(index_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    index_item.setCheckState(0, Qt.CheckState.Unchecked)
+                    index_item.setForeground(0, QColor("#E0B0FF")) # 给个特别的淡紫色
+
+                for file in files:
+                    if file.endswith('.json') and file not in ['template.json', 'index.json']:
                         file_item = QTreeWidgetItem(cat_item, [file.replace('.json', '')])
                         file_item.setData(0, Qt.ItemDataRole.UserRole, os.path.join(cat_path, file))
-                        # 【修改】子节点同样开启勾选
                         file_item.setFlags(file_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                         file_item.setCheckState(0, Qt.CheckState.Checked)
 
@@ -725,7 +934,7 @@ class NovelCreatorWindow(QMainWindow):
                     QMessageBox.critical(self, "错误", f"创建设定失败: {e}")
             return # 新增完毕后直接返回
 
-        # 2. 如果点击的是普通的设定文件节点
+        # 2. 如果点击的是普通的设定文件或索引文件
         file_path = item.data(0, Qt.ItemDataRole.UserRole)
         if not file_path or not os.path.exists(file_path):
             return # 点击的可能是父级分类目录，不做处理
@@ -733,8 +942,43 @@ class NovelCreatorWindow(QMainWindow):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            self.summary_editor.setText(content)
-            self.log_console.append(f"打开设定文件: {os.path.basename(file_path)}")
+            
+            # ================= 修改点：特殊渲染 index.json 为富文本 =================
+            if os.path.basename(file_path) == 'index.json':
+                try:
+                    data = json.loads(content)
+                    overview = data.get("category_overview", "暂无概述")
+                    items = data.get("items", [])
+                    
+                    # 拼接 HTML 富文本
+                    html_content = f"<h2 style='color: #E0B0FF;'>🌟 分类总体概括</h2>"
+                    html_content += f"<p><b>体系概述：</b><br>{overview}</p><hr>"
+                    html_content += "<h3>包含的设定列表：</h3><ul>"
+                    for it in items:
+                        file_name = it.get('file_name', '未知').replace('.json', '')
+                        brief = it.get('brief', '')
+                        html_content += f"<li style='margin-bottom: 8px;'><b>【{file_name}】</b>: {brief}</li>"
+                    html_content += "</ul>"
+                    html_content += "<br><p style='color: gray; font-size: 12px;'><i>提示：此目录为自动生成，如需更新，请在左侧树状图右键点击分类名称重新生成。</i></p>"
+                    
+                    self.summary_editor.setHtml(html_content)
+                    self.summary_editor.setReadOnly(True) # 设为只读
+                    self.btn_save.setEnabled(False)       # 禁用保存按钮，避免误覆盖
+                    self.log_console.append(f"打开总体概括: {os.path.basename(os.path.dirname(file_path))}/index.json")
+                    
+                except json.JSONDecodeError:
+                    # 如果 JSON 损坏，降级为普通文本显示并允许编辑修复
+                    self.summary_editor.setPlainText(content)
+                    self.summary_editor.setReadOnly(False)
+                    self.btn_save.setEnabled(True)
+                    self.log_console.append(f"<font color='orange'>警告：index.json 格式损坏，已降级为纯文本显示。</font>")
+            else:
+                # 普通设定文件，正常显示纯文本 JSON
+                self.summary_editor.setPlainText(content)
+                self.summary_editor.setReadOnly(False)
+                self.btn_save.setEnabled(True)
+                self.log_console.append(f"打开设定文件: {os.path.basename(file_path)}")
+            # =====================================================================
             
             # 更新状态变量，清空小说节点的状态，记录当前设定的路径
             self.current_editing_node = None 
@@ -742,7 +986,6 @@ class NovelCreatorWindow(QMainWindow):
             
             self.summary_editor.setEnabled(True)
             self.content_editor.setEnabled(False)
-            self.btn_save.setEnabled(True)
             self.btn_generate.setEnabled(False) # 设定文件是纯JSON数据，无需让AI续写正文
             
         except Exception as e:
@@ -956,7 +1199,10 @@ class NovelCreatorWindow(QMainWindow):
                 self.save_current_node()
                 
             self.log_console.append("<b><font color='green'>[系统通知] 执行全局保存成功 (Ctrl+S)。</font></b>")
-            self.statusBar().showMessage("全局保存成功", 1000) # 可选：在底部状态栏闪烁1秒提示
+            # 【修复类型检查】：显式获取或创建状态栏并断言类型
+            statusbar = self.statusBar()
+            if statusbar is not None:
+                statusbar.showMessage("全局保存成功", 1000)
         else:
             self.log_console.append("<font color='orange'>全局保存跳过：当前没有打开工作区。</font>")
 
@@ -1242,6 +1488,107 @@ class NovelCreatorWindow(QMainWindow):
             if self.current_editing_node:
                 self.btn_delete.setEnabled(not bool(self.current_editing_node.get("children")))
         self.generate_thread = None
+
+    # ================= 【新增】世界观设定的右键菜单逻辑 =================
+    def show_setting_context_menu(self, position):
+        if not self.workspace:
+            return
+            
+        menu = QMenu()
+        item = self.setting_tree.itemAt(position)
+        
+        # 空白处或任意位置的全局操作
+        gen_init_action = menu.addAction("💡 输入点子自动产生基础设定")
+        gen_init_action.triggered.connect(lambda: self.open_world_building_dialog("init"))
+        
+        gen_sup_action = menu.addAction("💡 针对现有内容补充新设定")
+        gen_sup_action.triggered.connect(lambda: self.open_world_building_dialog("supplement"))
+        
+        menu.addSeparator()
+
+        # 仅针对特定的分类目录生成 Index
+        if item and not item.parent() and not item.text(0).startswith("+"):
+            category_name = item.text(0)
+            gen_index_action = menu.addAction(f"📝 生成/更新【{category_name}】的总体概括 (index.json)")
+            gen_index_action.triggered.connect(lambda: self.start_index_generation(category_name))
+
+        menu.exec(self.setting_tree.viewport().mapToGlobal(position))
+
+    def open_world_building_dialog(self, mode="init"):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+            
+        title = "全新生成背景资料" if mode == "init" else "针对性补充背景资料"
+        hint = "请输入您的核心点子或世界观框架概念（例如：一个由猫咪统治的赛博朋克城市）："
+        
+        idea, ok = QInputDialog.getMultiLineText(self, title, hint)
+        if ok and idea.strip():
+            self.log_console.append(f"启动设定生成引擎，模式：{mode}。后台处理中，请稍候...")
+            self.btn_save.setEnabled(False) # 暂时禁用保存防止冲突
+
+            default_p1 = "你是一个资深的小说世界观设计师，擅长根据简短的点子构建丰富的背景设定。请根据以下核心概念，帮我规划出一个适合小说创作的世界观分类体系（例如：种族、政治、科技、宗教等），并列出每个分类下的关键要素名称。"
+            default_p2 = "请根据之前规划的世界观分类体系，针对每个要素进行详细的设定扩写，内容可以包含但不限于：外貌特征、社会结构、历史背景、与其他要素的关系等。请尽量丰富细节，帮助我构建一个生动立体的小说世界。"
+            
+            p1_tpl = self._get_or_create_prompt_template("world_build_list.txt", default_p1, "世界观分类规划")
+            p2_tpl = self._get_or_create_prompt_template("world_build_detail.txt", default_p2, "世界观细节扩写")
+            
+            self.wb_thread = WorldBuildingThread(self.llm_client, self.workspace, idea.strip(), mode, p1_tpl, p2_tpl)
+            self.wb_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
+            self.wb_thread.success_signal.connect(self.on_world_building_success)
+            self.wb_thread.error_signal.connect(self.on_world_building_error)
+            self.wb_thread.start()
+
+    def on_world_building_success(self):
+        self.log_console.append("<b><font color='green'>🎉 自动设定生成完毕！已将设定文件分配至对应目录。</font></b>")
+        self.refresh_ui_from_workspace() # 刷新左侧树结构，自动加载新文件
+        QMessageBox.information(self, "生成完成", "世界观设定生成完毕，请在左侧目录查看。")
+        self.btn_save.setEnabled(True)
+
+    def on_world_building_error(self, err_msg):
+        self.log_console.append(f"<font color='red'>世界观生成中断或失败: {err_msg}</font>")
+        QMessageBox.warning(self, "生成失败", f"流程中断:\n{err_msg}")
+        self.btn_save.setEnabled(True)
+
+    def start_index_generation(self, category):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+            
+        self.log_console.append(f"开始为【{category}】生成总体概括目录...")
+
+        # 【修正新增】：定义默认的 Prompt 并读取/创建模板文件
+        default_index_prompt = "请根据以下内容，帮我提取出一份结构化的概括目录（JSON格式）：\n{all_content}"
+        prompt_tpl = self._get_or_create_prompt_template(
+            "index_generate.txt", 
+            default_index_prompt, 
+            f"{category}的总体概括索引生成"
+        )
+
+        self.index_thread = IndexGenerateThread(self.llm_client, self.workspace, category, prompt_tpl)
+        self.index_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
+        self.index_thread.success_signal.connect(self.on_index_generation_success)
+        self.index_thread.error_signal.connect(self.on_index_generation_error)
+        self.index_thread.start()
+
+    def on_index_generation_success(self, category, index_content):
+        cat_path = os.path.join(self.workspace.settings_path, category)
+        index_path = os.path.join(cat_path, "index.json")
+        
+        try:
+            # 格式化一下 JSON 再保存
+            parsed_json = json.loads(index_content)
+            with open(index_path, 'w', encoding='utf-8') as f:
+                json.dump(parsed_json, f, ensure_ascii=False, indent=4)
+            
+            self.log_console.append(f"<b><font color='green'>🎉 【{category}】总体概括目录生成完毕！</font></b>")
+            self.refresh_ui_from_workspace()
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>保存 index.json 时出错: {e}</font>")
+
+    def on_index_generation_error(self, err_msg):
+        self.log_console.append(f"<font color='red'>索引生成失败: {err_msg}</font>")
+        QMessageBox.warning(self, "生成失败", f"生成索引流程中断:\n{err_msg}")
 
 if __name__ == '__main__':
     from ui.theme import get_dark_stylesheet
