@@ -6,7 +6,7 @@ import uuid  # 【新增】用于生成唯一的文件名
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit, 
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
-                             QLabel, QFileDialog, QMessageBox, 
+                             QLabel, QFileDialog, QMessageBox, QLineEdit,
                              QInputDialog, QDialog, QCheckBox, QSpinBox) # 【新增】QCheckBox, QSpinBox
 from PyQt6.QtGui import QKeySequence, QColor, QAction, QShortcut
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -303,6 +303,44 @@ class IdeaInputDialog(QDialog):
 
     def get_text(self):
         return self.text_edit.toPlainText()
+# ====================================================================
+
+# ================= 新增：带清空按钮的节点重命名弹窗 =================
+class RenameNodeDialog(QDialog):
+    def __init__(self, parent, title, label_text, default_text=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(350, 120)
+        
+        layout = QVBoxLayout(self)
+        
+        label = QLabel(label_text)
+        layout.addWidget(label)
+        
+        # 使用 QLineEdit，完美支持 Ctrl+A 全选
+        self.line_edit = QLineEdit(default_text)
+        # 开启右侧自带的 'X' 清空按钮
+        self.line_edit.setClearButtonEnabled(True) 
+        layout.addWidget(self.line_edit)
+        
+        # 自动全选现有文本，方便直接输入覆盖
+        self.line_edit.selectAll()
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_ok)
+        layout.addLayout(btn_layout)
+
+    def get_text(self):
+        return self.line_edit.text()
 # ====================================================================
 
 class NovelCreatorWindow(QMainWindow):
@@ -1362,20 +1400,22 @@ class NovelCreatorWindow(QMainWindow):
             return
 
         old_title = real_node.get("title", "")
-        # 弹出对话框要求输入新标题
-        new_title, ok = QInputDialog.getText(self, "重命名节点", "请输入新的节点名称:", text=old_title)
+        # 【修改点】调用自定义的弹窗类
+        dialog = RenameNodeDialog(self, "重命名节点", "请输入新的节点名称:", default_text=old_title)
         
-        if ok and new_title.strip() and new_title.strip() != old_title:
-            clean_title = new_title.strip()
-            # 1. 更新内存数据
-            real_node["title"] = clean_title
-            # 2. 更新 UI 显示
-            item.setText(0, clean_title)
-            
-            # 3. 自动保存大纲配置
-            if self.workspace and self.outline_tree_data:
-                self.workspace.save_outline_tree(self.outline_tree_data)
-                self.log_console.append(f"🔄 节点已重命名: 【{old_title}】 -> 【{clean_title}】 (已自动保存大纲)")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_title = dialog.get_text()
+            if new_title.strip() and new_title.strip() != old_title:
+                clean_title = new_title.strip()
+                # 1. 更新内存数据
+                real_node["title"] = clean_title
+                # 2. 更新 UI 显示
+                item.setText(0, clean_title)
+                
+                # 3. 自动保存大纲配置
+                if self.workspace and self.outline_tree_data:
+                    self.workspace.save_outline_tree(self.outline_tree_data)
+                    self.log_console.append(f"🔄 节点已重命名: 【{old_title}】 -> 【{clean_title}】 (已自动保存大纲)")
 
     def save_all(self):
         # 处理全局保存菜单动作 (Ctrl+S 触发)"""
