@@ -48,6 +48,49 @@ def clean_json_string(text: str) -> str:
         return text[start_idx:end_idx+1]
     return text
 
+# ================= 新增：大纲自动生成线程 =================
+class OutlineBuildingThread(QThread):
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal(dict) # 返回解析后的 JSON 字典
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, llm_client, idea, settings_text, prompt_tpl, parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.idea = idea
+        self.settings_text = settings_text
+        self.prompt_tpl = prompt_tpl
+
+    def run(self):
+        try:
+            self.progress_signal.emit("正在分析点子和设定，构建三级大纲结构...")
+            
+            # 强化 JSON 格式的系统指令
+            json_sys_prompt = "你现在是一个专业的数据结构化助手。你必须严格按照用户的要求输出纯 JSON 格式的数据。绝对不允许使用 Markdown 代码块（严禁出现 ```json 和 ```），严禁包含任何前言或解释说明。"
+            
+            prompt = self.prompt_tpl.format(idea=self.idea, settings_text=self.settings_text)
+            res_raw = self.llm_client.generate_text(prompt, override_system_instruction=json_sys_prompt)
+            
+            if res_raw.strip().startswith("> **生成失败:**"):
+                self.error_signal.emit(res_raw)
+                return
+                
+            res = clean_json_string(res_raw)
+            try:
+                outline_data = json.loads(res)
+            except json.JSONDecodeError:
+                self.error_signal.emit("大模型返回的大纲 JSON 解析失败，格式错乱。")
+                return
+            
+            if not isinstance(outline_data, dict) or "nodes" not in outline_data:
+                self.error_signal.emit("大模型返回的数据结构异常，必须包含 'nodes' 顶级键。")
+                return
+            
+            self.success_signal.emit(outline_data)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+# =========================================================
+
 # ================= 新增：世界观批量生成线程 =================
 class WorldBuildingThread(QThread):
     progress_signal = pyqtSignal(str)
@@ -130,8 +173,20 @@ class WorldBuildingThread(QThread):
                 
                 try:
                     detail_data = json.loads(detail_res)
+                    
+                    # 【防御性编程】：如果 AI 强行返回了数组（例如 [{...}]），则提取第一个字典元素
+                    if isinstance(detail_data, list):
+                        if len(detail_data) > 0 and isinstance(detail_data[0], dict):
+                            detail_data = detail_data[0]
+                        else:
+                            detail_data = {"错误说明": "AI 生成的数组中没有有效的字典对象", "raw_content": detail_res}
+                            
                     # 补充一个 name 字段防止模板里漏了
-                    detail_data["_node_name"] = name
+                    if isinstance(detail_data, dict):
+                        detail_data["_node_name"] = name
+                    else:
+                        detail_data = {"错误说明": "AI 返回的数据类型不是对象或数组", "raw_content": detail_res}
+                        
                 except json.JSONDecodeError:
                     # 如果这一个节点解析失败，写入纯文本让用户手动修
                     detail_data = {"错误说明": "AI 生成了非法的 JSON", "raw_content": detail_res}
@@ -215,6 +270,41 @@ class GenerateTaskThread(QThread):
         except Exception as e:
             self.error_signal.emit(str(e))
 
+
+# ================= 新增：适配深色主题的自定义多行输入框 =================
+class IdeaInputDialog(QDialog):
+    def __init__(self, parent, title, hint):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(600, 400)
+        
+        layout = QVBoxLayout(self)
+        
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+        
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlaceholderText("在这里输入您的设定概念或核心点子...")
+        layout.addWidget(self.text_edit)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_ok)
+        layout.addLayout(btn_layout)
+
+    def get_text(self):
+        return self.text_edit.toPlainText()
+# ====================================================================
+
 class NovelCreatorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -244,6 +334,93 @@ class NovelCreatorWindow(QMainWindow):
         recent_workspaces = sys_state.get("recent_workspaces", [])
         if recent_workspaces and os.path.exists(recent_workspaces[0]):
             self._load_workspace_by_path(recent_workspaces[0])
+
+    # ================= 【新增】小说大纲的右键菜单逻辑 =================
+    def show_novel_context_menu(self, position):
+        if not self.workspace:
+            return
+            
+        menu = QMenu()
+        gen_outline_action = menu.addAction("💡 结合当前点子与左侧勾选设定，自动生成大纲")
+        gen_outline_action.triggered.connect(self.open_outline_building_dialog)
+        
+        menu.exec(self.novel_tree.viewport().mapToGlobal(position))
+
+    def open_outline_building_dialog(self):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+            
+        # 使用你自定义的弹窗组件
+        dialog = IdeaInputDialog(self, "自动生成小说大纲", "请输入关于大纲的剧情发展点子、主线走向或期待的章节结构：\n（左侧打钩的世界观设定也会作为参考上下文发送给AI）")
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            idea = dialog.get_text()
+            if idea.strip():
+                self.log_console.append("启动大纲生成引擎。后台处理中，请稍候...")
+                self.btn_save.setEnabled(False)
+                
+                # 抓取左侧打钩的设定作为参考
+                checked_paths = self.get_checked_settings()
+                builder = ContextBuilder(self.workspace)
+                settings_text = builder._build_settings_text(checked_paths)
+                
+                # 加载 prompt 模板 (如果有缺失会自动创建并采用 fallback 文本)
+                default_prompt = "" # 留空即可，因为第一步我们已经在文件中写好了
+                prompt_tpl = self._get_or_create_prompt_template("outline_build.txt", default_prompt, "根据点子和设定生成大纲")
+                
+                # 启动生成线程
+                self.ob_thread = OutlineBuildingThread(
+                    llm_client=self.llm_client,
+                    idea=idea.strip(),
+                    settings_text=settings_text,
+                    prompt_tpl=prompt_tpl
+                )
+                self.ob_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
+                self.ob_thread.success_signal.connect(self.on_outline_building_success)
+                self.ob_thread.error_signal.connect(self.on_outline_building_error)
+                self.ob_thread.start()
+
+    def on_outline_building_success(self, outline_data):
+        import uuid
+        
+        # 递归清理大模型生成的数据，并分配物理路径属性
+        def process_nodes(nodes, level):
+            for node in nodes:
+                node["_status"] = "ok" # 默认先置为ok
+                if level == 3:
+                    # 分配底层场景的 Markdown 文件名，但不立刻创建实体文件！
+                    # 这样刷新UI时，检测不到实体文件，节点会标红/变灰，正好用于批量生成。
+                    node["file_path"] = f"场景_{uuid.uuid4().hex[:8]}.md"
+                    node["children"] = [] # 强制第3级不再有子节点
+                else:
+                    process_nodes(node.get("children", []), level + 1)
+        
+        new_nodes = outline_data.get("nodes", [])
+        process_nodes(new_nodes, 1)
+        
+        if "nodes" not in self.outline_tree_data:
+            self.outline_tree_data["nodes"] = []
+            
+        # 追加到当前大纲目录树的尾部
+        self.outline_tree_data["nodes"].extend(new_nodes)
+        
+        try:
+            # 写入系统级 JSON 并刷新视图
+            with open(self.workspace.tree_json_file, 'w', encoding='utf-8') as f:
+                json.dump(self.outline_tree_data, f, ensure_ascii=False, indent=4)
+                
+            self.log_console.append("<b><font color='green'>🎉 大纲生成完毕！已追加到目录树末尾。</font></b>")
+            self.refresh_ui_from_workspace()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存大纲 JSON 失败:\n{e}")
+        finally:
+            self.btn_save.setEnabled(True)
+            
+    def on_outline_building_error(self, err_msg):
+        self.log_console.append(f"<font color='red'>大纲生成失败: {err_msg}</font>")
+        QMessageBox.warning(self, "生成失败", f"大纲生成流程中断:\n{err_msg}")
+        self.btn_save.setEnabled(True)
 
     # ================= 新增：系统级状态管理（保存最近工作区） =================
     def _get_sys_state_path(self):
@@ -395,6 +572,10 @@ class NovelCreatorWindow(QMainWindow):
 
         self.novel_tree = QTreeWidget()
         self.novel_tree.setHeaderLabel("小说大纲结构")
+
+        # 【新增】激活小说大纲树的右键菜单
+        self.novel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.novel_tree.customContextMenuRequested.connect(self.show_novel_context_menu)
 
         # 【新增功能 2】：为大纲树绑定 F2 修改标题快捷键
         self.rename_shortcut = QShortcut(QKeySequence("F2"), self.novel_tree)
@@ -736,9 +917,6 @@ class NovelCreatorWindow(QMainWindow):
             self.log_console.append(f"<font color='red'><b>⚠️ 严重警告：检测到多个场景节点指向相同的物理文件！可能导致剧情覆盖或丢失。<br>冲突的底层文件列表：{', '.join(self._duplicate_paths)}<br>请手动在冲突的节点中点击“保存当前节点”以重新生成独立的 MD 文件绑定。</b></font>")
             QMessageBox.warning(self, "节点冲突警告", "检测到多个大纲节点共用了同一个本地 Markdown 文件（树状图中已标红）。\n请留意控制台警告，并手动编辑处理冲突！")
 
-        self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
-        self.novel_tree.expandAll()
-        
         self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
         self.novel_tree.expandAll()
 
@@ -1532,30 +1710,34 @@ class NovelCreatorWindow(QMainWindow):
         title = "全新生成背景资料" if mode == "init" else "针对性补充背景资料"
         hint = "请输入您的核心点子或世界观框架概念（例如：一个由猫咪统治的赛博朋克城市）："
         
-        idea, ok = QInputDialog.getMultiLineText(self, title, hint)
-        if ok and idea.strip():
-            self.log_console.append(f"启动设定生成引擎，模式：{mode}。后台处理中，请稍候...")
-            self.btn_save.setEnabled(False) # 暂时禁用保存防止冲突
+        # ================= 修改点：使用自定义对话框解决白底问题 =================
+        dialog = IdeaInputDialog(self, title, hint)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            idea = dialog.get_text()
+            if idea.strip():
+                self.log_console.append(f"启动设定生成引擎，模式：{mode}。后台处理中，请稍候...")
+                self.btn_save.setEnabled(False) # 暂时禁用保存防止冲突
 
-            default_p1 = "你是一个资深的小说世界观设计师，擅长根据简短的点子构建丰富的背景设定。请根据以下核心概念，帮我规划出一个适合小说创作的世界观分类体系（例如：种族、政治、科技、宗教等），并列出每个分类下的关键要素名称。"
-            default_p2 = "请根据之前规划的世界观分类体系，针对每个要素进行详细的设定扩写，内容可以包含但不限于：外貌特征、社会结构、历史背景、与其他要素的关系等。请尽量丰富细节，帮助我构建一个生动立体的小说世界。"
-            
-            p1_tpl = self._get_or_create_prompt_template("world_build_list.txt", default_p1, "世界观分类规划")
-            p2_tpl = self._get_or_create_prompt_template("world_build_detail.txt", default_p2, "世界观细节扩写")
-            
-            # 【修改这里】：明确指定参数名，防止错位
-            self.wb_thread = WorldBuildingThread(
-                llm_client=self.llm_client, 
-                workspace=self.workspace, 
-                idea=idea.strip(), 
-                prompt_1_tpl=p1_tpl, 
-                prompt_2_tpl=p2_tpl, 
-                mode=mode
-            )
-            self.wb_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
-            self.wb_thread.success_signal.connect(self.on_world_building_success)
-            self.wb_thread.error_signal.connect(self.on_world_building_error)
-            self.wb_thread.start()
+                default_p1 = "你是一个资深的小说世界观设计师，擅长根据简短的点子构建丰富的背景设定。请根据以下核心概念，帮我规划出一个适合小说创作的世界观分类体系（例如：种族、政治、科技、宗教等），并列出每个分类下的关键要素名称。"
+                default_p2 = "请根据之前规划的世界观分类体系，针对每个要素进行详细的设定扩写，内容可以包含但不限于：外貌特征、社会结构、历史背景、与其他要素的关系等。请尽量丰富细节，帮助我构建一个生动立体的小说世界。"
+                
+                p1_tpl = self._get_or_create_prompt_template("world_build_list.txt", default_p1, "世界观分类规划")
+                p2_tpl = self._get_or_create_prompt_template("world_build_detail.txt", default_p2, "世界观细节扩写")
+                
+                self.wb_thread = WorldBuildingThread(
+                    llm_client=self.llm_client, 
+                    workspace=self.workspace, 
+                    idea=idea.strip(), 
+                    prompt_1_tpl=p1_tpl, 
+                    prompt_2_tpl=p2_tpl, 
+                    mode=mode
+                )
+                self.wb_thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='cyan'>{msg}</font>"))
+                self.wb_thread.success_signal.connect(self.on_world_building_success)
+                self.wb_thread.error_signal.connect(self.on_world_building_error)
+                self.wb_thread.start()
+        # =====================================================================
 
     def on_world_building_success(self):
         self.log_console.append("<b><font color='green'>🎉 自动设定生成完毕！已将设定文件分配至对应目录。</font></b>")
