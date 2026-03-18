@@ -10,7 +10,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("系统配置 (API/模型)")
-        self.resize(500, 450)
+        self.resize(550, 500) # 稍微加大一点窗口以容纳新组件
         
         # 确定配置文件的路径 (假设工程结构为 root/ui/ 和 root/conf/)
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,12 +19,12 @@ class SettingsDialog(QDialog):
         
         # 加载现有配置
         self.config = self.load_config()
+        self.instructions_history = [] # 新增：存放历史指令的列表
         
         self.init_ui()
         self.populate_data()
 
     def load_config(self) -> dict:
-        """从本地读取 setting.json"""
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
@@ -66,12 +66,29 @@ class SettingsDialog(QDialog):
         txt_model_layout.addWidget(self.btn_fetch_txt_models)
         self.text_layout.addRow("模型名称 (Model):", txt_model_layout)
         
+        # ================= 新增：历史系统指令的管理 UI =================
+        history_layout = QHBoxLayout()
+        self.instruction_combo = QComboBox()
+        self.btn_save_instruction = QPushButton("💾 存为新模板")
+        self.btn_delete_instruction = QPushButton("🗑️ 删除该模板")
+        
+        history_layout.addWidget(self.instruction_combo, stretch=1)
+        history_layout.addWidget(self.btn_save_instruction)
+        history_layout.addWidget(self.btn_delete_instruction)
+        self.text_layout.addRow("历史系统指令:", history_layout)
+        
         self.txt_instruction_input = QTextEdit()
         self.txt_instruction_input.setPlaceholderText("系统提示词，例如：你是一个专业的小说家...")
-        self.text_layout.addRow("系统指令 (Instructions):", self.txt_instruction_input)
+        self.text_layout.addRow("当前指令内容:", self.txt_instruction_input)
+        
+        # 绑定历史记录相关事件
+        self.instruction_combo.currentIndexChanged.connect(self.on_instruction_changed)
+        self.btn_save_instruction.clicked.connect(self.save_instruction_to_history)
+        self.btn_delete_instruction.clicked.connect(self.delete_instruction_from_history)
+        # ===============================================================
 
         self.spin_timeout = QSpinBox()
-        self.spin_timeout.setRange(10, 600) # 允许设置 10秒 到 600秒
+        self.spin_timeout.setRange(10, 600)
         self.spin_timeout.setSuffix(" 秒")
         self.text_layout.addRow("请求超时时间 (Timeout):", self.spin_timeout)
 
@@ -134,15 +151,74 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(self.btn_save)
         main_layout.addLayout(btn_layout)
 
+    # ================= 新增：历史指令的逻辑处理 =================
+    def update_instruction_combo(self):
+        """刷新下拉列表视图"""
+        self.instruction_combo.blockSignals(True)
+        self.instruction_combo.clear()
+        for inst in self.instructions_history:
+            # 截取前 15 个字符作为摘要标题
+            display_name = inst[:15].replace("\n", " ") + ("..." if len(inst) > 15 else "")
+            self.instruction_combo.addItem(display_name, inst)
+        self.instruction_combo.blockSignals(False)
+
+    def on_instruction_changed(self, index):
+        """当下拉框切换时，更新文本框内容"""
+        if index >= 0:
+            content = self.instruction_combo.itemData(index)
+            self.txt_instruction_input.setPlainText(content)
+
+    def save_instruction_to_history(self):
+        """将当前编辑框的内容保存为新的历史记录"""
+        current_text = self.txt_instruction_input.toPlainText().strip()
+        if not current_text:
+            return
+            
+        if current_text not in self.instructions_history:
+            self.instructions_history.append(current_text)
+            self.update_instruction_combo()
+            self.instruction_combo.setCurrentIndex(len(self.instructions_history) - 1)
+            QMessageBox.information(self, "成功", "已保存为新的指令模板！")
+        else:
+            QMessageBox.information(self, "提示", "该指令模板已存在于记录中。")
+
+    def delete_instruction_from_history(self):
+        """删除当前选中的历史记录"""
+        index = self.instruction_combo.currentIndex()
+        if index >= 0:
+            del self.instructions_history[index]
+            self.update_instruction_combo()
+            if self.instructions_history:
+                self.txt_instruction_input.setPlainText(self.instructions_history[0])
+            else:
+                self.txt_instruction_input.clear()
+            QMessageBox.information(self, "成功", "已删除该指令模板！")
+    # ==========================================================
+
     def populate_data(self):
-        """将加载的字典数据填充到 UI 组件中"""
         text_cfg = self.config.get("text_api", {})
         self.txt_type_combo.setCurrentText(text_cfg.get("type", "openai"))
         self.txt_base_url_input.setText(text_cfg.get("base_url", "https://api.openai.com/v1"))
         self.txt_api_key_input.setText(text_cfg.get("api_key", ""))
         self.txt_model_combo.setCurrentText(text_cfg.get("model", "gpt-4o"))
-        self.txt_instruction_input.setPlainText(text_cfg.get("instructions", "你是一个专业的AI小说家，擅长根据设定和上下文构建引人入胜的故事。"))
-        self.spin_timeout.setValue(text_cfg.get("timeout", 120)) # 【新增】默认 120 秒
+        self.spin_timeout.setValue(text_cfg.get("timeout", 120))
+        
+        # 加载历史指令列表
+        self.instructions_history = text_cfg.get("instructions_history", [])
+        current_instruction = text_cfg.get("instructions", "你是一个专业的AI小说家，擅长根据设定和上下文构建引人入胜的故事。")
+        
+        # 确保当前指令在历史列表中
+        if current_instruction and current_instruction not in self.instructions_history:
+            self.instructions_history.insert(0, current_instruction)
+            
+        self.update_instruction_combo()
+        
+        # 设置当前选中的指令文本
+        self.txt_instruction_input.setPlainText(current_instruction)
+        # 尝试在下拉框中定位到当前指令
+        idx = self.instruction_combo.findData(current_instruction)
+        if idx >= 0:
+            self.instruction_combo.setCurrentIndex(idx)
 
         img_cfg = self.config.get("image_api", {})
         self.img_type_combo.setCurrentText(img_cfg.get("type", "openai"))
@@ -207,7 +283,11 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "提示", "当前仅支持自动拉取 OpenAI 兼容格式 (如 DeepSeek, Moonshot 等) 的模型列表。对于 Gemini，请手动输入模型名称（如 gemini-1.5-pro）。")
 
     def save_config(self):
-        """将 UI 中的数据收集并覆写到 setting.json"""
+        # 在保存配置时，如果当前文本框里的内容不在历史记录里，自动帮用户存一份
+        current_instruction = self.txt_instruction_input.toPlainText().strip()
+        if current_instruction and current_instruction not in self.instructions_history:
+            self.instructions_history.append(current_instruction)
+
         new_config = {
             "proxy": {
                 "enabled": self.cb_enable_proxy.isChecked(),
@@ -220,7 +300,8 @@ class SettingsDialog(QDialog):
                 "api_key": self.txt_api_key_input.text().strip(),
                 "model": self.txt_model_combo.currentText().strip(),
                 "timeout": self.spin_timeout.value(),
-                "instructions": self.txt_instruction_input.toPlainText()
+                "instructions": current_instruction,
+                "instructions_history": self.instructions_history # 新增字段落盘
             },
             "image_api": {
                 # ... 保持你原有的 image_api 内容不变 ...

@@ -1,0 +1,7 @@
+httpx==0.28.1
+Markdown==3.10.2
+openai==2.28.0
+protobuf==7.34.0
+PyQt6==6.10.2
+pyqt6_sip==13.10.2
+Requests==2.32.5
