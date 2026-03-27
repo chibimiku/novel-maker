@@ -32,10 +32,19 @@ class GenerationMixin:
             )
             return
 
+        # 保存当前内容到回退缓冲区
+        current_content = self.content_editor.toPlainText()
+        self._save_to_undo_stack('content', current_content)
+
         self.save_current_node()
 
         node_title = self.current_editing_node.get("title", "未知节点")
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage("正在构建上下文并发送请求到LLM...")
 
         self.btn_generate.setEnabled(False)
         self.btn_save.setEnabled(False)
@@ -137,6 +146,11 @@ class GenerationMixin:
     def on_generate_success(self: "NovelCreatorWindow", result: str):
         self.content_editor.setText(result)
         self.log_console.append("生成成功！已填入编辑器并自动保存。")
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage("LLM 生成成功，已更新编辑器内容", 3000)
 
         self.save_current_node()
 
@@ -145,10 +159,88 @@ class GenerationMixin:
         if self.is_batch_generating:
             self._process_next_batch_node()
 
+    def regenerate_summary(self: "NovelCreatorWindow"):
+        """重新生成当前节点的概要(Summary)"""
+        if not self.current_editing_node or not self.outline_tree_data:
+            return
+
+        if not self.llm_client:
+            QMessageBox.warning(
+                self,  # type: ignore[arg-type]
+                "配置缺失",
+                "尚未初始化大模型客户端，请检查 conf/setting.json 文件。",
+            )
+            return
+
+        # 保存当前概要到回退缓冲区
+        current_summary = self.summary_editor.toPlainText()
+        self._save_to_undo_stack('summary', current_summary)
+
+        node_title = self.current_editing_node.get("title", "未知节点")
+        self.log_console.append(f"开始重新生成【{node_title}】的概要...")
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage("正在发送请求到LLM生成概要...")
+
+        # 禁用相关按钮
+        self.btn_generate.setEnabled(False)
+        self.btn_rewrite.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self.btn_delete.setEnabled(False)
+
+        builder = ContextBuilder(self.workspace)
+        checked_paths = self.get_checked_settings()
+
+        messages = builder.build_summary_prompt(
+            self.current_editing_node,
+            self.outline_tree_data,
+            checked_paths,
+        )
+
+        prompt_content = messages[-1]["content"]
+
+        self.log_console.append(
+            "========== [System] 模型系统指令 (Instructions) =========="
+        )
+        self.log_console.append(self.llm_client.system_instruction)
+        self.log_console.append(
+            "========== [User] 生成概要提示词 =========="
+        )
+        self.log_console.append(prompt_content)
+        self.log_console.append("=================================================")
+        self.log_console.append("发送请求至大语言模型，后台处理中，请稍候...")
+
+        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        self.generate_thread.success_signal.connect(self.on_summary_generate_success)
+        self.generate_thread.error_signal.connect(self.on_generate_error)
+        self.generate_thread.start()
+
+    def on_summary_generate_success(self: "NovelCreatorWindow", result: str):
+        """处理概要生成成功的回调"""
+        self.summary_editor.setText(result)
+        self.current_editing_node["summary"] = result
+        self.log_console.append("概要生成成功！已更新至编辑器并自动保存。")
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage("概要生成成功，已更新编辑器内容", 3000)
+
+        self.save_current_node()
+        self._restore_generate_ui_state()
+
     def on_generate_error(self: "NovelCreatorWindow", error_msg: str):
         self.log_console.append(
             f"<font color='red'>生成失败: {error_msg}</font>"
         )
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage(f"LLM 请求失败: {error_msg[:50]}...", 3000)
+        
         if not self.is_batch_generating:
             QMessageBox.critical(
                 self,  # type: ignore[arg-type]
@@ -170,6 +262,7 @@ class GenerationMixin:
             self.btn_generate.setEnabled(True)
             self.btn_save.setEnabled(True)
             self.btn_rewrite.setEnabled(True)
+            self.btn_regenerate_summary.setEnabled(True)
             if self.current_editing_node:
                 self.btn_delete.setEnabled(
                     not bool(self.current_editing_node.get("children"))

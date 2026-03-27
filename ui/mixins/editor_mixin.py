@@ -64,6 +64,10 @@ class EditorMixin:
                     f"\U0001f4be 节点保存成功: "
                     f"{self.current_editing_node.get('title')}"
                 )
+                # 更新原始状态，避免切换节点时重复提示保存
+                self.current_node_original_summary = self.summary_editor.toPlainText()
+                if self.content_editor.isEnabled():
+                    self.current_node_original_content = self.content_editor.toPlainText()
             except Exception as e:
                 QMessageBox.critical(
                     self, "错误", f"保存大纲树失败:\n{e}"  # type: ignore[arg-type]

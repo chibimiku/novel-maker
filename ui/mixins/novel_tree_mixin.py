@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from ui.theme import NODE_ADD_BTN, NODE_ERROR, NODE_MISSING, NODE_NORMAL
 from ui.dialogs import IdeaInputDialog, RenameNodeDialog
 from ui.utils import find_duplicate_paths, get_item_level
-from ui.workers import OutlineBuildingThread
+from ui.workers import OutlineBuildingThread, GenerateTaskThread
 from core.context_builder import ContextBuilder
 
 if TYPE_CHECKING:
@@ -218,15 +218,57 @@ class NovelTreeMixin:
                 self.add_new_novel_node(target_list, 1)
             return
 
+        # 检查是否有未保存的更改
+        if self.current_editing_node:
+            current_summary = self.summary_editor.toPlainText()
+            current_content = self.content_editor.toPlainText()
+            original_summary = self.current_node_original_summary
+            original_content = self.current_node_original_content
+            
+            if current_summary != original_summary or current_content != original_content:
+                reply = QMessageBox.question(
+                    self,  # type: ignore[arg-type]
+                    "保存更改",
+                    "当前节点有未保存的更改，是否在切换前保存？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                
+                if reply == QMessageBox.StandardButton.Cancel:
+                    return
+                elif reply == QMessageBox.StandardButton.Yes:
+                    self.save_current_node()
+
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
         real_node = self.node_map.get(node_id)
         if not real_node:
             return
 
+        # 保存新节点的原始状态
         self.current_editing_node = real_node
         self.current_editing_item = item
         self.current_setting_path = None
         node_level = get_item_level(item)
+        
+        # 重置回退缓冲区
+        self.undo_stack = []
+        self.btn_undo.setEnabled(False)
+        
+        # 保存当前节点的原始状态
+        self.current_node_original_summary = real_node.get("summary", "")
+        if node_level == 3:
+            rel_path = real_node.get("file_path")
+            if rel_path:
+                full_path = os.path.join(self.workspace.text_path, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        self.current_node_original_content = f.read()
+                else:
+                    self.current_node_original_content = f"# {real_node.get('title')}\n\n(文件尚未生成)"
+            else:
+                self.current_node_original_content = f"# {real_node.get('title')}\n\n"
+        else:
+            self.current_node_original_content = "（当前层级仅支持填写概要，正文请在底层的\u201c场景\u201d节点中生成/编写）"
 
         self.btn_delete.setEnabled(not bool(real_node.get("children")))
 
@@ -234,6 +276,7 @@ class NovelTreeMixin:
         self.summary_editor.setText(real_node.get("summary", ""))
         self.summary_editor.setEnabled(True)
         self.btn_save.setEnabled(True)
+        self.btn_regenerate_summary.setEnabled(True)
 
         # 2. 加载正文 (仅对第3级开放)
         if node_level == 3:
@@ -357,6 +400,22 @@ class NovelTreeMixin:
             return
 
         menu = QMenu()
+        
+        # 获取当前点击的节点
+        item = self.novel_tree.itemAt(position)
+        if item and not item.text(0).startswith("+"):
+            node_id = item.data(0, Qt.ItemDataRole.UserRole)
+            real_node = self.node_map.get(node_id)
+            if real_node:
+                level = get_item_level(item)
+                # 只对1级和2级节点添加增加子节点的选项
+                if level in [1, 2]:
+                    add_children_action = menu.addAction(
+                        "\U0001f4a1 根据要求增加子节点"
+                    )
+                    add_children_action.triggered.connect(lambda: self.open_add_children_dialog(real_node, level))
+                    menu.addSeparator()
+
         gen_outline_action = menu.addAction(
             "\U0001f4a1 结合当前点子与左侧勾选设定，自动生成大纲"
         )
@@ -446,6 +505,259 @@ class NovelTreeMixin:
             )
         finally:
             self.btn_save.setEnabled(True)
+
+    def open_add_children_dialog(self: "NovelCreatorWindow", target_node: dict, level: int):
+        """打开增加子节点的对话框"""
+        if not self.llm_client:
+            QMessageBox.warning(
+                self, "未配置", "请先在设置中配置大模型 API。"  # type: ignore[arg-type]
+            )
+            return
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QLineEdit, QPushButton, QHBoxLayout
+
+        class AddChildrenDialog(QDialog):
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.setWindowTitle("根据要求增加子节点")
+                self.setMinimumWidth(500)
+                
+                layout = QVBoxLayout()
+                
+                # 输入要求
+                layout.addWidget(QLabel("请输入子节点的生成要求："))
+                self.requirement_edit = QTextEdit()
+                self.requirement_edit.setPlaceholderText("例如：生成3个关于主角在森林中冒险的场景")
+                layout.addWidget(self.requirement_edit)
+                
+                # 输入节点个数
+                layout.addWidget(QLabel("请输入要生成的子节点个数："))
+                self.count_edit = QLineEdit()
+                self.count_edit.setPlaceholderText("输入数字，如：3")
+                layout.addWidget(self.count_edit)
+                
+                # 按钮
+                btn_layout = QHBoxLayout()
+                self.ok_btn = QPushButton("确定")
+                self.cancel_btn = QPushButton("取消")
+                btn_layout.addStretch()
+                btn_layout.addWidget(self.ok_btn)
+                btn_layout.addWidget(self.cancel_btn)
+                layout.addLayout(btn_layout)
+                
+                self.ok_btn.clicked.connect(self.accept)
+                self.cancel_btn.clicked.connect(self.reject)
+                
+                self.setLayout(layout)
+            
+            def get_requirement(self):
+                return self.requirement_edit.toPlainText().strip()
+            
+            def get_count(self):
+                try:
+                    return int(self.count_edit.text().strip())
+                except:
+                    return 0
+
+        dialog = AddChildrenDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            requirement = dialog.get_requirement()
+            count = dialog.get_count()
+            
+            if not requirement:
+                QMessageBox.warning(
+                    self, "输入错误", "请输入生成要求。"  # type: ignore[arg-type]
+                )
+                return
+            
+            if count <= 0:
+                QMessageBox.warning(
+                    self, "输入错误", "请输入有效的节点个数。"  # type: ignore[arg-type]
+                )
+                return
+            
+            self.generate_children_nodes(target_node, level, requirement, count)
+
+    def generate_children_nodes(self: "NovelCreatorWindow", target_node: dict, level: int, requirement: str, count: int):
+        """根据要求生成子节点"""
+        node_title = target_node.get("title", "未知节点")
+        self.log_console.append(f"开始生成【{node_title}】的子节点...")
+        
+        # 在状态栏显示信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage("正在构建上下文并发送请求到LLM生成子节点...")
+        
+        # 禁用相关按钮
+        self.btn_save.setEnabled(False)
+        
+        try:
+            # 构建上下文
+            builder = ContextBuilder(self.workspace)
+            checked_paths = self.get_checked_settings()
+            
+            # 获取父节点和同级节点
+            parents = []
+            siblings = []
+            
+            def find_node_info(current_nodes, current_path):
+                nonlocal parents, siblings
+                for node in current_nodes:
+                    path = current_path + [node]
+                    if node is target_node:
+                        parents = current_path
+                        # 收集同级节点
+                        for sibling in current_nodes:
+                            if sibling is not target_node:
+                                siblings.append(sibling)
+                        return True
+                    if node.get("children"):
+                        if find_node_info(node.get("children", []), path):
+                            return True
+                return False
+            
+            find_node_info(self.outline_tree_data.get("nodes", []), [])
+            
+            # 构建上下文文本
+            context_blocks = []
+            
+            # 父节点信息
+            if parents:
+                context_blocks.append("【父节点信息】")
+                for p in parents:
+                    title = p.get("title", "未命名")
+                    summary = p.get("summary", "").strip() or "(该层级无概要)"
+                    context_blocks.append(f"<{title}> 概要:\n{summary}\n")
+            
+            # 同级节点信息
+            if siblings:
+                context_blocks.append("【同级节点信息】")
+                for sibling in siblings:
+                    title = sibling.get("title", "未命名")
+                    summary = sibling.get("summary", "").strip() or "(暂无概要)"
+                    context_blocks.append(f"<{title}> 概要:\n{summary}\n")
+            
+            # 当前节点信息
+            context_blocks.append("【当前节点信息】")
+            current_summary = target_node.get("summary", "").strip() or "(暂无概要)"
+            context_blocks.append(f"<{node_title}> 概要:\n{current_summary}\n")
+            
+            context_text = "\n".join(context_blocks) if context_blocks else "（无相关上下文）"
+            
+            # 构建提示词
+            child_type = "节" if level == 1 else "场景"
+            prompt = f"""
+你是一个专业的小说创作者。请根据提供的上下文信息，为指定的节点生成子节点。
+
+### 一、 上下文信息
+{context_text}
+
+### 二、 生成要求
+1. 请为节点【{node_title}】生成 {count} 个 {child_type} 子节点
+2. 子节点应该围绕以下要求展开：{requirement}
+3. 每个子节点需要包含标题和概要内容
+4. 如果当前节点【{node_title}】没有概要，请一并生成其概要内容
+5. 生成的子节点应该与上下文信息逻辑连贯
+6. 只需要生成概要内容，不需要生成正文
+
+### 三、 输出格式
+请严格按照以下 JSON 格式输出：
+{{
+  "current_node_summary": "当前节点的概要内容（如果需要生成）",
+  "children": [
+    {{
+      "title": "子节点1标题",
+      "summary": "子节点1概要"
+    }},
+    {{
+      "title": "子节点2标题",
+      "summary": "子节点2概要"
+    }}
+  ]
+}}
+
+请确保输出是有效的 JSON 格式，不要包含任何其他内容。
+"""
+            
+            self.log_console.append("提示词构建完成，准备发送请求...")
+            
+            # 发送请求
+            self.generate_thread = GenerateTaskThread(self.llm_client, prompt)
+            self.generate_thread.success_signal.connect(lambda result: self.on_children_generate_success(result, target_node))
+            self.generate_thread.error_signal.connect(self.on_children_generate_error)
+            self.generate_thread.start()
+            
+            self.log_console.append("生成线程已启动，等待LLM响应...")
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>生成子节点时发生错误: {e}</font>")
+            # 在状态栏显示错误信息
+            statusbar = self.statusBar()
+            if statusbar:
+                statusbar.showMessage(f"生成子节点时发生错误: {e[:50]}...", 3000)
+            # 恢复按钮状态
+            self.btn_save.setEnabled(True)
+
+    def on_children_generate_success(self: "NovelCreatorWindow", result: str, target_node: dict):
+        """处理子节点生成成功的回调"""
+        try:
+            import json
+            data = json.loads(result)
+            
+            # 更新当前节点的概要（如果有）
+            if "current_node_summary" in data and data["current_node_summary"]:
+                target_node["summary"] = data["current_node_summary"]
+            
+            # 添加子节点
+            if "children" in data and isinstance(data["children"], list):
+                children = target_node.setdefault("children", [])
+                for child in data["children"]:
+                    if "title" in child:
+                        new_child = {
+                            "title": child["title"],
+                            "summary": child.get("summary", ""),
+                            "children": [],
+                            "_status": "ok"
+                        }
+                        # 如果是生成场景节点，添加文件路径
+                        if len(target_node.get("children", [])) + len(data["children"]) <= 3:
+                            if target_node.get("children", []) and len(target_node["children"]) == 2:
+                                # 第三个子节点，应该是场景
+                                import uuid
+                                file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+                                new_child["file_path"] = file_name
+                        children.append(new_child)
+            
+            # 保存大纲
+            self.workspace.save_outline_tree(self.outline_tree_data)
+            self.log_console.append("子节点生成成功！")
+            
+            # 在状态栏显示信息
+            statusbar = self.statusBar()
+            if statusbar:
+                statusbar.showMessage("子节点生成成功，已更新大纲树", 3000)
+            
+            # 刷新 UI
+            self.refresh_ui_from_workspace()
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>处理生成结果失败: {e}</font>")
+            # 在状态栏显示错误信息
+            statusbar = self.statusBar()
+            if statusbar:
+                statusbar.showMessage(f"处理生成结果失败: {e[:50]}...", 3000)
+        finally:
+            self.btn_save.setEnabled(True)
+
+    def on_children_generate_error(self: "NovelCreatorWindow", error_msg: str):
+        """处理子节点生成错误的回调"""
+        self.log_console.append(
+            f"<font color='red'>子节点生成失败: {error_msg}</font>"
+        )
+        # 在状态栏显示错误信息
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage(f"子节点生成失败: {error_msg[:50]}...", 3000)
+        # 恢复按钮状态
+        self.btn_save.setEnabled(True)
 
     def on_outline_building_error(self: "NovelCreatorWindow", err_msg: str):
         self.log_console.append(

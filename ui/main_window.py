@@ -55,6 +55,12 @@ class NovelCreatorWindow(
         # 批量生成相关的状态变量
         self.batch_generate_queue = []
         self.is_batch_generating = False
+        
+        # 回退缓冲区相关变量
+        self.undo_stack = []              # 回退缓冲区，最多保存20次变更
+        self.max_undo_stack = 20          # 最大回退次数
+        self.current_node_original_summary = ""  # 当前节点的原始概要
+        self.current_node_original_content = ""  # 当前节点的原始内容
 
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config) if self.config else None
@@ -77,10 +83,12 @@ class NovelCreatorWindow(
         menubar.addMenu(file_menu)
 
         new_action = QAction('新建工作区', self)
+        new_action.setShortcut(QKeySequence("Ctrl+N"))
         file_menu.addAction(new_action)
         new_action.triggered.connect(self.new_workspace)
 
         load_action = QAction('加载工作区', self)
+        load_action.setShortcut(QKeySequence("Ctrl+O"))
         file_menu.addAction(load_action)
         load_action.triggered.connect(self.load_workspace)
 
@@ -92,10 +100,14 @@ class NovelCreatorWindow(
         save_action = file_menu.addAction('保存全部')
         save_action.setShortcut(QKeySequence("Ctrl+S"))
         save_action.triggered.connect(self.save_all)
+        
         export_html_action = file_menu.addAction('🌐 导出为可阅读网页 (HTML)')
+        export_html_action.setShortcut(QKeySequence("Ctrl+E"))
         export_html_action.triggered.connect(self.export_to_html)
+        
         setting_menu = menubar.addMenu('设置')
         settings_action = setting_menu.addAction('系统配置 (API/模型)')
+        settings_action.setShortcut(QKeySequence("Ctrl+P"))
         settings_action.triggered.connect(self.open_settings_dialog)
 
         main_widget = QWidget()
@@ -128,8 +140,29 @@ class NovelCreatorWindow(
         original_drop_event = self.novel_tree.dropEvent
         def custom_drop_event(event):
             original_drop_event(event)
-            self._cleanup_tree_add_buttons()
             self.sync_tree_data_from_ui()
+            # 保存当前选中的节点
+            current_item = self.novel_tree.currentItem()
+            current_node_id = None
+            if current_item:
+                current_node_id = current_item.data(0, Qt.ItemDataRole.UserRole)
+            # 重新构建树结构以确保子节点正确显示
+            self._refresh_novel_tree()
+            # 尝试恢复选中的节点
+            if current_node_id:
+                def find_item_by_node_id(item, node_id):
+                    for i in range(item.childCount()):
+                        child = item.child(i)
+                        if child.data(0, Qt.ItemDataRole.UserRole) == node_id:
+                            return child
+                        found = find_item_by_node_id(child, node_id)
+                        if found:
+                            return found
+                    return None
+                found_item = find_item_by_node_id(self.novel_tree.invisibleRootItem(), current_node_id)
+                if found_item:
+                    self.novel_tree.setCurrentItem(found_item)
+                    self.on_novel_node_clicked(found_item, 0)
         self.novel_tree.dropEvent = custom_drop_event
 
         self.novel_tree.itemClicked.connect(self.on_novel_node_clicked)
@@ -201,23 +234,31 @@ class NovelCreatorWindow(
         self.btn_batch_generate = QPushButton("🚀 批量生成缺失场景")
         self.btn_generate = QPushButton("🔄 结合上下文生成正文")
         self.btn_rewrite = QPushButton("✍️ 基于原文重写(扩/缩)")
+        self.btn_regenerate_summary = QPushButton("📝 重新生成概要")
+        self.btn_undo = QPushButton("↶ 后退")
         self.btn_save = QPushButton("💾 保存当前节点")
         self.btn_delete = QPushButton("🗑️ 删除当前节点")
 
         self.btn_batch_generate.clicked.connect(self.start_batch_generate)
         self.btn_generate.clicked.connect(self.generate_current_node)
         self.btn_rewrite.clicked.connect(self.rewrite_current_node)
+        self.btn_regenerate_summary.clicked.connect(self.regenerate_summary)
+        self.btn_undo.clicked.connect(self.undo_last_change)
         self.btn_save.clicked.connect(self.save_current_node)
         self.btn_delete.clicked.connect(self.delete_current_node)
 
         self.btn_generate.setEnabled(False)
         self.btn_rewrite.setEnabled(False)
+        self.btn_regenerate_summary.setEnabled(False)
+        self.btn_undo.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
 
         btn_layout.addWidget(self.btn_batch_generate)
         btn_layout.addWidget(self.btn_generate)
         btn_layout.addWidget(self.btn_rewrite)
+        btn_layout.addWidget(self.btn_regenerate_summary)
+        btn_layout.addWidget(self.btn_undo)
         btn_layout.addWidget(self.btn_save)
         btn_layout.addWidget(self.btn_delete)
         detail_layout.addLayout(btn_layout)
@@ -232,6 +273,49 @@ class NovelCreatorWindow(
         main_layout.addWidget(self.log_console, stretch=1)
 
     # ================= UI 刷新总调度 ================= #
+
+    def undo_last_change(self):
+        """回退到最近一次变更前的状态"""
+        if not self.undo_stack:
+            return
+
+        # 弹出最近的变更
+        last_change = self.undo_stack.pop()
+        change_type = last_change.get('type')
+        old_value = last_change.get('old_value')
+
+        if change_type == 'summary':
+            self.summary_editor.setText(old_value)
+            if self.current_editing_node:
+                self.current_editing_node['summary'] = old_value
+        elif change_type == 'content':
+            self.content_editor.setText(old_value)
+
+        # 更新后退按钮状态
+        self.btn_undo.setEnabled(len(self.undo_stack) > 0)
+        self.log_console.append("已回退到上一次变更前的状态")
+
+    def _save_to_undo_stack(self, change_type, old_value):
+        """保存变更到回退缓冲区"""
+        if not self.current_editing_node:
+            return
+
+        # 检查是否与上一次变更相同
+        if self.undo_stack and self.undo_stack[-1].get('type') == change_type:
+            return
+
+        # 添加变更到缓冲区
+        self.undo_stack.append({
+            'type': change_type,
+            'old_value': old_value
+        })
+
+        # 限制缓冲区大小
+        if len(self.undo_stack) > self.max_undo_stack:
+            self.undo_stack.pop(0)
+
+        # 更新后退按钮状态
+        self.btn_undo.setEnabled(True)
 
     def refresh_ui_from_workspace(self):
         """刷新整个 UI：分别委托给设定树和大纲树的渲染方法。"""

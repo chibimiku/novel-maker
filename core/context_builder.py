@@ -202,6 +202,106 @@ class ContextBuilder:
                 return ""
         return ""
 
+    def build_summary_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list) -> list:
+        """构建生成场景概要(Summary)的专属上下文"""
+        target_title = target_node.get("title", "未命名场景")
+        
+        # 获取父节点、子节点和同级节点
+        parents = []
+        children = target_node.get("children", [])
+        siblings = []
+        target_level = 0
+        
+        # 寻找父节点、同级节点和目标节点的层级
+        def find_node_info(current_nodes, current_path, level):
+            nonlocal parents, siblings, target_level
+            for i, node in enumerate(current_nodes):
+                path = current_path + [node]
+                if node is target_node:
+                    parents = current_path
+                    target_level = level
+                    # 收集同级节点
+                    for j, sibling in enumerate(current_nodes):
+                        if sibling is not target_node:
+                            siblings.append((j, sibling))
+                    return True
+                if node.get("children"):
+                    if find_node_info(node.get("children", []), path, level + 1):
+                        return True
+            return False
+        
+        find_node_info(tree_data.get("nodes", []), [], 1)
+        
+        # 构建上下文文本
+        context_blocks = []
+        
+        # 父节点信息
+        if parents:
+            context_blocks.append("【所属章节大纲】")
+            for p in parents:
+                title = p.get("title", "未命名")
+                summary = p.get("summary", "").strip() or "(该层级无概要)"
+                context_blocks.append(f"<{title}> 概要:\n{summary}\n")
+        
+        # 同级节点信息（仅针对2级节点）
+        if target_level == 2 and siblings:
+            context_blocks.append("【同级节点信息】")
+            # 按顺序排列同级节点
+            sorted_siblings = sorted(siblings, key=lambda x: x[0])
+            for idx, (original_idx, sibling) in enumerate(sorted_siblings):
+                sibling_title = sibling.get("title", "未命名")
+                sibling_summary = sibling.get("summary", "").strip() or "(暂无概要)"
+                context_blocks.append(f"{original_idx + 1}. <{sibling_title}> 概要:\n{sibling_summary}\n")
+            
+            # 说明目标节点在同级中的位置
+            # 找到目标节点在原列表中的位置
+            target_position = -1
+            all_nodes = tree_data.get("nodes", [])
+            if parents:
+                parent_node = parents[-1]
+                all_nodes = parent_node.get("children", [])
+            
+            for i, node in enumerate(all_nodes):
+                if node is target_node:
+                    target_position = i + 1
+                    break
+            
+            if target_position != -1:
+                context_blocks.append(f"\n【目标节点位置】\n当前节点【{target_title}】在同级节点中位于第 {target_position} 位。\n")
+        
+        # 子节点信息
+        if children:
+            context_blocks.append("【子节点信息】")
+            for child in children:
+                child_title = child.get("title", "未命名")
+                child_summary = child.get("summary", "").strip() or "(暂无概要)"
+                context_blocks.append(f"<{child_title}> 概要:\n{child_summary}\n")
+        
+        context_text = "\n".join(context_blocks) if context_blocks else "（无相关上下文）"
+        
+        # 构建提示词
+        prompt = f"""
+你是一个专业的小说创作者。请根据提供的上下文信息，为指定的场景生成一个精准、简洁的剧情概要(Summary)。
+
+### 一、 上下文信息
+{context_text}
+
+### 二、 当前任务
+请为场景【{target_title}】生成一个剧情概要，要求：
+1. 概要应准确反映该场景的核心内容和作用
+2. 语言简洁明了，控制在100-300字之间
+3. 突出场景的关键冲突、人物和情节发展
+4. 与父节点的主题保持一致，同时为子节点的发展做铺垫
+5. 如果是2级节点，请确保概要与同级节点的内容连贯，符合其在序列中的位置
+
+### 三、 输出格式与要求（绝对红线）
+1. 请直接输出概要内容，不要添加任何前缀或后缀
+2. 严禁任何助手语气与客套话，如"好的"、"已为您生成"等
+3. 确保概要内容与上下文信息逻辑连贯
+"""
+        
+        return [{"role": "user", "content": prompt.strip()}]
+
     def _assemble_final_prompt(self, target_title: str, settings_text: str, outline_context_text: str, target_summary: str, target_content: str, generate_image: bool, word_count: int) -> str:
         """拼接终极提示词，明确区分概要与正文的任务要求"""
         
