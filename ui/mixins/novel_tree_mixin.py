@@ -454,49 +454,104 @@ class NovelTreeMixin:
             QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。") # type: ignore[arg-type]
             return
             
-        reply = QMessageBox.question(
-            self, # type: ignore[arg-type]
-            "确认执行",
-            f"即将遍历校验节点【{target_node.get('title')}】及其所有子节点。\n\n"
-            "本操作不会直接覆盖您的原始数据，只会生成两份临时 Markdown 文件供您进行 Diff 比较和手动处理。\n"
-            "请确认是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QCheckBox, QPushButton, QHBoxLayout
         
-        if reply == QMessageBox.StandardButton.Yes:
-            self.log_console.append(f"<font color='cyan'>启动概要同步校验引擎，根节点：{target_node.get('title')}...</font>")
+        # 构建一个自定义的确认对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认执行校验同步")
+        dialog.setMinimumWidth(450)
+        
+        layout = QVBoxLayout()
+        
+        msg_label = QLabel(
+            f"即将遍历校验节点【{target_node.get('title')}】及其所有子节点。\n\n"
+            "默认情况下，系统只会生成两份临时 Markdown 文件供您进行 Diff 比较，不会修改原数据。"
+        )
+        msg_label.setWordWrap(True)
+        layout.addWidget(msg_label)
+        
+        # 新增强制覆盖模式复选框
+        force_cb = QCheckBox("开启【强制覆盖模式】（仅对底层场景生效）")
+        force_cb.setToolTip("勾选后，所有3级场景节点的概要将直接被新版本覆盖。1级(章)、2级(节)节点过于复杂，依然只生成 Diff 供人工确认。")
+        # 默认不选中
+        force_cb.setChecked(False)
+        layout.addWidget(force_cb)
+        
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定开始")
+        cancel_btn = QPushButton("取消")
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            force_mode = force_cb.isChecked()
+            mode_str = "【自动覆盖3级场景】" if force_mode else "【仅生成Diff】"
+            
+            self.log_console.append(f"<font color='cyan'>启动概要同步校验引擎 {mode_str}，根节点：{target_node.get('title')}...</font>")
             self.btn_save.setEnabled(False)
             
             self.sync_worker = SummarySyncWorker(
                 target_node=target_node,
                 level=level,
                 llm_client=self.llm_client,
-                workspace_manager=self.workspace
+                workspace_manager=self.workspace,
+                force_mode=force_mode  # 传入勾选状态
             )
             self.sync_worker.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='gray'>{msg}</font>"))
             self.sync_worker.success_signal.connect(self.on_summary_sync_success)
             self.sync_worker.error_signal.connect(self.on_summary_sync_error)
             self.sync_worker.start()
 
-    def on_summary_sync_success(self: "NovelCreatorWindow", before_path: str, after_path: str):
+    def on_summary_sync_success(self: "NovelCreatorWindow", before_path: str, after_path: str, level3_updates: dict):
+        updated_count = 0
+        
+        # 如果有需要强制更新的3级节点，直接覆盖内存中的大纲树并保存
+        if level3_updates:
+            for node_id, new_summary in level3_updates.items():
+                if node_id in self.node_map:
+                    self.node_map[node_id]["summary"] = new_summary
+                    updated_count += 1
+            
+            if updated_count > 0 and self.workspace and self.outline_tree_data:
+                self.workspace.save_outline_tree(self.outline_tree_data)
+                
+                # 如果当前UI右侧正文编辑器正在编辑刚才被覆盖的节点，自动刷新其内容
+                if self.current_editing_node and self.current_editing_node.get("id") in level3_updates:
+                    self.summary_editor.setText(self.current_editing_node["summary"])
+
         self.btn_save.setEnabled(True)
         self.log_console.append("<font color='green'><b>✅ 概要校验与同步完成！</b></font>")
+        
+        if updated_count > 0:
+            self.log_console.append(f"<font color='yellow'>已自动覆盖 {updated_count} 个3级场景的概要。</font>")
+            
         self.log_console.append(f"旧版概要文件: <a href='file:///{before_path}'>{before_path}</a>")
         self.log_console.append(f"新版概要文件: <a href='file:///{after_path}'>{after_path}</a>")
         
-        QMessageBox.information(
-            self, # type: ignore[arg-type]
-            "处理完成",
-            "大纲概要校验已完成！\n\n"
-            "系统已将修改前后的汇总输出为以下文件：\n"
+        # 弹窗提示
+        msg = "大纲概要校验已完成！\n\n"
+        if updated_count > 0:
+            msg += f"已为您自动覆盖 {updated_count} 个3级场景节点的概要，大纲已自动保存。\n\n"
+            
+        msg += (
+            "系统已将所有节点（含1、2、3级）修改前后的汇总输出为以下文件：\n"
             f"1. {os.path.basename(before_path)}\n2. {os.path.basename(after_path)}\n\n"
-            "请前往工作区的 temp_diff 文件夹下使用相关 Diff 工具（如 VS Code）进行查阅，按需复制所需的文本覆盖原节点。"
+            "（请前往工作区的 temp_diff 文件夹查阅章/节的 Diff 并手动合并）"
         )
+        
+        QMessageBox.information(self, "处理完成", msg) # type: ignore[arg-type]
 
     def on_summary_sync_error(self: "NovelCreatorWindow", error_msg: str):
         self.btn_save.setEnabled(True)
         self.log_console.append(f"<font color='red'>❌ 概要校验失败: {error_msg}</font>")
-        QMessageBox.critical(self, "错误", f"概要校验过程中发生异常:\n{error_msg}") # type: ignore[arg-type]
+        QMessageBox.critical(self, "错误", f"概要校验过程中发生异常:\n{error_msg}") # type: ignore[arg-type]ype: ignore[arg-type]
 
     def open_outline_building_dialog(self: "NovelCreatorWindow"):
         if not self.llm_client:

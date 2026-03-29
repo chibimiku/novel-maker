@@ -4,27 +4,28 @@ from core.context_builder import ContextBuilder
 
 class SummarySyncWorker(QThread):
     progress_signal = pyqtSignal(str)
-    success_signal = pyqtSignal(str, str)  # 返回 before_path, after_path
+    # 修改点1：增加一个 dict 参数用于传回需要覆盖的3级节点数据
+    success_signal = pyqtSignal(str, str, dict)  
     error_signal = pyqtSignal(str)
 
-    def __init__(self, target_node, level, llm_client, workspace_manager):
+    def __init__(self, target_node, level, llm_client, workspace_manager, force_mode=False):
         super().__init__()
         self.target_node = target_node
         self.level = level
         self.llm_client = llm_client
         self.workspace = workspace_manager
         self.context_builder = ContextBuilder(workspace_manager)
+        self.force_mode = force_mode  # 修改点2：接收强制模式参数
         
         self.before_records = []
         self.after_records = []
+        self.level3_updates = {} # 存放需要强制更新的3级节点ID和新概要
 
     def run(self):
         try:
             self.progress_signal.emit(f"开始校验节点树: {self.target_node.get('title', '未命名')}")
-            # 采用自底向上的后序遍历，确保父节点能拿到子节点最新的概要
             self.process_node(self.target_node, self.level)
             
-            # 生成对比用的临时 Markdown 文件
             temp_dir = os.path.join(self.workspace.workspace_path, "temp_diff")
             os.makedirs(temp_dir, exist_ok=True)
             
@@ -37,15 +38,16 @@ class SummarySyncWorker(QThread):
             with open(after_path, 'w', encoding='utf-8') as f:
                 f.write("# 校验后新概要汇总\n\n" + "\n\n".join(self.after_records))
 
-            self.success_signal.emit(before_path, after_path)
+            # 修改点3：将 level3_updates 一并发送回主线程
+            self.success_signal.emit(before_path, after_path, self.level3_updates)
         except Exception as e:
             self.error_signal.emit(f"校验同步失败: {str(e)}")
 
     def process_node(self, node, level):
         title = node.get("title", "未命名")
         old_summary = node.get("summary", "").strip()
+        node_id = node.get("id")
         
-        # 1. 递归处理所有子节点，收集子节点的新概要
         children_actual_contents = []
         if "children" in node and node["children"]:
             for child in node["children"]:
@@ -54,29 +56,26 @@ class SummarySyncWorker(QThread):
         
         self.progress_signal.emit(f"正在分析节点: {title} (层级 {level})...")
 
-        # 2. 确定“实际内容”的参考来源
         if level == 3:
-            # 场景节点：直接读取 MD 正文
             actual_content = self.context_builder._read_node_content(node).strip()
-            # 截断过长的正文以防止超长上下文，保留首尾核心片段
             if len(actual_content) > 4000:
                 actual_content = actual_content[:2000] + "\n\n...(中间省略)...\n\n" + actual_content[-2000:]
         else:
-            # 章/节节点：使用子节点的最新概要汇总作为实际内容
             actual_content = "\n".join(children_actual_contents)
 
-        # 记录修改前的状态
         self.before_records.append(f"## {title} (层级: {level})\n{old_summary if old_summary else '(空)'}\n")
 
-        # 3. 如果底层场景既没有正文也没有旧概要，直接返回空，避免无意义的 LLM 调用
         if not old_summary and not actual_content:
             new_summary = ""
         else:
-            # 4. 调用 LLM 进行校验和重写
             prompt = self.context_builder.build_summary_sync_prompt(title, level, old_summary, actual_content)
             new_summary = self.llm_client.generate_text(prompt=prompt).strip()
 
-        # 记录修改后的状态
         self.after_records.append(f"## {title} (层级: {level})\n{new_summary}\n")
+
+        # 修改点4：如果是强制模式，并且当前处理的是3级场景节点，则记录它的新概要
+        if self.force_mode and level == 3 and new_summary:
+            if node_id:
+                self.level3_updates[node_id] = new_summary
 
         return new_summary
