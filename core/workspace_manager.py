@@ -63,17 +63,33 @@ class WorkspaceManager:
     def load_outline_tree(self) -> dict:
         """
         加载并校验 outline_tree.json。
-        在加载时会自动比对记录的 MD5 与本地文件的实际 MD5。
+        在加载时会自动比对记录的 MD5 与本地文件的实际 MD5，并为节点添加UUID。
         """
         if not os.path.exists(self.tree_json_file):
             return {"nodes": []}
 
         try:
+            import uuid
             with open(self.tree_json_file, 'r', encoding='utf-8') as f:
                 tree_data = json.load(f)
+            
+            # 为所有节点添加UUID
+            def add_uuid_to_nodes(nodes):
+                for node in nodes:
+                    if "id" not in node:
+                        node["id"] = str(uuid.uuid4())
+                    if "children" in node:
+                        add_uuid_to_nodes(node["children"])
+            
+            add_uuid_to_nodes(tree_data.get("nodes", []))
+            
             # 递归校验树中节点的 MD5，标记文件是否被外部修改或缺失
             # 【修改点 3】：传入起始层级 level=1
             self._verify_tree_md5(tree_data.get("nodes", []), level=1)
+            
+            # 保存带有UUID的树数据
+            self.save_outline_tree(tree_data)
+            
             return tree_data
             
         except Exception as e:

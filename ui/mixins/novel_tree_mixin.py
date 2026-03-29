@@ -7,6 +7,8 @@ import json
 import os
 import uuid
 from typing import TYPE_CHECKING
+import os
+from ui.summary_sync_worker import SummarySyncWorker
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
@@ -75,11 +77,25 @@ class NovelTreeMixin:
 
         for node in nodes:
             title = node.get("title", "未命名节点")
+            # 对于3级节点，添加文件修改时间
+            if level == 3:
+                file_path = node.get("file_path")
+                if file_path:
+                    full_path = os.path.join(self.workspace.text_path, file_path)
+                    if os.path.exists(full_path):
+                        import time
+                        mtime = os.path.getmtime(full_path)
+                        # 格式化时间为 YYYY-MM-DD HH:MM
+                        formatted_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+                        title = f"{title} ({formatted_time})"
             item = QTreeWidgetItem(parent_widget, [title])
 
+            # 添加勾选框
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            
             if level == 3:
                 item.setFlags(
-                    (item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+                    (item.flags() | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsUserCheckable)
                     & ~Qt.ItemFlag.ItemIsDropEnabled
                 )
             else:
@@ -87,9 +103,11 @@ class NovelTreeMixin:
                     item.flags()
                     | Qt.ItemFlag.ItemIsDragEnabled
                     | Qt.ItemFlag.ItemIsDropEnabled
+                    | Qt.ItemFlag.ItemIsUserCheckable
                 )
 
-            node_id = str(uuid.uuid4())
+            # 使用节点的id属性作为node_id
+            node_id = node.get("id")
             self.node_map[node_id] = node
             item.setData(0, Qt.ItemDataRole.UserRole, node_id)
 
@@ -277,6 +295,8 @@ class NovelTreeMixin:
         self.summary_editor.setEnabled(True)
         self.btn_save.setEnabled(True)
         self.btn_regenerate_summary.setEnabled(True)
+        self.btn_select_all.setEnabled(True)
+        self.btn_select_none.setEnabled(True)
 
         # 2. 加载正文 (仅对第3级开放)
         if node_level == 3:
@@ -321,6 +341,7 @@ class NovelTreeMixin:
             title = title.strip()
 
             new_node = {
+                "id": str(uuid.uuid4()),
                 "title": title,
                 "summary": "",
                 "children": [],
@@ -421,7 +442,61 @@ class NovelTreeMixin:
         )
         gen_outline_action.triggered.connect(self.open_outline_building_dialog)
 
+        if item and not item.text(0).startswith("+"):
+            menu.addSeparator()
+            sync_summary_action = menu.addAction("\U0001f504 校验并同步该节点及子节点概要 (生成Diff)")
+            sync_summary_action.triggered.connect(lambda: self.start_summary_sync(real_node, get_item_level(item)))
+
         menu.exec(self.novel_tree.viewport().mapToGlobal(position))
+
+    def start_summary_sync(self: "NovelCreatorWindow", target_node: dict, level: int):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。") # type: ignore[arg-type]
+            return
+            
+        reply = QMessageBox.question(
+            self, # type: ignore[arg-type]
+            "确认执行",
+            f"即将遍历校验节点【{target_node.get('title')}】及其所有子节点。\n\n"
+            "本操作不会直接覆盖您的原始数据，只会生成两份临时 Markdown 文件供您进行 Diff 比较和手动处理。\n"
+            "请确认是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.log_console.append(f"<font color='cyan'>启动概要同步校验引擎，根节点：{target_node.get('title')}...</font>")
+            self.btn_save.setEnabled(False)
+            
+            self.sync_worker = SummarySyncWorker(
+                target_node=target_node,
+                level=level,
+                llm_client=self.llm_client,
+                workspace_manager=self.workspace
+            )
+            self.sync_worker.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='gray'>{msg}</font>"))
+            self.sync_worker.success_signal.connect(self.on_summary_sync_success)
+            self.sync_worker.error_signal.connect(self.on_summary_sync_error)
+            self.sync_worker.start()
+
+    def on_summary_sync_success(self: "NovelCreatorWindow", before_path: str, after_path: str):
+        self.btn_save.setEnabled(True)
+        self.log_console.append("<font color='green'><b>✅ 概要校验与同步完成！</b></font>")
+        self.log_console.append(f"旧版概要文件: <a href='file:///{before_path}'>{before_path}</a>")
+        self.log_console.append(f"新版概要文件: <a href='file:///{after_path}'>{after_path}</a>")
+        
+        QMessageBox.information(
+            self, # type: ignore[arg-type]
+            "处理完成",
+            "大纲概要校验已完成！\n\n"
+            "系统已将修改前后的汇总输出为以下文件：\n"
+            f"1. {os.path.basename(before_path)}\n2. {os.path.basename(after_path)}\n\n"
+            "请前往工作区的 temp_diff 文件夹下使用相关 Diff 工具（如 VS Code）进行查阅，按需复制所需的文本覆盖原节点。"
+        )
+
+    def on_summary_sync_error(self: "NovelCreatorWindow", error_msg: str):
+        self.btn_save.setEnabled(True)
+        self.log_console.append(f"<font color='red'>❌ 概要校验失败: {error_msg}</font>")
+        QMessageBox.critical(self, "错误", f"概要校验过程中发生异常:\n{error_msg}") # type: ignore[arg-type]
 
     def open_outline_building_dialog(self: "NovelCreatorWindow"):
         if not self.llm_client:
@@ -472,6 +547,8 @@ class NovelTreeMixin:
     def on_outline_building_success(self: "NovelCreatorWindow", outline_data):
         def process_nodes(nodes, level):
             for node in nodes:
+                if "id" not in node:
+                    node["id"] = str(uuid.uuid4())
                 node["_status"] = "ok"
                 if level == 3:
                     node["file_path"] = f"场景_{uuid.uuid4().hex[:8]}.md"
@@ -652,26 +729,27 @@ class NovelTreeMixin:
 ### 一、 上下文信息
 {context_text}
 
-### 二、 生成要求
-1. 请为节点【{node_title}】生成 {count} 个 {child_type} 子节点
-2. 子节点应该围绕以下要求展开：{requirement}
-3. 每个子节点需要包含标题和概要内容
-4. 如果当前节点【{node_title}】没有概要，请一并生成其概要内容
-5. 生成的子节点应该与上下文信息逻辑连贯
-6. 只需要生成概要内容，不需要生成正文
+### 二、 生成要求与核心要素规范（绝对红线）
+1. 请为节点【{node_title}】生成 {count} 个 {child_type} 子节点，需围绕此要求展开：{requirement}
+2. 每个子节点需要包含标题和概要内容。如果当前节点【{node_title}】没有概要，请一并生成其概要内容。
+3. **【核心概要提取强制规范】**：你生成的**所有概要**（包括补充的父节点概要和新建的子节点概要），都必须结构严谨，明确写出以下信息：
+   - **时间与事件交互**：明确交代该剧情发生时的【时间】、【具体地点】、【出场人物】，以及明确的【事件交互】（谁和谁具体完成了什么事）。
+   - **状态与变化**：必须体现核心人物的【心境/情绪转变】、【衣着/装备/外貌的改变】，或【队伍成员的增减变化】。
+   - **场景与轨迹**：若发生位置转移，需明确指出【从哪里移动到了哪里】。
+4. 生成的子节点应该与上下文信息逻辑连贯。只需要生成概要内容，不需要生成正文。
 
 ### 三、 输出格式
 请严格按照以下 JSON 格式输出：
 {{
-  "current_node_summary": "当前节点的概要内容（如果需要生成）",
+  "current_node_summary": "当前节点的概要内容（如果需要生成，也必须符合上述核心要素规范）",
   "children": [
     {{
       "title": "子节点1标题",
-      "summary": "子节点1概要"
+      "summary": "子节点1概要（必须符合上述核心要素规范）"
     }},
     {{
       "title": "子节点2标题",
-      "summary": "子节点2概要"
+      "summary": "子节点2概要（必须符合上述核心要素规范）"
     }}
   ]
 }}
@@ -713,11 +791,12 @@ class NovelTreeMixin:
                 for child in data["children"]:
                     if "title" in child:
                         new_child = {
-                            "title": child["title"],
-                            "summary": child.get("summary", ""),
-                            "children": [],
-                            "_status": "ok"
-                        }
+                                "id": str(uuid.uuid4()),
+                                "title": child["title"],
+                                "summary": child.get("summary", ""),
+                                "children": [],
+                                "_status": "ok"
+                            }
                         # 如果是生成场景节点，添加文件路径
                         if len(target_node.get("children", [])) + len(data["children"]) <= 3:
                             if target_node.get("children", []) and len(target_node["children"]) == 2:

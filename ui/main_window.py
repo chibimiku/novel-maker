@@ -15,6 +15,9 @@ from PyQt6.QtCore import Qt
 # 导入暗色主题配色常量
 from ui.theme import TEXT_SECONDARY
 
+# 导入时间线对话框
+from ui.timeline_dialog import TimelineDialog
+
 # 导入核心逻辑层组件
 from core.llm_client import LLMClient
 
@@ -110,6 +113,11 @@ class NovelCreatorWindow(
         settings_action.setShortcut(QKeySequence("Ctrl+P"))
         settings_action.triggered.connect(self.open_settings_dialog)
 
+        # 添加工具菜单
+        tool_menu = menubar.addMenu('工具')
+        timeline_action = tool_menu.addAction('时间线校对')
+        timeline_action.triggered.connect(self.open_timeline_dialog)
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
@@ -130,6 +138,9 @@ class NovelCreatorWindow(
         self.novel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.novel_tree.customContextMenuRequested.connect(self.show_novel_context_menu)
 
+        # 连接勾选状态变化信号
+        self.novel_tree.itemChanged.connect(self.on_novel_item_changed)
+
         self.rename_shortcut = QShortcut(QKeySequence("F2"), self.novel_tree)
         self.rename_shortcut.activated.connect(self.rename_current_node)
 
@@ -137,9 +148,98 @@ class NovelCreatorWindow(
         self.novel_tree.setDragEnabled(True)
         self.novel_tree.setAcceptDrops(True)
         self.novel_tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
+        
+        # 重写 dragMoveEvent 以实现拖拽容错
+        original_drag_move_event = self.novel_tree.dragMoveEvent
+        def custom_drag_move_event(event):
+            # 获取目标项
+            target_item = self.novel_tree.itemAt(event.pos())
+            
+            # 如果目标项是添加按钮，不接受拖拽
+            if target_item and target_item.text(0).startswith("+"):
+                event.ignore()
+                return
+            
+            # 获取拖动的项
+            dragged_items = self.novel_tree.selectedItems()
+            if not dragged_items:
+                event.ignore()
+                return
+            
+            dragged_item = dragged_items[0]
+            
+            # 检查拖动的项是否有子节点
+            has_children = dragged_item.childCount() > 0
+            for i in range(dragged_item.childCount()):
+                if not dragged_item.child(i).text(0).startswith("+"):
+                    has_children = True
+                    break
+            
+            # 检查目标位置的级别
+            target_level = 0
+            if target_item:
+                # 计算目标项的级别
+                temp_item = target_item
+                while temp_item.parent():
+                    target_level += 1
+                    temp_item = temp_item.parent()
+                target_level += 1  # 根节点是第1级
+            
+            # 如果拖动的项有子节点，且目标位置是3级节点，不接受拖拽
+            if has_children and target_level == 3:
+                event.ignore()
+                return
+            
+            # 否则，调用原始的 dragMoveEvent
+            original_drag_move_event(event)
+        
+        self.novel_tree.dragMoveEvent = custom_drag_move_event
+        
+        # 重写 dropEvent 以确保数据同步
         original_drop_event = self.novel_tree.dropEvent
         def custom_drop_event(event):
+            # 获取目标项
+            target_item = self.novel_tree.itemAt(event.pos())
+            
+            # 如果目标项是添加按钮，不接受放置
+            if target_item and target_item.text(0).startswith("+"):
+                event.ignore()
+                return
+            
+            # 获取拖动的项
+            dragged_items = self.novel_tree.selectedItems()
+            if not dragged_items:
+                event.ignore()
+                return
+            
+            dragged_item = dragged_items[0]
+            
+            # 检查拖动的项是否有子节点
+            has_children = dragged_item.childCount() > 0
+            for i in range(dragged_item.childCount()):
+                if not dragged_item.child(i).text(0).startswith("+"):
+                    has_children = True
+                    break
+            
+            # 检查目标位置的级别
+            target_level = 0
+            if target_item:
+                # 计算目标项的级别
+                temp_item = target_item
+                while temp_item.parent():
+                    target_level += 1
+                    temp_item = temp_item.parent()
+                target_level += 1  # 根节点是第1级
+            
+            # 如果拖动的项有子节点，且目标位置是3级节点，不接受放置
+            if has_children and target_level == 3:
+                event.ignore()
+                return
+            
+            # 否则，调用原始的 dropEvent
             original_drop_event(event)
+            
+            # 同步数据并刷新UI
             self.sync_tree_data_from_ui()
             # 保存当前选中的节点
             current_item = self.novel_tree.currentItem()
@@ -163,6 +263,7 @@ class NovelCreatorWindow(
                 if found_item:
                     self.novel_tree.setCurrentItem(found_item)
                     self.on_novel_node_clicked(found_item, 0)
+        
         self.novel_tree.dropEvent = custom_drop_event
 
         self.novel_tree.itemClicked.connect(self.on_novel_node_clicked)
@@ -231,6 +332,8 @@ class NovelCreatorWindow(
 
         # 底部按钮
         btn_layout = QHBoxLayout()
+        self.btn_select_all = QPushButton("全选")
+        self.btn_select_none = QPushButton("全不选")
         self.btn_batch_generate = QPushButton("🚀 批量生成缺失场景")
         self.btn_generate = QPushButton("🔄 结合上下文生成正文")
         self.btn_rewrite = QPushButton("✍️ 基于原文重写(扩/缩)")
@@ -239,6 +342,8 @@ class NovelCreatorWindow(
         self.btn_save = QPushButton("💾 保存当前节点")
         self.btn_delete = QPushButton("🗑️ 删除当前节点")
 
+        self.btn_select_all.clicked.connect(self.select_all_nodes)
+        self.btn_select_none.clicked.connect(self.select_none_nodes)
         self.btn_batch_generate.clicked.connect(self.start_batch_generate)
         self.btn_generate.clicked.connect(self.generate_current_node)
         self.btn_rewrite.clicked.connect(self.rewrite_current_node)
@@ -247,6 +352,8 @@ class NovelCreatorWindow(
         self.btn_save.clicked.connect(self.save_current_node)
         self.btn_delete.clicked.connect(self.delete_current_node)
 
+        self.btn_select_all.setEnabled(False)
+        self.btn_select_none.setEnabled(False)
         self.btn_generate.setEnabled(False)
         self.btn_rewrite.setEnabled(False)
         self.btn_regenerate_summary.setEnabled(False)
@@ -254,6 +361,8 @@ class NovelCreatorWindow(
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
 
+        btn_layout.addWidget(self.btn_select_all)
+        btn_layout.addWidget(self.btn_select_none)
         btn_layout.addWidget(self.btn_batch_generate)
         btn_layout.addWidget(self.btn_generate)
         btn_layout.addWidget(self.btn_rewrite)
@@ -317,6 +426,110 @@ class NovelCreatorWindow(
         # 更新后退按钮状态
         self.btn_undo.setEnabled(True)
 
+    def on_novel_item_changed(self, item, column):
+        """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
+        if column != 0:
+            return
+
+        # 获取当前勾选状态
+        current_state = item.checkState(0)
+
+        # 递归处理子节点
+        def update_children(parent_item, state):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    child.setCheckState(0, state)
+                    update_children(child, state)
+
+        # 处理子节点
+        update_children(item, current_state)
+
+        # 处理父节点
+        def update_parent(parent_item):
+            if not parent_item:
+                return
+
+            checked_count = 0
+            unchecked_count = 0
+            total_count = 0
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    total_count += 1
+                    if child.checkState(0) == Qt.CheckState.Checked:
+                        checked_count += 1
+                    elif child.checkState(0) == Qt.CheckState.Unchecked:
+                        unchecked_count += 1
+
+            if total_count == 0:
+                return
+            elif checked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Checked)
+            elif unchecked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+            # 递归更新上层父节点
+            update_parent(parent_item.parent())
+
+        # 处理父节点
+        update_parent(item.parent())
+
+    def on_novel_item_changed(self, item, column):
+        """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
+        if column != 0:
+            return
+
+        # 获取当前勾选状态
+        current_state = item.checkState(0)
+
+        # 递归处理子节点
+        def update_children(parent_item, state):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    child.setCheckState(0, state)
+                    update_children(child, state)
+
+        # 处理子节点
+        update_children(item, current_state)
+
+        # 处理父节点
+        def update_parent(parent_item):
+            if not parent_item:
+                return
+
+            checked_count = 0
+            unchecked_count = 0
+            total_count = 0
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    total_count += 1
+                    if child.checkState(0) == Qt.CheckState.Checked:
+                        checked_count += 1
+                    elif child.checkState(0) == Qt.CheckState.Unchecked:
+                        unchecked_count += 1
+
+            if total_count == 0:
+                return
+            elif checked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Checked)
+            elif unchecked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+            # 递归更新上层父节点
+            update_parent(parent_item.parent())
+
+        # 处理父节点
+        update_parent(item.parent())
+
     def refresh_ui_from_workspace(self):
         """刷新整个 UI：分别委托给设定树和大纲树的渲染方法。"""
         if not self.workspace:
@@ -331,6 +544,110 @@ class NovelCreatorWindow(
 
         # 渲染小说大纲树（来自 NovelTreeMixin）
         self._refresh_novel_tree()
+        
+        # 启用全选和全不选按钮
+        self.btn_select_all.setEnabled(True)
+        self.btn_select_none.setEnabled(True)
+
+    def on_novel_item_changed(self, item, column):
+        """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
+        if column != 0:
+            return
+
+        # 获取当前勾选状态
+        current_state = item.checkState(0)
+
+        # 递归处理子节点
+        def update_children(parent_item, state):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    child.setCheckState(0, state)
+                    update_children(child, state)
+
+        # 处理子节点
+        update_children(item, current_state)
+
+        # 处理父节点
+        def update_parent(parent_item):
+            if not parent_item:
+                return
+
+            checked_count = 0
+            unchecked_count = 0
+            total_count = 0
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    total_count += 1
+                    if child.checkState(0) == Qt.CheckState.Checked:
+                        checked_count += 1
+                    elif child.checkState(0) == Qt.CheckState.Unchecked:
+                        unchecked_count += 1
+
+            if total_count == 0:
+                return
+            elif checked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Checked)
+            elif unchecked_count == total_count:
+                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+            else:
+                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+            # 递归更新上层父节点
+            update_parent(parent_item.parent())
+
+        # 处理父节点
+        update_parent(item.parent())
+
+    def select_all_nodes(self):
+        """全选所有节点"""
+        def select_all_recursive(item):
+            if not item.text(0).startswith("+"):
+                item.setCheckState(0, Qt.CheckState.Checked)
+            for i in range(item.childCount()):
+                select_all_recursive(item.child(i))
+
+        root = self.novel_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            select_all_recursive(root.child(i))
+
+    def select_none_nodes(self):
+        """全不选所有节点"""
+        def select_none_recursive(item):
+            if not item.text(0).startswith("+"):
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+            for i in range(item.childCount()):
+                select_none_recursive(item.child(i))
+
+        root = self.novel_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            select_none_recursive(root.child(i))
+
+    def open_timeline_dialog(self):
+        """打开时间线校对窗口"""
+        if not self.outline_tree_data:
+            # 如果没有大纲数据，显示提示
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "提示", "请先加载或创建工作区，以便获取小说大纲数据")
+            return
+        
+        # 打开时间线校对窗口
+        dialog = TimelineDialog(self.outline_tree_data, self, self.workspace)
+        dialog.exec()
+
+    def open_timeline_dialog(self):
+        """打开时间线校对窗口"""
+        if not self.outline_tree_data:
+            # 如果没有大纲数据，显示提示
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "提示", "请先加载或创建工作区，以便获取小说大纲数据")
+            return
+        
+        # 打开时间线校对窗口
+        dialog = TimelineDialog(self.outline_tree_data, self, self.workspace)
+        dialog.exec()
 
 
 if __name__ == '__main__':

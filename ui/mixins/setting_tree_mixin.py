@@ -247,13 +247,20 @@ class SettingTreeMixin:
                     f"打开设定文件: {os.path.basename(file_path)}"
                 )
 
+            # --- 修改部分开始 ---
             self.current_editing_node = None
             self.current_setting_path = file_path
 
             self.summary_editor.setEnabled(True)
+            
+            # 禁用正文区，清空遗留的文本，并重置字数显示
             self.content_editor.setEnabled(False)
+            self.content_editor.clear()
+            if hasattr(self, 'word_count_label'):
+                self.word_count_label.setText("当前字数: 0")
+                
             self.btn_generate.setEnabled(False)
-
+            # --- 修改部分结束 ---
         except Exception as e:
             self.log_console.append(f"<font color='red'>读取设定失败: {e}</font>")
 
