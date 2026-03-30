@@ -267,7 +267,6 @@ QCheckBox::indicator:hover {{
 QCheckBox::indicator:checked {{
     background-color: {ACCENT};
     border-color: {ACCENT};
-    image: none;
 }}
 
 QCheckBox::indicator:checked:hover {{

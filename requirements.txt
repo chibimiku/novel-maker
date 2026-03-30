@@ -5,3 +5,4 @@ protobuf==7.34.0
 PyQt6==6.10.2
 pyqt6_sip==13.10.2
 Requests==2.32.5
+diff-match-patch==20230430

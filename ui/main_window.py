@@ -8,9 +8,9 @@ import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
-                             QLabel, QCheckBox, QSpinBox)
+                             QLabel, QCheckBox, QSpinBox, QAbstractItemView)
 from PyQt6.QtGui import QKeySequence, QAction, QShortcut
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 # 导入暗色主题配色常量
 from ui.theme import TEXT_SECONDARY
@@ -31,6 +31,123 @@ from ui.mixins import (
     EditorMixin,
 )
 
+class NovelTreeWidget(QTreeWidget):
+    """自定义的小说大纲树控件，负责拦截并处理拖拽逻辑"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_window: 'NovelCreatorWindow | None' = None
+
+    def get_item_level(self, item):
+        """辅助方法：获取节点层级，顶级为1"""
+        level = 1
+        parent = item.parent()
+        while parent:
+            level += 1
+            parent = parent.parent()
+        return level
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        if not event.isAccepted():
+            return
+
+        target_item = self.itemAt(event.position().toPoint())
+        dragged_items = self.selectedItems()
+        if not dragged_items:
+            event.ignore()
+            return
+
+        dragged_item = dragged_items[0]
+        drop_pos = self.dropIndicatorPosition()
+
+        # 检查是否包含真正的业务子节点（排除 "+" 按钮）
+        has_real_children = False
+        for i in range(dragged_item.childCount()):
+            if not dragged_item.child(i).text(0).startswith("+"):
+                has_real_children = True
+                break
+
+        if target_item:
+            if target_item.text(0).startswith("+"):
+                # 严禁任何放到 + 按钮内部(OnItem) 或 放到 + 按钮下方(BelowItem) 的操作
+                if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem or \
+                   drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                    event.ignore()
+                    return
+
+            target_level = self.get_item_level(target_item)
+            new_level = target_level + 1 if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem else target_level
+
+            if has_real_children and new_level >= 3:
+                event.ignore()
+                return
+            if new_level > 3:
+                event.ignore()
+                return
+
+    def dropEvent(self, event):
+        target_item = self.itemAt(event.position().toPoint())
+        dragged_items = self.selectedItems()
+        if not dragged_items:
+            event.ignore()
+            return
+
+        dragged_item = dragged_items[0]
+        drop_pos = self.dropIndicatorPosition()
+
+        has_real_children = False
+        for i in range(dragged_item.childCount()):
+            if not dragged_item.child(i).text(0).startswith("+"):
+                has_real_children = True
+                break
+
+        if target_item:
+            if target_item.text(0).startswith("+"):
+                if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem or \
+                   drop_pos == QAbstractItemView.DropIndicatorPosition.BelowItem:
+                    event.ignore()
+                    return
+
+            target_level = self.get_item_level(target_item)
+            new_level = target_level + 1 if drop_pos == QAbstractItemView.DropIndicatorPosition.OnItem else target_level
+
+            if has_real_children and new_level >= 3:
+                event.ignore()
+                return
+            if new_level > 3:
+                event.ignore()
+                return
+
+        # 1. 先让 Qt 完成它的原生物理位置移动
+        super().dropEvent(event)
+
+        # 2. 【核心修复】：立刻执行自愈机制，修正 Qt 违规塞入的节点
+        self._rescue_add_button_children()
+
+        # 3. 延后同步逻辑，保障底层 C++ 移动动作已彻底完结
+        if self.main_window:
+            QTimer.singleShot(0, self.main_window._handle_drop_sync)
+
+    def _rescue_add_button_children(self, parent_item=None):
+        """
+        自愈机制：倒序遍历节点。如果发现 '+' 按钮被 Qt 强行塞了子节点，
+        就把它提取出来，放到 '+' 按钮的前面（成为正常的同级节点）。
+        """
+        target = parent_item if parent_item else self.invisibleRootItem()
+        # 必须倒序遍历，因为我们要执行插入操作，正序会打乱索引
+        for i in range(target.childCount() - 1, -1, -1):
+            child = target.child(i)
+            if child.text(0).startswith("+"):
+                # 如果发现加号按钮有子节点（非法状态）
+                while child.childCount() > 0:
+                    # 将其提取出来
+                    rescued_node = child.takeChild(0)
+                    # 插入到 target 中，位置在当前加号按钮的正前方
+                    target.insertChild(i, rescued_node)
+                    # 递归检查刚被提取出来的节点
+                    self._rescue_add_button_children(rescued_node)
+            else:
+                self._rescue_add_button_children(child)
 
 class NovelCreatorWindow(
     EditorMixin,
@@ -132,13 +249,13 @@ class NovelCreatorWindow(
         self.setting_tree.customContextMenuRequested.connect(self.show_setting_context_menu)
         splitter.addWidget(self.setting_tree)
 
-        self.novel_tree = QTreeWidget()
+        # 使用我们自定义的 NovelTreeWidget
+        self.novel_tree = NovelTreeWidget()
+        self.novel_tree.main_window = self  # 绑定主窗口引用
         self.novel_tree.setHeaderLabel("小说大纲结构")
 
         self.novel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.novel_tree.customContextMenuRequested.connect(self.show_novel_context_menu)
-
-        # 连接勾选状态变化信号
         self.novel_tree.itemChanged.connect(self.on_novel_item_changed)
 
         self.rename_shortcut = QShortcut(QKeySequence("F2"), self.novel_tree)
@@ -149,123 +266,6 @@ class NovelCreatorWindow(
         self.novel_tree.setAcceptDrops(True)
         self.novel_tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
         
-        # 重写 dragMoveEvent 以实现拖拽容错
-        original_drag_move_event = self.novel_tree.dragMoveEvent
-        def custom_drag_move_event(event):
-            # 获取目标项
-            target_item = self.novel_tree.itemAt(event.pos())
-            
-            # 如果目标项是添加按钮，不接受拖拽
-            if target_item and target_item.text(0).startswith("+"):
-                event.ignore()
-                return
-            
-            # 获取拖动的项
-            dragged_items = self.novel_tree.selectedItems()
-            if not dragged_items:
-                event.ignore()
-                return
-            
-            dragged_item = dragged_items[0]
-            
-            # 检查拖动的项是否有子节点
-            has_children = dragged_item.childCount() > 0
-            for i in range(dragged_item.childCount()):
-                if not dragged_item.child(i).text(0).startswith("+"):
-                    has_children = True
-                    break
-            
-            # 检查目标位置的级别
-            target_level = 0
-            if target_item:
-                # 计算目标项的级别
-                temp_item = target_item
-                while temp_item.parent():
-                    target_level += 1
-                    temp_item = temp_item.parent()
-                target_level += 1  # 根节点是第1级
-            
-            # 如果拖动的项有子节点，且目标位置是3级节点，不接受拖拽
-            if has_children and target_level == 3:
-                event.ignore()
-                return
-            
-            # 否则，调用原始的 dragMoveEvent
-            original_drag_move_event(event)
-        
-        self.novel_tree.dragMoveEvent = custom_drag_move_event
-        
-        # 重写 dropEvent 以确保数据同步
-        original_drop_event = self.novel_tree.dropEvent
-        def custom_drop_event(event):
-            # 获取目标项
-            target_item = self.novel_tree.itemAt(event.pos())
-            
-            # 如果目标项是添加按钮，不接受放置
-            if target_item and target_item.text(0).startswith("+"):
-                event.ignore()
-                return
-            
-            # 获取拖动的项
-            dragged_items = self.novel_tree.selectedItems()
-            if not dragged_items:
-                event.ignore()
-                return
-            
-            dragged_item = dragged_items[0]
-            
-            # 检查拖动的项是否有子节点
-            has_children = dragged_item.childCount() > 0
-            for i in range(dragged_item.childCount()):
-                if not dragged_item.child(i).text(0).startswith("+"):
-                    has_children = True
-                    break
-            
-            # 检查目标位置的级别
-            target_level = 0
-            if target_item:
-                # 计算目标项的级别
-                temp_item = target_item
-                while temp_item.parent():
-                    target_level += 1
-                    temp_item = temp_item.parent()
-                target_level += 1  # 根节点是第1级
-            
-            # 如果拖动的项有子节点，且目标位置是3级节点，不接受放置
-            if has_children and target_level == 3:
-                event.ignore()
-                return
-            
-            # 否则，调用原始的 dropEvent
-            original_drop_event(event)
-            
-            # 同步数据并刷新UI
-            self.sync_tree_data_from_ui()
-            # 保存当前选中的节点
-            current_item = self.novel_tree.currentItem()
-            current_node_id = None
-            if current_item:
-                current_node_id = current_item.data(0, Qt.ItemDataRole.UserRole)
-            # 重新构建树结构以确保子节点正确显示
-            self._refresh_novel_tree()
-            # 尝试恢复选中的节点
-            if current_node_id:
-                def find_item_by_node_id(item, node_id):
-                    for i in range(item.childCount()):
-                        child = item.child(i)
-                        if child.data(0, Qt.ItemDataRole.UserRole) == node_id:
-                            return child
-                        found = find_item_by_node_id(child, node_id)
-                        if found:
-                            return found
-                    return None
-                found_item = find_item_by_node_id(self.novel_tree.invisibleRootItem(), current_node_id)
-                if found_item:
-                    self.novel_tree.setCurrentItem(found_item)
-                    self.on_novel_node_clicked(found_item, 0)
-        
-        self.novel_tree.dropEvent = custom_drop_event
-
         self.novel_tree.itemClicked.connect(self.on_novel_node_clicked)
         splitter.addWidget(self.novel_tree)
 
@@ -383,6 +383,14 @@ class NovelCreatorWindow(
 
     # ================= UI 刷新总调度 ================= #
 
+    def _handle_drop_sync(self):
+        """处理拖放动作完成后的数据同步与 UI 安全刷新"""
+        # 1. 整理 UI：将可能被挤到上面的 "+" 按钮重新沉降到底部
+        self._cleanup_tree_add_buttons()
+        
+        # 2. 反向同步：从已经排序好的完美 UI 树中提取数据，覆盖保存到 JSON 中
+        self.sync_tree_data_from_ui()
+
     def undo_last_change(self):
         """回退到最近一次变更前的状态"""
         if not self.undo_stack:
@@ -425,110 +433,6 @@ class NovelCreatorWindow(
 
         # 更新后退按钮状态
         self.btn_undo.setEnabled(True)
-
-    def on_novel_item_changed(self, item, column):
-        """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
-        if column != 0:
-            return
-
-        # 获取当前勾选状态
-        current_state = item.checkState(0)
-
-        # 递归处理子节点
-        def update_children(parent_item, state):
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    child.setCheckState(0, state)
-                    update_children(child, state)
-
-        # 处理子节点
-        update_children(item, current_state)
-
-        # 处理父节点
-        def update_parent(parent_item):
-            if not parent_item:
-                return
-
-            checked_count = 0
-            unchecked_count = 0
-            total_count = 0
-
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    total_count += 1
-                    if child.checkState(0) == Qt.CheckState.Checked:
-                        checked_count += 1
-                    elif child.checkState(0) == Qt.CheckState.Unchecked:
-                        unchecked_count += 1
-
-            if total_count == 0:
-                return
-            elif checked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Checked)
-            elif unchecked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
-
-            # 递归更新上层父节点
-            update_parent(parent_item.parent())
-
-        # 处理父节点
-        update_parent(item.parent())
-
-    def on_novel_item_changed(self, item, column):
-        """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
-        if column != 0:
-            return
-
-        # 获取当前勾选状态
-        current_state = item.checkState(0)
-
-        # 递归处理子节点
-        def update_children(parent_item, state):
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    child.setCheckState(0, state)
-                    update_children(child, state)
-
-        # 处理子节点
-        update_children(item, current_state)
-
-        # 处理父节点
-        def update_parent(parent_item):
-            if not parent_item:
-                return
-
-            checked_count = 0
-            unchecked_count = 0
-            total_count = 0
-
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    total_count += 1
-                    if child.checkState(0) == Qt.CheckState.Checked:
-                        checked_count += 1
-                    elif child.checkState(0) == Qt.CheckState.Unchecked:
-                        unchecked_count += 1
-
-            if total_count == 0:
-                return
-            elif checked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Checked)
-            elif unchecked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
-
-            # 递归更新上层父节点
-            update_parent(parent_item.parent())
-
-        # 处理父节点
-        update_parent(item.parent())
 
     def refresh_ui_from_workspace(self):
         """刷新整个 UI：分别委托给设定树和大纲树的渲染方法。"""
@@ -624,18 +528,6 @@ class NovelCreatorWindow(
         root = self.novel_tree.invisibleRootItem()
         for i in range(root.childCount()):
             select_none_recursive(root.child(i))
-
-    def open_timeline_dialog(self):
-        """打开时间线校对窗口"""
-        if not self.outline_tree_data:
-            # 如果没有大纲数据，显示提示
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.information(self, "提示", "请先加载或创建工作区，以便获取小说大纲数据")
-            return
-        
-        # 打开时间线校对窗口
-        dialog = TimelineDialog(self.outline_tree_data, self, self.workspace)
-        dialog.exec()
 
     def open_timeline_dialog(self):
         """打开时间线校对窗口"""

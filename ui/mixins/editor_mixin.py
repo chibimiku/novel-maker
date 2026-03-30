@@ -46,10 +46,15 @@ class EditorMixin:
                     new_md5 = self.workspace.save_markdown_file(rel_path, content)
                     self.current_editing_node["md5"] = new_md5
                     self.current_editing_node["_status"] = "ok"
+                    # 安全地检查current_editing_item是否仍然有效
                     if self.current_editing_item:
-                        self.current_editing_item.setForeground(
-                            0, QColor(NODE_NORMAL)
-                        )
+                        try:
+                            self.current_editing_item.setForeground(
+                                0, QColor(NODE_NORMAL)
+                            )
+                        except RuntimeError:
+                            # 如果item已被删除，忽略这个错误
+                            pass
                 except Exception as e:
                     QMessageBox.critical(
                         self,  # type: ignore[arg-type]

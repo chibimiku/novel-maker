@@ -39,6 +39,7 @@ class NovelTreeMixin:
         """渲染右侧的小说大纲目录树。"""
         self.novel_tree.clear()
         self.node_map.clear()
+        self.current_editing_item = None  # 清除已删除的item引用
         self.novel_tree.setHeaderLabel("小说大纲结构")
         self.outline_tree_data = self.workspace.load_outline_tree()
 
@@ -114,8 +115,16 @@ class NovelTreeMixin:
             status = node.get("_status", "ok")
             file_path = node.get("file_path")
 
+            # 检查是否有待合并的修改
+            has_pending = False
+            if self.workspace and node_id:
+                has_pending = self.workspace.has_pending_modify(node_id)
+
             if level == 3:
-                if (
+                if has_pending:
+                    # 有待合并修改，显示红色
+                    item.setForeground(0, QColor("#FF4444"))
+                elif (
                     file_path
                     and getattr(self, "_duplicate_paths", None)
                     and file_path in self._duplicate_paths
@@ -129,7 +138,10 @@ class NovelTreeMixin:
                 else:
                     item.setForeground(0, QColor(NODE_NORMAL))
             else:
-                item.setForeground(0, QColor(NODE_NORMAL))
+                if has_pending:
+                    item.setForeground(0, QColor("#FF4444"))
+                else:
+                    item.setForeground(0, QColor(NODE_NORMAL))
 
             if "children" not in node:
                 node["children"] = []
@@ -424,11 +436,18 @@ class NovelTreeMixin:
         
         # 获取当前点击的节点
         item = self.novel_tree.itemAt(position)
+        real_node = None
+        level = 0
+        node_id = None
+        has_pending = False
+        
         if item and not item.text(0).startswith("+"):
             node_id = item.data(0, Qt.ItemDataRole.UserRole)
             real_node = self.node_map.get(node_id)
             if real_node:
                 level = get_item_level(item)
+                has_pending = self.workspace.has_pending_modify(node_id) if node_id else False
+                
                 # 只对1级和2级节点添加增加子节点的选项
                 if level in [1, 2]:
                     add_children_action = menu.addAction(
@@ -436,16 +455,35 @@ class NovelTreeMixin:
                     )
                     add_children_action.triggered.connect(lambda: self.open_add_children_dialog(real_node, level))
                     menu.addSeparator()
+                
+                # 只对3级节点添加修改内容的选项
+                if level == 3:
+                    if has_pending:
+                        # 有待合并修改时，"修改内容"变灰，"进行合并"可用
+                        modify_action = menu.addAction("✏️ 修改内容")
+                        modify_action.setEnabled(False)
+                        
+                        merge_action = menu.addAction("🔄 进行合并")
+                        merge_action.triggered.connect(lambda: self.open_merge_dialog(node_id, real_node))
+                        
+                        discard_action = menu.addAction("❌ 丢弃修改")
+                        discard_action.triggered.connect(lambda: self.discard_pending_modify(node_id))
+                    else:
+                        # 无待合并修改时，"修改内容"可用
+                        modify_action = menu.addAction("✏️ 修改内容")
+                        modify_action.triggered.connect(lambda: self.open_modify_request_dialog(real_node, node_id))
+                    
+                    menu.addSeparator()
 
         gen_outline_action = menu.addAction(
             "\U0001f4a1 结合当前点子与左侧勾选设定，自动生成大纲"
         )
         gen_outline_action.triggered.connect(self.open_outline_building_dialog)
 
-        if item and not item.text(0).startswith("+"):
+        if item and not item.text(0).startswith("+") and real_node:
             menu.addSeparator()
             sync_summary_action = menu.addAction("\U0001f504 校验并同步该节点及子节点概要 (生成Diff)")
-            sync_summary_action.triggered.connect(lambda: self.start_summary_sync(real_node, get_item_level(item)))
+            sync_summary_action.triggered.connect(lambda: self.start_summary_sync(real_node, level))
 
         menu.exec(self.novel_tree.viewport().mapToGlobal(position))
 
@@ -901,3 +939,197 @@ class NovelTreeMixin:
             self, "生成失败", f"大纲生成流程中断:\n{err_msg}"  # type: ignore[arg-type]
         )
         self.btn_save.setEnabled(True)
+
+    # ================= 修改内容暂存与合并功能 ================= #
+
+    def open_modify_request_dialog(self: "NovelCreatorWindow", real_node: dict, node_id: str):
+        """打开修改请求对话框"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
+
+        class ModifyRequestDialog(QDialog):
+            def __init__(self, parent, node_title):
+                super().__init__(parent)
+                self.setWindowTitle(f"修改内容 - {node_title}")
+                self.setMinimumWidth(600)
+                self.setMinimumHeight(400)
+                self.result_text = ""
+
+                layout = QVBoxLayout()
+                layout.addWidget(QLabel("请输入修改要求："))
+
+                self.requirement_edit = QTextEdit()
+                self.requirement_edit.setPlaceholderText("例如：将这段内容的语气改得更加轻松幽默，或者增加一些环境描写...")
+                layout.addWidget(self.requirement_edit)
+
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+
+                self.cancel_btn = QPushButton("取消")
+                self.cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(self.cancel_btn)
+
+                self.ok_btn = QPushButton("生成修改")
+                self.ok_btn.clicked.connect(self.accept)
+                self.ok_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+                btn_layout.addWidget(self.ok_btn)
+
+                layout.addLayout(btn_layout)
+                self.setLayout(layout)
+
+            def get_requirement(self):
+                return self.requirement_edit.toPlainText().strip()
+
+        dialog = ModifyRequestDialog(self, real_node.get("title", "未知节点"))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            requirement = dialog.get_requirement()
+            if requirement:
+                self.start_modify_content(real_node, node_id, requirement)
+
+    def start_modify_content(self: "NovelCreatorWindow", real_node: dict, node_id: str, requirement: str):
+        """开始修改内容的LLM请求"""
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+
+        # 读取原文
+        original_text = ""
+        rel_path = real_node.get("file_path")
+        if rel_path:
+            full_path = os.path.join(self.workspace.text_path, rel_path)
+            if os.path.exists(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    original_text = f.read()
+
+        if not original_text:
+            QMessageBox.warning(self, "提示", "该节点暂无正文内容可修改。")
+            return
+
+        self.log_console.append(f"<font color='cyan'>开始修改节点【{real_node.get('title')}】的内容...</font>")
+        self.btn_save.setEnabled(False)
+
+        # 构建提示词
+        prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
+
+### 修改要求：
+{requirement}
+
+### 原文内容：
+{original_text}
+
+### 输出要求：
+1. 只输出修改后的完整文本
+2. 保持原文的基本结构和格式
+3. 不要添加任何额外的解释性文字
+4. 如果原文有标题（# 开头），请保留
+"""
+
+        # 发送请求
+        from ui.workers import GenerateTaskThread
+        self.modify_thread = GenerateTaskThread(self.llm_client, prompt)
+        self.modify_thread.success_signal.connect(lambda result: self.on_modify_success(result, real_node, node_id, original_text, requirement))
+        self.modify_thread.error_signal.connect(self.on_modify_error)
+        self.modify_thread.start()
+
+    def on_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str, requirement: str):
+        """修改成功回调"""
+        try:
+            # 保存待合并修改
+            self.workspace.save_pending_modify(node_id, original_text, result, requirement)
+            
+            self.log_console.append(f"<font color='green'>✅ 修改内容生成完成！节点标题已变红，请右键选择【进行合并】来查看差异并合并。</font>")
+            
+            # 刷新树UI，显示红色标题
+            self._refresh_novel_tree()
+            
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>保存待合并修改失败: {e}</font>")
+            QMessageBox.critical(self, "错误", f"保存待合并修改失败:\n{e}")
+        finally:
+            self.btn_save.setEnabled(True)
+
+    def on_modify_error(self: "NovelCreatorWindow", error_msg: str):
+        """修改失败回调"""
+        self.log_console.append(f"<font color='red'>修改内容失败: {error_msg}</font>")
+        QMessageBox.critical(self, "错误", f"修改内容过程中发生异常:\n{error_msg}")
+        self.btn_save.setEnabled(True)
+
+    def open_merge_dialog(self: "NovelCreatorWindow", node_id: str, real_node: dict):
+        """打开合并对话框"""
+        from ui.diff_merge_dialog import DiffMergeDialog
+
+        pending_data = self.workspace.get_pending_modify(node_id)
+        if not pending_data:
+            QMessageBox.warning(self, "提示", "没有找到待合并的修改。")
+            return
+
+        dialog = DiffMergeDialog(
+            self,
+            node_id,
+            pending_data["original_text"],
+            pending_data["modified_text"],
+            real_node.get("title", "未知节点")
+        )
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            result_text = dialog.get_result()
+            self.apply_merge_result(node_id, real_node, result_text)
+
+    def apply_merge_result(self: "NovelCreatorWindow", node_id: str, real_node: dict, result_text: str):
+        """应用合并结果"""
+        try:
+            # 保存到文件
+            rel_path = real_node.get("file_path")
+            if rel_path:
+                full_path = os.path.join(self.workspace.text_path, rel_path)
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(result_text)
+                
+                # 更新md5
+                new_md5 = self.workspace.calculate_md5(full_path)
+                real_node["md5"] = new_md5
+
+            # 删除待合并修改
+            self.workspace.delete_pending_modify(node_id)
+
+            # 保存大纲树
+            self.workspace.save_outline_tree(self.outline_tree_data)
+
+            # 刷新UI
+            self._refresh_novel_tree()
+            
+            # 重新查找并设置当前编辑的节点（刷新树后旧item已无效）
+            if self.current_editing_node and self.current_editing_node.get("id") == node_id:
+                # 从新构建的树中重新找到对应的item
+                if node_id in self.node_map:
+                    self.current_editing_item = self.node_map[node_id]
+                # 刷新编辑器内容
+                if rel_path:
+                    full_path = os.path.join(self.workspace.text_path, rel_path)
+                    if os.path.exists(full_path):
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            self.content_editor.setText(content)
+                            # 更新原始内容比较基准
+                            self.current_node_original_content = content
+                            self.current_node_original_summary = self.summary_editor.toPlainText()
+            
+            self.log_console.append(f"<font color='green'>✅ 合并成功！节点内容已更新。</font>")
+
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>合并失败: {e}</font>")
+            QMessageBox.critical(self, "错误", f"合并失败:\n{e}")
+
+    def discard_pending_modify(self: "NovelCreatorWindow", node_id: str):
+        """丢弃待合并修改"""
+        reply = QMessageBox.question(
+            self,
+            "确认丢弃",
+            "确定要丢弃这次修改吗？LLM生成的结果将被永久删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self.workspace.delete_pending_modify(node_id)
+            self._refresh_novel_tree()
+            self.log_console.append(f"<font color='yellow'>已丢弃待合并的修改。</font>")

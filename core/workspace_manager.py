@@ -15,9 +15,13 @@ class WorkspaceManager:
         self.settings_path = os.path.join(workspace_path, "设定")
         self.text_path = os.path.join(workspace_path, "正文")
         self.sys_data_path = os.path.join(workspace_path, "系统数据")
+        self.pending_modifies_dir = os.path.join(self.sys_data_path, "pending_modifies")
         
         self.tree_json_file = os.path.join(self.sys_data_path, "outline_tree.json")
         self.setting_dirs = ["公共设定", "人物设定", "名词设定", "地点设定", "其他设定"]
+        
+        self._pending_modify_cache = {}
+        self._load_all_pending_modifies()
 
     def init_workspace(self):
         """
@@ -157,3 +161,52 @@ class WorkspaceManager:
             # 递归处理子节点时，层级+1
             if "children" in node:
                 self._verify_tree_md5(node["children"], level + 1)
+
+    def _load_all_pending_modifies(self):
+        """加载所有待合并的修改到缓存中"""
+        if not os.path.exists(self.pending_modifies_dir):
+            return
+        for filename in os.listdir(self.pending_modifies_dir):
+            if filename.endswith(".json"):
+                node_id = filename[:-5]
+                try:
+                    with open(os.path.join(self.pending_modifies_dir, filename), "r", encoding="utf-8") as f:
+                        self._pending_modify_cache[node_id] = json.load(f)
+                except Exception as e:
+                    logger.error(f"加载待合并修改失败 {filename}: {e}")
+
+    def has_pending_modify(self, node_id: str) -> bool:
+        """检查节点是否有待合并的修改"""
+        return node_id in self._pending_modify_cache
+
+    def get_pending_modify(self, node_id: str) -> dict | None:
+        """获取节点的待合并修改"""
+        return self._pending_modify_cache.get(node_id)
+
+    def save_pending_modify(self, node_id: str, original_text: str, modified_text: str, request_prompt: str) -> None:
+        """保存待合并的修改"""
+        data = {
+            "node_id": node_id,
+            "original_text": original_text,
+            "modified_text": modified_text,
+            "request_prompt": request_prompt,
+        }
+        self._pending_modify_cache[node_id] = data
+        
+        os.makedirs(self.pending_modifies_dir, exist_ok=True)
+        file_path = os.path.join(self.pending_modifies_dir, f"{node_id}.json")
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+    def delete_pending_modify(self, node_id: str) -> None:
+        """删除节点的待合并修改"""
+        if node_id in self._pending_modify_cache:
+            del self._pending_modify_cache[node_id]
+        
+        file_path = os.path.join(self.pending_modifies_dir, f"{node_id}.json")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    def get_all_pending_node_ids(self) -> list:
+        """获取所有有待合并修改的节点ID列表"""
+        return list(self._pending_modify_cache.keys())
