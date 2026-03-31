@@ -36,6 +36,7 @@ class NovelTreeWidget(QTreeWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.main_window: 'NovelCreatorWindow | None' = None
+        self._dragged_item = None
 
     def get_item_level(self, item):
         """辅助方法：获取节点层级，顶级为1"""
@@ -85,6 +86,17 @@ class NovelTreeWidget(QTreeWidget):
                 event.ignore()
                 return
 
+    def startDrag(self, supportedActions):
+        """记录即将被拖拽的节点，并保存完整的树数据快照"""
+        dragged_items = self.selectedItems()
+        if dragged_items:
+            self._dragged_item = dragged_items[0]
+            # 保存完整的树数据快照
+            if self.main_window and self.main_window.outline_tree_data:
+                import copy
+                self.main_window._pre_drag_tree_snapshot = copy.deepcopy(self.main_window.outline_tree_data)
+        super().startDrag(supportedActions)
+
     def dropEvent(self, event):
         target_item = self.itemAt(event.position().toPoint())
         dragged_items = self.selectedItems()
@@ -92,7 +104,7 @@ class NovelTreeWidget(QTreeWidget):
             event.ignore()
             return
 
-        dragged_item = dragged_items[0]
+        dragged_item = self._dragged_item if self._dragged_item else dragged_items[0]
         drop_pos = self.dropIndicatorPosition()
 
         has_real_children = False
@@ -181,6 +193,9 @@ class NovelCreatorWindow(
         self.max_undo_stack = 20          # 最大回退次数
         self.current_node_original_summary = ""  # 当前节点的原始概要
         self.current_node_original_content = ""  # 当前节点的原始内容
+        
+        # 拖拽前的树数据快照
+        self._pre_drag_tree_snapshot = None
 
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config) if self.config else None
@@ -457,53 +472,62 @@ class NovelCreatorWindow(
         """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
         if column != 0:
             return
+        
+        # 使用标志位防止递归触发
+        if hasattr(self, '_updating_check_state') and self._updating_check_state:
+            return
+        
+        self._updating_check_state = True
+        
+        try:
+            # 获取当前勾选状态
+            current_state = item.checkState(0)
 
-        # 获取当前勾选状态
-        current_state = item.checkState(0)
+            # 递归处理子节点
+            def update_children(parent_item, state):
+                for i in range(parent_item.childCount()):
+                    child = parent_item.child(i)
+                    if not child.text(0).startswith("+"):
+                        child.setCheckState(0, state)
+                        update_children(child, state)
 
-        # 递归处理子节点
-        def update_children(parent_item, state):
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    child.setCheckState(0, state)
-                    update_children(child, state)
+            # 处理子节点
+            update_children(item, current_state)
 
-        # 处理子节点
-        update_children(item, current_state)
+            # 处理父节点
+            def update_parent(parent_item):
+                if not parent_item:
+                    return
 
-        # 处理父节点
-        def update_parent(parent_item):
-            if not parent_item:
-                return
+                checked_count = 0
+                unchecked_count = 0
+                total_count = 0
 
-            checked_count = 0
-            unchecked_count = 0
-            total_count = 0
+                for i in range(parent_item.childCount()):
+                    child = parent_item.child(i)
+                    if not child.text(0).startswith("+"):
+                        total_count += 1
+                        if child.checkState(0) == Qt.CheckState.Checked:
+                            checked_count += 1
+                        elif child.checkState(0) == Qt.CheckState.Unchecked:
+                            unchecked_count += 1
 
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.text(0).startswith("+"):
-                    total_count += 1
-                    if child.checkState(0) == Qt.CheckState.Checked:
-                        checked_count += 1
-                    elif child.checkState(0) == Qt.CheckState.Unchecked:
-                        unchecked_count += 1
+                if total_count == 0:
+                    return
+                elif checked_count == total_count:
+                    parent_item.setCheckState(0, Qt.CheckState.Checked)
+                elif unchecked_count == total_count:
+                    parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+                else:
+                    parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
 
-            if total_count == 0:
-                return
-            elif checked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Checked)
-            elif unchecked_count == total_count:
-                parent_item.setCheckState(0, Qt.CheckState.Unchecked)
-            else:
-                parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+                # 递归更新上层父节点
+                update_parent(parent_item.parent())
 
-            # 递归更新上层父节点
-            update_parent(parent_item.parent())
-
-        # 处理父节点
-        update_parent(item.parent())
+            # 处理父节点
+            update_parent(item.parent())
+        finally:
+            self._updating_check_state = False
 
     def select_all_nodes(self):
         """全选所有节点"""

@@ -33,7 +33,7 @@ class OutlineBuildingThread(QThread):
             prompt = self.prompt_tpl.format(idea=self.idea, settings_text=self.settings_text)
             res_raw = self.llm_client.generate_text(prompt, override_system_instruction=json_sys_prompt)
             
-            if res_raw.strip().startswith("> **生成失败:**"):
+            if res_raw and res_raw.strip().startswith("> **生成失败:**"):
                 self.error_signal.emit(res_raw)
                 return
                 
@@ -88,7 +88,7 @@ class WorldBuildingThread(QThread):
             prompt_1 = self.prompt_1_tpl.format(idea=self.idea, existing_context=existing_context)
             list_res_raw = self.llm_client.generate_text(prompt_1, override_system_instruction=json_sys_prompt)
 
-            if list_res_raw.strip().startswith("> **生成失败:**"):
+            if list_res_raw and list_res_raw.strip().startswith("> **生成失败:**"):
                 self.error_signal.emit(list_res_raw)
                 return
                 
@@ -216,16 +216,17 @@ class GenerateTaskThread(QThread):
     success_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, llm_client, prompt_content, parent=None):
+    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None):
         super().__init__(parent)
         self.llm_client = llm_client
         self.prompt_content = prompt_content
+        self.override_system_instruction = override_system_instruction
 
     def run(self):
         try:
-            result = self.llm_client.generate_text(self.prompt_content)
+            result = self.llm_client.generate_text(self.prompt_content, override_system_instruction=self.override_system_instruction)
             # 【防雪崩修复】：拦截 llm_client 返回的文本格式错误信息
-            if result.strip().startswith("> **生成失败:**"):
+            if result and result.strip().startswith("> **生成失败:**"):
                 error_msg = result.replace("> **生成失败:**", "").strip()
                 self.error_signal.emit(error_msg)
             else:

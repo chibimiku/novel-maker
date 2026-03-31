@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 
 from ui.theme import NODE_ADD_BTN, NODE_ERROR, NODE_MISSING, NODE_NORMAL
 from ui.dialogs import IdeaInputDialog, RenameNodeDialog
-from ui.utils import find_duplicate_paths, get_item_level
+from ui.utils import find_duplicate_paths, get_item_level, find_item_by_data
 from ui.workers import OutlineBuildingThread, GenerateTaskThread
 from core.context_builder import ContextBuilder
 
@@ -36,7 +36,26 @@ class NovelTreeMixin:
     # ================= 小说树渲染 ================= #
 
     def _refresh_novel_tree(self: "NovelCreatorWindow"):
-        """渲染右侧的小说大纲目录树。"""
+        """渲染右侧的小说大纲目录树（带折叠状态记忆）。"""
+        
+        # 1. 在清空前，记录当前展开的节点 ID
+        is_first_load = self.novel_tree.topLevelItemCount() == 0
+        expanded_ids = set()
+        
+        if not is_first_load:
+            def collect_expanded(parent_item):
+                for i in range(parent_item.childCount()):
+                    child = parent_item.child(i)
+                    if child.isExpanded():
+                        n_id = child.data(0, Qt.ItemDataRole.UserRole)
+                        if n_id:
+                            expanded_ids.add(n_id)
+                    # 递归检查子节点
+                    collect_expanded(child)
+            
+            collect_expanded(self.novel_tree.invisibleRootItem())
+
+        # 2. 原有的清理和加载逻辑
         self.novel_tree.clear()
         self.node_map.clear()
         self.current_editing_item = None  # 清除已删除的item引用
@@ -47,6 +66,7 @@ class NovelTreeMixin:
             self.outline_tree_data["nodes"] = []
         nodes_ref = self.outline_tree_data["nodes"]
 
+        # 冲突警告逻辑保持不变
         self._duplicate_paths = find_duplicate_paths(nodes_ref)
         if self._duplicate_paths:
             dup_list = ", ".join(self._duplicate_paths)
@@ -66,8 +86,25 @@ class NovelTreeMixin:
                 "（树状图中已标红）。\n请留意控制台警告，并手动编辑处理冲突！",
             )
 
+        # 构建 UI 树
         self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
-        self.novel_tree.expandAll()
+        
+        # 3. 恢复折叠状态
+        if is_first_load:
+            # 如果是初次加载，默认全部展开
+            self.novel_tree.expandAll()
+        else:
+            # 否则，仅恢复之前展开的节点
+            def restore_expanded(parent_item):
+                for i in range(parent_item.childCount()):
+                    child = parent_item.child(i)
+                    n_id = child.data(0, Qt.ItemDataRole.UserRole)
+                    if n_id and n_id in expanded_ids:
+                        child.setExpanded(True)
+                    # 递归恢复子节点
+                    restore_expanded(child)
+                    
+            restore_expanded(self.novel_tree.invisibleRootItem())
 
     def _build_novel_tree_ui(
         self: "NovelCreatorWindow", nodes: list, parent_widget, level: int = 1
@@ -188,21 +225,58 @@ class NovelTreeMixin:
 
         new_nodes: list = []
         root = self.novel_tree.invisibleRootItem()
+        
+        all_nodes_dict = {}
+        
+        def collect_all_nodes(nodes):
+            for node in nodes:
+                if "id" in node:
+                    all_nodes_dict[node["id"]] = node
+                if "children" in node:
+                    collect_all_nodes(node["children"])
+        
+        if hasattr(self, '_pre_drag_tree_snapshot') and self._pre_drag_tree_snapshot:
+            collect_all_nodes(self._pre_drag_tree_snapshot.get("nodes", []))
+        else:
+            collect_all_nodes(self.outline_tree_data.get("nodes", []))
+        
         for i in range(root.childCount()):
             item = root.child(i)
             if item.text(0).startswith("+"):
                 continue
-            node_data = self._build_node_data_from_item(item)
+            node_data = self._build_node_data_from_item(item, all_nodes_dict)
             if node_data:
                 new_nodes.append(node_data)
 
         self.outline_tree_data["nodes"] = new_nodes
         self.workspace.save_outline_tree(self.outline_tree_data)
+        
+        if hasattr(self, '_pre_drag_tree_snapshot'):
+            self._pre_drag_tree_snapshot = None
+        
         self.log_console.append("系统通知：节点位置结构已自动保存。")
 
-    def _build_node_data_from_item(self: "NovelCreatorWindow", item):
+    def _build_node_data_from_item(self: "NovelCreatorWindow", item, all_nodes_dict=None, original_parent_data=None):
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
-        node_data = self.node_map.get(node_id)
+        
+        # 【修复核心】：Qt内部拖拽父节点会导致子节点UserRole丢失。在此通过标题匹配进行回退恢复。
+        if not node_id and original_parent_data and "children" in original_parent_data:
+            item_text = item.text(0)
+            for orig_child in original_parent_data["children"]:
+                # 3级节点标题在UI中附加了修改时间，因此使用 startswith 或 in 进行匹配
+                if item_text.startswith(orig_child.get("title", "")):
+                    node_id = orig_child.get("id")
+                    if node_id:
+                        # 恢复ID并重新写回UI，防止后续流程再次丢失
+                        item.setData(0, Qt.ItemDataRole.UserRole, node_id)
+                        break
+        
+        node_data = None
+        if all_nodes_dict and node_id in all_nodes_dict:
+            node_data = all_nodes_dict[node_id]
+        if not node_data:
+            node_data = self.node_map.get(node_id)
+        
         if not node_data:
             return None
 
@@ -211,7 +285,8 @@ class NovelTreeMixin:
             child_item = item.child(i)
             if child_item.text(0).startswith("+"):
                 continue
-            child_data = self._build_node_data_from_item(child_item)
+            # 递归调用时，将当前的 node_data 作为 original_parent_data 传给子节点
+            child_data = self._build_node_data_from_item(child_item, all_nodes_dict, node_data)
             if child_data:
                 new_children.append(child_data)
 
@@ -232,6 +307,35 @@ class NovelTreeMixin:
             )
             return
 
+        # === 【修复核心 1】：将未保存更改的检查逻辑移动到最前面 ===
+        if self.current_editing_node:
+            current_summary = self.summary_editor.toPlainText()
+            current_content = self.content_editor.toPlainText()
+            original_summary = getattr(self, "current_node_original_summary", "")
+            original_content = getattr(self, "current_node_original_content", "")
+            
+            # 【修复核心 2】：统一换行符标准，防止 Windows/Mac 换行符差异导致的“假变动”误报
+            is_summary_changed = current_summary.replace('\r\n', '\n') != original_summary.replace('\r\n', '\n')
+            is_content_changed = current_content.replace('\r\n', '\n') != original_content.replace('\r\n', '\n')
+            
+            if is_summary_changed or is_content_changed:
+                reply = QMessageBox.question(
+                    self,  # type: ignore[arg-type]
+                    "保存更改",
+                    "当前节点有未保存的更改，是否在切换前保存？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                
+                if reply == QMessageBox.StandardButton.Cancel:
+                    # 【修复核心 3】：如果用户取消切换，强行把大纲树的高亮选择框拉回正在编辑的节点
+                    if getattr(self, "current_editing_item", None):
+                        self.novel_tree.setCurrentItem(self.current_editing_item)
+                    return
+                elif reply == QMessageBox.StandardButton.Yes:
+                    self.save_current_node()
+
+        # === 拦截并处理 “+新增” 按钮 ===
         if item.text(0).startswith("+"):
             parent_item = item.parent()
             if parent_item:
@@ -248,33 +352,13 @@ class NovelTreeMixin:
                 self.add_new_novel_node(target_list, 1)
             return
 
-        # 检查是否有未保存的更改
-        if self.current_editing_node:
-            current_summary = self.summary_editor.toPlainText()
-            current_content = self.content_editor.toPlainText()
-            original_summary = self.current_node_original_summary
-            original_content = self.current_node_original_content
-            
-            if current_summary != original_summary or current_content != original_content:
-                reply = QMessageBox.question(
-                    self,  # type: ignore[arg-type]
-                    "保存更改",
-                    "当前节点有未保存的更改，是否在切换前保存？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Yes,
-                )
-                
-                if reply == QMessageBox.StandardButton.Cancel:
-                    return
-                elif reply == QMessageBox.StandardButton.Yes:
-                    self.save_current_node()
-
+        # === 以下为原有的常规节点点击处理逻辑 ===
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
         real_node = self.node_map.get(node_id)
         if not real_node:
             return
 
-        # 保存新节点的原始状态
+        # (保留你原来的后续代码，比如记录 current_editing_node、重置 Undo 等...)
         self.current_editing_node = real_node
         self.current_editing_item = item
         self.current_setting_path = None
@@ -440,6 +524,28 @@ class NovelTreeMixin:
         level = 0
         node_id = None
         has_pending = False
+        
+        # 检查是否有被勾选的节点
+        checked_nodes = []
+        root = self.novel_tree.invisibleRootItem()
+        
+        def collect_checked_items(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if not child.text(0).startswith("+"):
+                    if child.checkState(0) == Qt.CheckState.Checked:
+                        n_id = child.data(0, Qt.ItemDataRole.UserRole)
+                        if n_id and n_id in self.node_map:
+                            checked_nodes.append((child, self.node_map[n_id]))
+                    collect_checked_items(child)
+        
+        collect_checked_items(root)
+        
+        # 如果有被勾选的节点，添加批量修改选项
+        if checked_nodes:
+            batch_modify_action = menu.addAction("📝 批量修改勾选节点")
+            batch_modify_action.triggered.connect(lambda: self.open_batch_modify_request_dialog(checked_nodes))
+            menu.addSeparator()
         
         if item and not item.text(0).startswith("+"):
             node_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -1099,9 +1205,13 @@ class NovelTreeMixin:
             
             # 重新查找并设置当前编辑的节点（刷新树后旧item已无效）
             if self.current_editing_node and self.current_editing_node.get("id") == node_id:
-                # 从新构建的树中重新找到对应的item
+                # 从新构建的树中重新找到对应的item和节点对象
+                item = find_item_by_data(self.novel_tree.invisibleRootItem(), node_id)
+                if item:
+                    self.current_editing_item = item
+                # 更新当前编辑的节点为新的节点对象
                 if node_id in self.node_map:
-                    self.current_editing_item = self.node_map[node_id]
+                    self.current_editing_node = self.node_map[node_id]
                 # 刷新编辑器内容
                 if rel_path:
                     full_path = os.path.join(self.workspace.text_path, rel_path)
@@ -1133,3 +1243,214 @@ class NovelTreeMixin:
             self.workspace.delete_pending_modify(node_id)
             self._refresh_novel_tree()
             self.log_console.append(f"<font color='yellow'>已丢弃待合并的修改。</font>")
+    
+    def open_batch_modify_request_dialog(self: "NovelCreatorWindow", checked_nodes):
+        """打开批量修改请求对话框"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout, QListWidget, QListWidgetItem
+        
+        # 过滤节点：只保留3级且没有待合并修改的节点
+        valid_nodes = []
+        skipped_info = []
+        
+        for item, node in checked_nodes:
+            level = get_item_level(item)
+            node_id = node.get("id")
+            
+            if level in [1, 2]:
+                skipped_info.append(f"跳过【{node.get('title', '未知')}】：1级/2级节点无正文")
+                continue
+            
+            if self.workspace.has_pending_modify(node_id):
+                skipped_info.append(f"跳过【{node.get('title', '未知')}】：已处于待合并状态")
+                continue
+            
+            # 读取原文，检查是否有正文
+            original_text = ""
+            rel_path = node.get("file_path")
+            if rel_path:
+                full_path = os.path.join(self.workspace.text_path, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        original_text = f.read()
+            
+            if not original_text:
+                skipped_info.append(f"跳过【{node.get('title', '未知')}】：无正文内容")
+                continue
+            
+            valid_nodes.append((item, node))
+        
+        if not valid_nodes:
+            info_text = "没有符合条件的节点可以处理。\n\n" + "\n".join(skipped_info)
+            QMessageBox.information(self, "提示", info_text)
+            return
+        
+        class BatchModifyRequestDialog(QDialog):
+            def __init__(self, parent, valid_nodes_info, skipped_info_list):
+                super().__init__(parent)
+                self.setWindowTitle("批量修改内容")
+                self.setMinimumWidth(600)
+                self.setMinimumHeight(500)
+                self.result_text = ""
+                
+                layout = QVBoxLayout()
+                
+                # 显示待处理的节点列表
+                layout.addWidget(QLabel(f"准备处理 {len(valid_nodes_info)} 个节点："))
+                node_list = QListWidget()
+                for _, node in valid_nodes_info:
+                    node_list.addItem(QListWidgetItem(f"✅ {node.get('title', '未知')}"))
+                layout.addWidget(node_list)
+                
+                # 显示跳过的节点信息（如果有）
+                if skipped_info_list:
+                    layout.addWidget(QLabel("\n以下节点将被跳过："))
+                    skipped_list = QListWidget()
+                    for info in skipped_info_list:
+                        skipped_list.addItem(QListWidgetItem(f"⚠️ {info}"))
+                    layout.addWidget(skipped_list)
+                
+                # 输入修改要求
+                layout.addWidget(QLabel("\n请输入修改要求（将应用于所有选中节点）："))
+                self.requirement_edit = QTextEdit()
+                self.requirement_edit.setPlaceholderText("例如：将这段内容的语气改得更加轻松幽默，或者增加一些环境描写...")
+                self.requirement_edit.setMinimumHeight(120)
+                layout.addWidget(self.requirement_edit)
+                
+                # 按钮
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+                
+                self.cancel_btn = QPushButton("取消")
+                self.cancel_btn.clicked.connect(self.reject)
+                btn_layout.addWidget(self.cancel_btn)
+                
+                self.ok_btn = QPushButton("开始批量修改")
+                self.ok_btn.clicked.connect(self.accept)
+                self.ok_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+                btn_layout.addWidget(self.ok_btn)
+                
+                layout.addLayout(btn_layout)
+                self.setLayout(layout)
+            
+            def get_requirement(self):
+                return self.requirement_edit.toPlainText().strip()
+        
+        dialog = BatchModifyRequestDialog(self, valid_nodes, skipped_info)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            requirement = dialog.get_requirement()
+            if requirement:
+                self.start_batch_modify_content(valid_nodes, requirement)
+    
+    def start_batch_modify_content(self: "NovelCreatorWindow", valid_nodes, requirement):
+        """开始批量修改内容"""
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+        
+        # 初始化批量处理状态
+        if not hasattr(self, 'batch_modify_queue'):
+            self.batch_modify_queue = []
+        if not hasattr(self, 'is_batch_modifying'):
+            self.is_batch_modifying = False
+        
+        if self.is_batch_modifying:
+            QMessageBox.warning(self, "提示", "正在进行批量修改，请等待完成或停止后再进行新的批量操作。")
+            return
+        
+        self.batch_modify_queue = valid_nodes.copy()
+        self.is_batch_modifying = True
+        self.batch_modify_requirement = requirement
+        self.batch_modify_success_count = 0
+        self.batch_modify_fail_count = 0
+        
+        self.log_console.append(f"<font color='cyan'>🚀 开始批量修改，共 {len(self.batch_modify_queue)} 个节点...</font>")
+        self.btn_save.setEnabled(False)
+        
+        self._process_next_batch_modify_node()
+    
+    def _process_next_batch_modify_node(self: "NovelCreatorWindow"):
+        """处理下一个批量修改节点"""
+        if not self.is_batch_modifying:
+            return
+        
+        if not self.batch_modify_queue:
+            self.is_batch_modifying = False
+            self.btn_save.setEnabled(True)
+            self.log_console.append(f"<b><font color='green'>🎉 批量修改完成！成功：{self.batch_modify_success_count} 个，失败：{self.batch_modify_fail_count} 个</font></b>")
+            QMessageBox.information(
+                self, 
+                "批量修改完成", 
+                f"批量修改已结束！\n成功：{self.batch_modify_success_count} 个\n失败：{self.batch_modify_fail_count} 个\n\n节点已变红，请右键选择【进行合并】查看差异并合并。"
+            )
+            self._refresh_novel_tree()
+            return
+        
+        next_item, next_node = self.batch_modify_queue.pop(0)
+        node_title = next_node.get('title', '未知节点')
+        node_id = next_node.get('id')
+        
+        self.log_console.append(f"<hr><b>⏳ 正在处理节点: {node_title} (队列剩余 {len(self.batch_modify_queue)} 个)</b>")
+        
+        # 读取原文
+        original_text = ""
+        rel_path = next_node.get("file_path")
+        if rel_path:
+            full_path = os.path.join(self.workspace.text_path, rel_path)
+            if os.path.exists(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    original_text = f.read()
+        
+        if not original_text:
+            self.log_console.append(f"<font color='orange'>跳过【{node_title}】：无正文内容</font>")
+            self.batch_modify_fail_count += 1
+            self._process_next_batch_modify_node()
+            return
+        
+        # 构建提示词
+        prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
+
+### 修改要求：
+{self.batch_modify_requirement}
+
+### 原文内容：
+{original_text}
+
+### 输出要求：
+1. 只输出修改后的完整文本
+2. 保持原文的基本结构和格式
+3. 不要添加任何额外的解释性文字
+4. 如果原文有标题（# 开头），请保留
+"""
+        
+        # 发送请求
+        from ui.workers import GenerateTaskThread
+        self.batch_modify_thread = GenerateTaskThread(self.llm_client, prompt)
+        self.batch_modify_thread.success_signal.connect(
+            lambda result: self.on_batch_modify_success(result, next_node, node_id, original_text)
+        )
+        self.batch_modify_thread.error_signal.connect(
+            lambda error: self.on_batch_modify_error(error, node_title)
+        )
+        self.batch_modify_thread.start()
+    
+    def on_batch_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str):
+        """批量修改单个节点成功回调"""
+        try:
+            # 保存待合并修改
+            self.workspace.save_pending_modify(node_id, original_text, result, self.batch_modify_requirement)
+            
+            self.batch_modify_success_count += 1
+            node_title = real_node.get('title', '未知节点')
+            self.log_console.append(f"<font color='green'>✅ 节点【{node_title}】修改成功！</font>")
+            
+        except Exception as e:
+            self.batch_modify_fail_count += 1
+            self.log_console.append(f"<font color='red'>保存待合并修改失败: {e}</font>")
+        finally:
+            self._process_next_batch_modify_node()
+    
+    def on_batch_modify_error(self: "NovelCreatorWindow", error_msg: str, node_title: str):
+        """批量修改单个节点失败回调"""
+        self.batch_modify_fail_count += 1
+        self.log_console.append(f"<font color='red'>❌ 节点【{node_title}】修改失败: {error_msg}</font>")
+        self._process_next_batch_modify_node()

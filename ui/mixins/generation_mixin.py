@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QMessageBox
 
 from core.context_builder import ContextBuilder
@@ -19,9 +20,19 @@ class GenerationMixin:
     """处理 AI 生成正文、重写正文以及批量生成缺失场景。"""
 
     # ================= AI 生成核心逻辑 ================= #
+    
+    def _get_current_node_from_tree(self: "NovelCreatorWindow"):
+        """从当前选中的树节点获取最新的节点对象"""
+        if not self.current_editing_item:
+            return None
+        node_id = self.current_editing_item.data(0, Qt.ItemDataRole.UserRole)
+        if node_id and node_id in self.node_map:
+            return self.node_map[node_id]
+        return None
 
     def generate_current_node(self: "NovelCreatorWindow"):
-        if not self.current_editing_node or not self.outline_tree_data:
+        current_node = self._get_current_node_from_tree() or self.current_editing_node
+        if not current_node or not self.outline_tree_data:
             return
 
         if not self.llm_client:
@@ -38,7 +49,7 @@ class GenerationMixin:
 
         self.save_current_node()
 
-        node_title = self.current_editing_node.get("title", "未知节点")
+        node_title = current_node.get("title", "未知节点")
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
         
         # 在状态栏显示信息
@@ -54,7 +65,7 @@ class GenerationMixin:
         checked_paths = self.get_checked_settings()
 
         messages = builder.build_generation_prompt(
-            self.current_editing_node,
+            current_node,
             self.outline_tree_data,
             checked_paths,
             generate_image=self.cb_gen_image.isChecked(),
@@ -81,7 +92,8 @@ class GenerationMixin:
         self.generate_thread.start()
 
     def rewrite_current_node(self: "NovelCreatorWindow"):
-        if not self.current_editing_node:
+        current_node = self._get_current_node_from_tree() or self.current_editing_node
+        if not current_node:
             return
 
         target_content = self.content_editor.toPlainText().strip()
@@ -117,14 +129,14 @@ class GenerationMixin:
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
 
-        node_title = self.current_editing_node.get("title", "未知节点")
+        node_title = current_node.get("title", "未知节点")
         self.log_console.append(f"开始构建【{node_title}】的重写请求...")
 
         builder = ContextBuilder(self.workspace)
         checked_paths = self.get_checked_settings()
 
         messages = builder.build_rewrite_prompt(
-            self.current_editing_node,
+            current_node,
             self.outline_tree_data,
             checked_paths,
             target_word_count,
@@ -161,7 +173,8 @@ class GenerationMixin:
 
     def regenerate_summary(self: "NovelCreatorWindow"):
         """重新生成当前节点的概要(Summary)"""
-        if not self.current_editing_node or not self.outline_tree_data:
+        current_node = self._get_current_node_from_tree() or self.current_editing_node
+        if not current_node or not self.outline_tree_data:
             return
 
         if not self.llm_client:
@@ -172,11 +185,14 @@ class GenerationMixin:
             )
             return
 
+        # 保存当前选中节点的 ID，用于在生成后恢复选择
+        self._current_regenerating_node_id = current_node.get("id")
+
         # 保存当前概要到回退缓冲区
         current_summary = self.summary_editor.toPlainText()
         self._save_to_undo_stack('summary', current_summary)
 
-        node_title = self.current_editing_node.get("title", "未知节点")
+        node_title = current_node.get("title", "未知节点")
         self.log_console.append(f"开始重新生成【{node_title}】的概要...")
         
         # 在状态栏显示信息
@@ -194,7 +210,7 @@ class GenerationMixin:
         checked_paths = self.get_checked_settings()
 
         messages = builder.build_summary_prompt(
-            self.current_editing_node,
+            current_node,
             self.outline_tree_data,
             checked_paths,
         )
@@ -202,9 +218,9 @@ class GenerationMixin:
         prompt_content = messages[-1]["content"]
 
         self.log_console.append(
-            "========== [System] 模型系统指令 (Instructions) =========="
+            "========== [System] 概要生成系统指令 (Summary Instructions) =========="
         )
-        self.log_console.append(self.llm_client.system_instruction)
+        self.log_console.append(self.llm_client.summary_system_instruction)
         self.log_console.append(
             "========== [User] 生成概要提示词 =========="
         )
@@ -212,15 +228,17 @@ class GenerationMixin:
         self.log_console.append("=================================================")
         self.log_console.append("发送请求至大语言模型，后台处理中，请稍候...")
 
-        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content, self.llm_client.summary_system_instruction)
         self.generate_thread.success_signal.connect(self.on_summary_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
         self.generate_thread.start()
 
     def on_summary_generate_success(self: "NovelCreatorWindow", result: str):
         """处理概要生成成功的回调"""
+        current_node = self._get_current_node_from_tree() or self.current_editing_node
         self.summary_editor.setText(result)
-        self.current_editing_node["summary"] = result
+        if current_node:
+            current_node["summary"] = result
         self.log_console.append("概要生成成功！已更新至编辑器并自动保存。")
         
         # 在状态栏显示信息
@@ -229,6 +247,22 @@ class GenerationMixin:
             statusbar.showMessage("概要生成成功，已更新编辑器内容", 3000)
 
         self.save_current_node()
+        
+        # 恢复节点选中状态
+        if hasattr(self, '_current_regenerating_node_id') and self._current_regenerating_node_id:
+            # 使用 find_item_by_data 函数查找节点
+            root_item = self.novel_tree.invisibleRootItem()
+            from ui.utils import find_item_by_data
+            target_item = find_item_by_data(root_item, self._current_regenerating_node_id)
+            
+            if target_item:
+                # 选中该节点并设置焦点
+                self.novel_tree.setCurrentItem(target_item)
+                self.novel_tree.scrollToItem(target_item)
+                # 更新 current_editing_item 和 current_editing_node
+                self.current_editing_item = target_item
+                self.current_editing_node = self.node_map.get(self._current_regenerating_node_id)
+        
         self._restore_generate_ui_state()
 
     def on_generate_error(self: "NovelCreatorWindow", error_msg: str):

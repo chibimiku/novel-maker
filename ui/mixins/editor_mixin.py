@@ -46,14 +46,16 @@ class EditorMixin:
                     new_md5 = self.workspace.save_markdown_file(rel_path, content)
                     self.current_editing_node["md5"] = new_md5
                     self.current_editing_node["_status"] = "ok"
-                    # 安全地检查current_editing_item是否仍然有效
+                    # 安全地检查current_editing_item是否仍然有效并且是正确的类型
                     if self.current_editing_item:
                         try:
-                            self.current_editing_item.setForeground(
-                                0, QColor(NODE_NORMAL)
-                            )
-                        except RuntimeError:
-                            # 如果item已被删除，忽略这个错误
+                            # 检查是否有setForeground方法，避免在错误类型上调用
+                            if hasattr(self.current_editing_item, 'setForeground'):
+                                self.current_editing_item.setForeground(
+                                    0, QColor(NODE_NORMAL)
+                                )
+                        except (RuntimeError, AttributeError):
+                            # 如果item已被删除或类型错误，忽略这个错误
                             pass
                 except Exception as e:
                     QMessageBox.critical(

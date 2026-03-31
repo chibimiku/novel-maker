@@ -69,7 +69,7 @@ class SummarySyncWorker(QThread):
             new_summary = ""
         else:
             prompt = self.context_builder.build_summary_sync_prompt(title, level, old_summary, actual_content)
-            new_summary = self.llm_client.generate_text(prompt=prompt).strip()
+            new_summary = self.llm_client.generate_text(prompt=prompt, override_system_instruction=self.llm_client.summary_system_instruction).strip()
 
         self.after_records.append(f"## {title} (层级: {level})\n{new_summary}\n")
 

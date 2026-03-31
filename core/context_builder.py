@@ -241,6 +241,8 @@ class ContextBuilder:
         children = target_node.get("children", [])
         siblings = []
         target_level = 0
+        prev_node = None
+        next_node = None
         
         # 寻找父节点、同级节点和目标节点的层级
         def find_node_info(current_nodes, current_path, level):
@@ -261,6 +263,28 @@ class ContextBuilder:
             return False
         
         find_node_info(tree_data.get("nodes", []), [], 1)
+        
+        # 如果是第3级节点，也查找前后相邻节点
+        if target_level == 3:
+            flat_scenes = []
+            
+            def flatten(current_nodes, current_path):
+                for node in current_nodes:
+                    path = current_path + [node]
+                    if not node.get("children"):
+                        flat_scenes.append((node, current_path))
+                    else:
+                        flatten(node.get("children", []), path)
+                    
+            flatten(tree_data.get("nodes", []), [])
+            
+            for i, (node, path) in enumerate(flat_scenes):
+                if node is target_node:
+                    if i > 0:
+                        prev_node = flat_scenes[i-1][0]
+                    if i < len(flat_scenes) - 1:
+                        next_node = flat_scenes[i+1][0]
+                    break
         
         # 构建上下文文本
         context_blocks = []
@@ -307,6 +331,37 @@ class ContextBuilder:
                 child_summary = child.get("summary", "").strip() or "(暂无概要)"
                 context_blocks.append(f"<{child_title}> 概要:\n{child_summary}\n")
         
+        # 对于第3级节点，添加正文内容和前后相邻节点信息
+        if target_level == 3:
+            target_content = self._read_node_content(target_node).strip()
+            if target_content and not (target_content.startswith("#") and len(target_content.split('\n')) <= 3):
+                context_blocks.append("【当前场景正文】")
+                context_blocks.append(target_content)
+            
+            if prev_node:
+                prev_title = prev_node.get("title")
+                prev_summary = prev_node.get("summary", "").strip()
+                prev_content = self._read_node_content(prev_node).strip()
+                
+                context_blocks.append(f"\n【上一相邻场景: {prev_title}】")
+                context_blocks.append(f"剧情概要: {prev_summary if prev_summary else '(本场景暂无概要)'}")
+                
+                if prev_content:
+                    tail = prev_content[-500:] if len(prev_content) > 500 else prev_content
+                    context_blocks.append(f"正文结尾参考:\n...{tail}")
+            
+            if next_node:
+                next_title = next_node.get("title")
+                next_summary = next_node.get("summary", "").strip()
+                next_content = self._read_node_content(next_node).strip()
+                
+                context_blocks.append(f"\n【下一相邻场景: {next_title}】")
+                context_blocks.append(f"剧情概要: {next_summary if next_summary else '(本场景暂无概要)'}")
+                
+                if next_content:
+                    head = next_content[:300] if len(next_content) > 300 else next_content
+                    context_blocks.append(f"正文开篇参考:\n{head}...")
+        
         context_text = "\n".join(context_blocks) if context_blocks else "（无相关上下文）"
         
         # 构建提示词
@@ -324,11 +379,12 @@ class ContextBuilder:
 
 ### 三、 当前任务
 请为场景【{target_title}】生成剧情概要，要求：
-1. 概要必须融合上述“核心要素提取要求”，不仅要概括大意，更要突出变化。
+1. 概要必须融合上述"核心要素提取要求"，不仅要概括大意，更要突出变化。
 2. 语言凝练，控制在 150-400 字之间（为确保细节完整，字数可适当浮动）。
 3. 突出场景的关键冲突、人物和情节发展。
 4. 与父节点的主题保持一致，同时为子节点的发展做铺垫。
 5. 如果是2级节点，请确保概要与同级节点的内容连贯，符合其在序列中的位置。
+6. 如果是3级场景节点，请完全基于提供的【当前场景正文】内容生成概要，不要自行捏造不存在的剧情。
 
 ### 四、 输出格式与要求（绝对红线）
 1. 请直接输出概要内容，不要添加任何前缀或后缀。

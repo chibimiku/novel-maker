@@ -53,6 +53,9 @@ class LLMClient:
         # 【修改点】：强化默认的系统人设约束，防止生成废话
         default_sys_prompt = "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。"
         self.system_instruction = text_cfg.get("instructions", default_sys_prompt)
+        # 概要生成系统指令
+        default_summary_sys_prompt = "你是一个专业的小说编辑，擅长为小说节点生成精炼、准确的概要。"
+        self.summary_system_instruction = text_cfg.get("summary_instructions", default_summary_sys_prompt)
         
         if self.text_type == "openai":
             # 构建 httpx 客户端用于代理
@@ -137,6 +140,8 @@ class LLMClient:
                 
                 # 【修改点】：提取文本，写入日志后再返回
                 result = response.choices[0].message.content
+                if result is None:
+                    result = ""
                 logger.info(f"\n========== {self.text_model_name} 原始返回 ==========\n{result}\n==================================================\n")
                 return result
 
@@ -159,6 +164,8 @@ class LLMClient:
                 response = chat.send_message(prompt)
                 
                 result = response.text
+                if result is None:
+                    result = ""
                 logger.info(f"\n========== Gemini 原始返回 ==========\n{result}\n=======================================\n")
                 return result
                 

@@ -294,9 +294,13 @@ class AdvancedDiffMergeDialog(QDialog):
         main_layout.addLayout(btn_layout)
 
         self.setLayout(main_layout)
-        
-        # 最后再最大化，确保样式应用后显示
-        self.showMaximized()
+    
+    def showEvent(self, event):
+        """窗口显示事件 - 第一次显示时最大化"""
+        super().showEvent(event)
+        if not hasattr(self, '_maximized'):
+            self.showMaximized()
+            self._maximized = True
 
     def parse_and_render_diff(self):
         """解析并渲染差异"""
@@ -315,14 +319,19 @@ class AdvancedDiffMergeDialog(QDialog):
         """将diff-match-patch的结果转换为行级差异，保留细粒度信息"""
         result: List[DiffLine] = []
         
-        # 将diffs按行分割
-        original_buffer = []
-        modified_buffer = []
-        original_segments_buffer = []
-        modified_segments_buffer = []
+        # 过滤掉空的或只包含空白字符的片段
+        def is_empty_segment(t):
+            return not t or t.strip() == ''
+        
+        # 将所有diffs首先分成"行块"，每个块以换行符结束
+        # 这样可以确保同一行内的多个diff片段被正确处理
+        current_orig_line = []
+        current_mod_line = []
+        current_orig_segments = []
+        current_mod_segments = []
         
         for op, text in diffs:
-            # 按行分割文本
+            # 处理每个diff片段
             lines = text.splitlines(True)
             
             for i, line in enumerate(lines):
@@ -330,62 +339,73 @@ class AdvancedDiffMergeDialog(QDialog):
                 clean_line = line.rstrip('\n')
                 
                 if op == -1:  # 删除
-                    original_buffer.append(clean_line)
-                    original_segments_buffer.append(DiffSegment("delete", clean_line))
+                    current_orig_line.append(clean_line)
+                    if not is_empty_segment(clean_line):
+                        current_orig_segments.append(DiffSegment("delete", clean_line))
                 elif op == 1:  # 插入
-                    modified_buffer.append(clean_line)
-                    modified_segments_buffer.append(DiffSegment("insert", clean_line))
+                    current_mod_line.append(clean_line)
+                    if not is_empty_segment(clean_line):
+                        current_mod_segments.append(DiffSegment("insert", clean_line))
                 else:  # 相等
-                    original_buffer.append(clean_line)
-                    modified_buffer.append(clean_line)
-                    original_segments_buffer.append(DiffSegment("equal", clean_line))
-                    modified_segments_buffer.append(DiffSegment("equal", clean_line))
+                    current_orig_line.append(clean_line)
+                    current_mod_line.append(clean_line)
+                    if not is_empty_segment(clean_line):
+                        current_orig_segments.append(DiffSegment("equal", clean_line))
+                        current_mod_segments.append(DiffSegment("equal", clean_line))
                 
-                # 如果有换行，或者是最后一行，创建DiffLine
-                if has_newline or i == len(lines) - 1:
-                    orig_line = ''.join(original_buffer)
-                    mod_line = ''.join(modified_buffer)
+                # 遇到换行符时，创建一行DiffLine
+                if has_newline:
+                    orig_line_text = ''.join(current_orig_line)
+                    mod_line_text = ''.join(current_mod_line)
+                    self._add_diff_line(result, orig_line_text, mod_line_text, 
+                                        current_orig_segments, current_mod_segments)
                     
-                    if orig_line == mod_line:
-                        diff_line = DiffLine("equal", orig_line, mod_line, len(result))
-                        diff_line.original_segments = original_segments_buffer.copy()
-                        diff_line.modified_segments = modified_segments_buffer.copy()
-                    elif not orig_line:
-                        diff_line = DiffLine("insert", "", mod_line, len(result))
-                        diff_line.modified_segments = modified_segments_buffer.copy()
-                    elif not mod_line:
-                        diff_line = DiffLine("delete", orig_line, "", len(result))
-                        diff_line.original_segments = original_segments_buffer.copy()
-                    else:
-                        diff_line = DiffLine("replace", orig_line, mod_line, len(result))
-                        diff_line.original_segments = original_segments_buffer.copy()
-                        diff_line.modified_segments = modified_segments_buffer.copy()
-                    
-                    result.append(diff_line)
-                    
-                    # 清空缓冲区
-                    original_buffer = []
-                    modified_buffer = []
-                    original_segments_buffer = []
-                    modified_segments_buffer = []
+                    # 重置当前行缓冲区
+                    current_orig_line = []
+                    current_mod_line = []
+                    current_orig_segments = []
+                    current_mod_segments = []
+        
+        # 处理剩余的文本（没有以换行符结尾的部分）
+        if current_orig_line or current_mod_line:
+            orig_line_text = ''.join(current_orig_line)
+            mod_line_text = ''.join(current_mod_line)
+            self._add_diff_line(result, orig_line_text, mod_line_text, 
+                                current_orig_segments, current_mod_segments)
         
         # 过滤掉无意义的空行差异
         filtered_result = []
         for diff_line in result:
-            # 检查是否是无意义的空行差异
-            # 情况: 替换类型，但两边都是空行或纯空白（比如只是换行符差异）
             if diff_line.line_type == "replace":
                 orig_stripped = diff_line.original_line.strip()
                 mod_stripped = diff_line.modified_line.strip()
                 if not orig_stripped and not mod_stripped:
-                    # 两边都是空行，转换为equal类型，不显示为差异
                     diff_line.line_type = "equal"
                     filtered_result.append(diff_line)
                     continue
-            # 其他情况（正常的insert、delete、equal、有实际内容的replace）都保留
             filtered_result.append(diff_line)
         
         return filtered_result
+    
+    def _add_diff_line(self, result: List[DiffLine], orig_line: str, mod_line: str,
+                      orig_segments: List[DiffSegment], mod_segments: List[DiffSegment]):
+        """向结果中添加一个DiffLine"""
+        if orig_line == mod_line:
+            diff_line = DiffLine("equal", orig_line, mod_line, len(result))
+            diff_line.original_segments = orig_segments.copy()
+            diff_line.modified_segments = mod_segments.copy()
+        elif not orig_line:
+            diff_line = DiffLine("insert", "", mod_line, len(result))
+            diff_line.modified_segments = mod_segments.copy()
+        elif not mod_line:
+            diff_line = DiffLine("delete", orig_line, "", len(result))
+            diff_line.original_segments = orig_segments.copy()
+        else:
+            diff_line = DiffLine("replace", orig_line, mod_line, len(result))
+            diff_line.original_segments = orig_segments.copy()
+            diff_line.modified_segments = mod_segments.copy()
+        
+        result.append(diff_line)
 
     def _render_diff_lines(self):
         """渲染差异行"""

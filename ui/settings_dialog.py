@@ -3,14 +3,14 @@ import json
 import requests
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QComboBox, QTextEdit, 
-                             QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox)
+                             QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox, QInputDialog)
 from PyQt6.QtCore import Qt
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("系统配置 (API/模型)")
-        self.resize(550, 500) # 稍微加大一点窗口以容纳新组件
+        self.resize(550, 600) # 稍微加大一点窗口以容纳新组件
         
         # 确定配置文件的路径 (假设工程结构为 root/ui/ 和 root/conf/)
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,7 +19,8 @@ class SettingsDialog(QDialog):
         
         # 加载现有配置
         self.config = self.load_config()
-        self.instructions_history = [] # 新增：存放历史指令的列表
+        self.text_instructions_history = [] # 存放文本生成历史指令的列表
+        self.summary_instructions_history = [] # 存放概要生成历史指令的列表
         
         self.init_ui()
         self.populate_data()
@@ -65,27 +66,6 @@ class SettingsDialog(QDialog):
         txt_model_layout.addWidget(self.txt_model_combo, stretch=1)
         txt_model_layout.addWidget(self.btn_fetch_txt_models)
         self.text_layout.addRow("模型名称 (Model):", txt_model_layout)
-        
-        # ================= 新增：历史系统指令的管理 UI =================
-        history_layout = QHBoxLayout()
-        self.instruction_combo = QComboBox()
-        self.btn_save_instruction = QPushButton("💾 存为新模板")
-        self.btn_delete_instruction = QPushButton("🗑️ 删除该模板")
-        
-        history_layout.addWidget(self.instruction_combo, stretch=1)
-        history_layout.addWidget(self.btn_save_instruction)
-        history_layout.addWidget(self.btn_delete_instruction)
-        self.text_layout.addRow("历史系统指令:", history_layout)
-        
-        self.txt_instruction_input = QTextEdit()
-        self.txt_instruction_input.setPlaceholderText("系统提示词，例如：你是一个专业的小说家...")
-        self.text_layout.addRow("当前指令内容:", self.txt_instruction_input)
-        
-        # 绑定历史记录相关事件
-        self.instruction_combo.currentIndexChanged.connect(self.on_instruction_changed)
-        self.btn_save_instruction.clicked.connect(self.save_instruction_to_history)
-        self.btn_delete_instruction.clicked.connect(self.delete_instruction_from_history)
-        # ===============================================================
 
         self.spin_timeout = QSpinBox()
         self.spin_timeout.setRange(10, 600)
@@ -94,6 +74,72 @@ class SettingsDialog(QDialog):
 
         
         self.tabs.addTab(self.text_tab, "📝 文本生成模型")
+
+        # --- 系统指令 Tab ---
+        self.instructions_tab = QWidget()
+        self.instructions_tab_layout = QVBoxLayout(self.instructions_tab)
+        
+        # 使用子选项卡分离文本生成和概要生成指令
+        self.instructions_sub_tabs = QTabWidget()
+        
+        # --- 文本生成系统指令子 Tab ---
+        self.text_instructions_tab = QWidget()
+        self.text_instructions_layout = QFormLayout(self.text_instructions_tab)
+        
+        text_history_layout = QHBoxLayout()
+        self.text_instruction_combo = QComboBox()
+        self.btn_save_text_instruction = QPushButton("💾 存为新模板")
+        self.btn_edit_text_name = QPushButton("✏️ 编辑名称")
+        self.btn_delete_text_instruction = QPushButton("🗑️ 删除该模板")
+        
+        text_history_layout.addWidget(self.text_instruction_combo, stretch=1)
+        text_history_layout.addWidget(self.btn_save_text_instruction)
+        text_history_layout.addWidget(self.btn_edit_text_name)
+        text_history_layout.addWidget(self.btn_delete_text_instruction)
+        self.text_instructions_layout.addRow("历史系统指令:", text_history_layout)
+        
+        self.text_instruction_input = QTextEdit()
+        self.text_instruction_input.setPlaceholderText("系统提示词，例如：你是一个专业的小说家...")
+        self.text_instructions_layout.addRow("当前指令内容:", self.text_instruction_input)
+        
+        # 绑定文本生成指令历史记录相关事件
+        self.text_instruction_combo.currentIndexChanged.connect(self.on_text_instruction_changed)
+        self.btn_save_text_instruction.clicked.connect(self.save_text_instruction_to_history)
+        self.btn_edit_text_name.clicked.connect(self.edit_instruction_name)
+        self.btn_delete_text_instruction.clicked.connect(self.delete_instruction_from_history)
+        
+        self.instructions_sub_tabs.addTab(self.text_instructions_tab, "📝 文本生成系统指令")
+        
+        # --- 概要生成系统指令子 Tab ---
+        self.summary_instructions_tab = QWidget()
+        self.summary_instructions_layout = QFormLayout(self.summary_instructions_tab)
+        
+        summary_history_layout = QHBoxLayout()
+        self.summary_instruction_combo = QComboBox()
+        self.btn_save_summary_instruction = QPushButton("💾 存为新模板")
+        self.btn_edit_summary_name = QPushButton("✏️ 编辑名称")
+        self.btn_delete_summary_instruction = QPushButton("🗑️ 删除该模板")
+        
+        summary_history_layout.addWidget(self.summary_instruction_combo, stretch=1)
+        summary_history_layout.addWidget(self.btn_save_summary_instruction)
+        summary_history_layout.addWidget(self.btn_edit_summary_name)
+        summary_history_layout.addWidget(self.btn_delete_summary_instruction)
+        self.summary_instructions_layout.addRow("历史系统指令:", summary_history_layout)
+        
+        self.summary_instruction_input = QTextEdit()
+        self.summary_instruction_input.setPlaceholderText("概要生成系统提示词，例如：你是一个专业的小说编辑，擅长为小说节点生成精炼的概要...")
+        self.summary_instructions_layout.addRow("当前指令内容:", self.summary_instruction_input)
+        
+        # 绑定概要生成指令历史记录相关事件
+        self.summary_instruction_combo.currentIndexChanged.connect(self.on_summary_instruction_changed)
+        self.btn_save_summary_instruction.clicked.connect(self.save_summary_instruction_to_history)
+        self.btn_edit_summary_name.clicked.connect(self.edit_instruction_name)
+        self.btn_delete_summary_instruction.clicked.connect(self.delete_instruction_from_history)
+        
+        self.instructions_sub_tabs.addTab(self.summary_instructions_tab, "📋 概要生成系统指令")
+        
+        self.instructions_tab_layout.addWidget(self.instructions_sub_tabs)
+        self.tabs.addTab(self.instructions_tab, "📋 系统指令")
 
         # --- 图像模型 Tab ---
         self.image_tab = QWidget()
@@ -151,47 +197,157 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(self.btn_save)
         main_layout.addLayout(btn_layout)
 
-    # ================= 新增：历史指令的逻辑处理 =================
-    def update_instruction_combo(self):
-        """刷新下拉列表视图"""
-        self.instruction_combo.blockSignals(True)
-        self.instruction_combo.clear()
-        for inst in self.instructions_history:
-            # 截取前 15 个字符作为摘要标题
-            display_name = inst[:15].replace("\n", " ") + ("..." if len(inst) > 15 else "")
-            self.instruction_combo.addItem(display_name, inst)
-        self.instruction_combo.blockSignals(False)
+    # ================= 历史指令的逻辑处理 =================
+    def update_text_instruction_combo(self):
+        """刷新文本生成指令下拉列表视图"""
+        self.text_instruction_combo.blockSignals(True)
+        self.text_instruction_combo.clear()
+        for inst in self.text_instructions_history:
+            display_name = inst.get("name", "")
+            if not display_name:
+                content = inst.get("content", "")
+                display_name = content[:15].replace("\n", " ") + ("..." if len(content) > 15 else "")
+            self.text_instruction_combo.addItem(display_name, inst)
+        self.text_instruction_combo.blockSignals(False)
 
-    def on_instruction_changed(self, index):
-        """当下拉框切换时，更新文本框内容"""
+    def on_text_instruction_changed(self, index):
+        """当文本生成指令下拉框切换时，更新文本框内容"""
         if index >= 0:
-            content = self.instruction_combo.itemData(index)
-            self.txt_instruction_input.setPlainText(content)
+            data = self.text_instruction_combo.itemData(index)
+            content = data.get("content", "") if data else ""
+            self.text_instruction_input.setPlainText(content)
 
-    def save_instruction_to_history(self):
-        """将当前编辑框的内容保存为新的历史记录"""
-        current_text = self.txt_instruction_input.toPlainText().strip()
+    def save_text_instruction_to_history(self):
+        """将当前文本生成指令编辑框的内容保存为新的历史记录"""
+        current_text = self.text_instruction_input.toPlainText().strip()
         if not current_text:
+            QMessageBox.warning(self, "提示", "指令内容不能为空！")
             return
-            
-        if current_text not in self.instructions_history:
-            self.instructions_history.append(current_text)
-            self.update_instruction_combo()
-            self.instruction_combo.setCurrentIndex(len(self.instructions_history) - 1)
-            QMessageBox.information(self, "成功", "已保存为新的指令模板！")
+        
+        name, ok = QInputDialog.getText(self, "保存指令模板", "请输入指令名称：")
+        if not ok:
+            return
+        
+        name = name.strip()
+        if not name:
+            name = current_text[:15].replace("\n", " ") + ("..." if len(current_text) > 15 else "")
+        
+        exists = False
+        for inst in self.text_instructions_history:
+            if inst.get("content") == current_text:
+                exists = True
+                break
+        
+        if not exists:
+            self.text_instructions_history.append({"name": name, "content": current_text})
+            self.update_text_instruction_combo()
+            self.text_instruction_combo.setCurrentIndex(len(self.text_instructions_history) - 1)
+            QMessageBox.information(self, "成功", f"已保存为新的指令模板：{name}")
         else:
             QMessageBox.information(self, "提示", "该指令模板已存在于记录中。")
 
-    def delete_instruction_from_history(self):
-        """删除当前选中的历史记录"""
-        index = self.instruction_combo.currentIndex()
+    def update_summary_instruction_combo(self):
+        """刷新概要生成指令下拉列表视图"""
+        self.summary_instruction_combo.blockSignals(True)
+        self.summary_instruction_combo.clear()
+        for inst in self.summary_instructions_history:
+            display_name = inst.get("name", "")
+            if not display_name:
+                content = inst.get("content", "")
+                display_name = content[:15].replace("\n", " ") + ("..." if len(content) > 15 else "")
+            self.summary_instruction_combo.addItem(display_name, inst)
+        self.summary_instruction_combo.blockSignals(False)
+
+    def on_summary_instruction_changed(self, index):
+        """当概要生成指令下拉框切换时，更新文本框内容"""
         if index >= 0:
-            del self.instructions_history[index]
-            self.update_instruction_combo()
-            if self.instructions_history:
-                self.txt_instruction_input.setPlainText(self.instructions_history[0])
+            data = self.summary_instruction_combo.itemData(index)
+            content = data.get("content", "") if data else ""
+            self.summary_instruction_input.setPlainText(content)
+
+    def save_summary_instruction_to_history(self):
+        """将当前概要生成指令编辑框的内容保存为新的历史记录"""
+        current_text = self.summary_instruction_input.toPlainText().strip()
+        if not current_text:
+            QMessageBox.warning(self, "提示", "指令内容不能为空！")
+            return
+        
+        name, ok = QInputDialog.getText(self, "保存指令模板", "请输入指令名称：")
+        if not ok:
+            return
+        
+        name = name.strip()
+        if not name:
+            name = current_text[:15].replace("\n", " ") + ("..." if len(current_text) > 15 else "")
+        
+        exists = False
+        for inst in self.summary_instructions_history:
+            if inst.get("content") == current_text:
+                exists = True
+                break
+        
+        if not exists:
+            self.summary_instructions_history.append({"name": name, "content": current_text})
+            self.update_summary_instruction_combo()
+            self.summary_instruction_combo.setCurrentIndex(len(self.summary_instructions_history) - 1)
+            QMessageBox.information(self, "成功", f"已保存为新的指令模板：{name}")
+        else:
+            QMessageBox.information(self, "提示", "该指令模板已存在于记录中。")
+
+    def edit_instruction_name(self):
+        """编辑当前选中指令的名称（根据当前活跃的子标签页判断编辑哪个）"""
+        current_tab = self.instructions_sub_tabs.currentIndex()
+        if current_tab == 0:
+            combo = self.text_instruction_combo
+            history = self.text_instructions_history
+            update_func = self.update_text_instruction_combo
+        else:
+            combo = self.summary_instruction_combo
+            history = self.summary_instructions_history
+            update_func = self.update_summary_instruction_combo
+        
+        index = combo.currentIndex()
+        if index < 0:
+            QMessageBox.warning(self, "提示", "请先选择一个指令模板！")
+            return
+        
+        current_data = history[index]
+        old_name = current_data.get("name", "")
+        
+        name, ok = QInputDialog.getText(self, "编辑指令名称", "请输入新的指令名称：", text=old_name)
+        if not ok:
+            return
+        
+        name = name.strip()
+        if name:
+            history[index]["name"] = name
+            update_func()
+            combo.setCurrentIndex(index)
+            QMessageBox.information(self, "成功", f"指令名称已更新为：{name}")
+
+    def delete_instruction_from_history(self):
+        """删除当前选中的历史记录（根据当前活跃的子标签页判断删除哪个）"""
+        current_tab = self.instructions_sub_tabs.currentIndex()
+        if current_tab == 0:
+            combo = self.text_instruction_combo
+            history = self.text_instructions_history
+            input_widget = self.text_instruction_input
+            update_func = self.update_text_instruction_combo
+        else:
+            combo = self.summary_instruction_combo
+            history = self.summary_instructions_history
+            input_widget = self.summary_instruction_input
+            update_func = self.update_summary_instruction_combo
+        
+        index = combo.currentIndex()
+        if index >= 0:
+            del history[index]
+            update_func()
+            if history:
+                content = history[0].get("content", "")
+                input_widget.setPlainText(content)
             else:
-                self.txt_instruction_input.clear()
+                input_widget.clear()
             QMessageBox.information(self, "成功", "已删除该指令模板！")
     # ==========================================================
 
@@ -203,22 +359,73 @@ class SettingsDialog(QDialog):
         self.txt_model_combo.setCurrentText(text_cfg.get("model", "gpt-4o"))
         self.spin_timeout.setValue(text_cfg.get("timeout", 120))
         
-        # 加载历史指令列表
-        self.instructions_history = text_cfg.get("instructions_history", [])
-        current_instruction = text_cfg.get("instructions", "你是一个专业的AI小说家，擅长根据设定和上下文构建引人入胜的故事。")
+        # 加载文本生成历史指令列表
+        raw_text_history = text_cfg.get("instructions_history", [])
+        self.text_instructions_history = []
+        for item in raw_text_history:
+            if isinstance(item, str):
+                self.text_instructions_history.append({"name": "", "content": item})
+            elif isinstance(item, dict):
+                self.text_instructions_history.append(item)
         
-        # 确保当前指令在历史列表中
-        if current_instruction and current_instruction not in self.instructions_history:
-            self.instructions_history.insert(0, current_instruction)
+        text_current_instruction = text_cfg.get("instructions", "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。")
+        
+        # 确保当前文本生成指令在历史列表中
+        if text_current_instruction:
+            exists = False
+            for inst in self.text_instructions_history:
+                if inst.get("content") == text_current_instruction:
+                    exists = True
+                    break
+            if not exists:
+                self.text_instructions_history.insert(0, {"name": "", "content": text_current_instruction})
             
-        self.update_instruction_combo()
+        self.update_text_instruction_combo()
         
-        # 设置当前选中的指令文本
-        self.txt_instruction_input.setPlainText(current_instruction)
+        # 设置当前选中的文本生成指令文本
+        self.text_instruction_input.setPlainText(text_current_instruction)
         # 尝试在下拉框中定位到当前指令
-        idx = self.instruction_combo.findData(current_instruction)
+        idx = -1
+        for i, inst in enumerate(self.text_instructions_history):
+            if inst.get("content") == text_current_instruction:
+                idx = i
+                break
         if idx >= 0:
-            self.instruction_combo.setCurrentIndex(idx)
+            self.text_instruction_combo.setCurrentIndex(idx)
+        
+        # 加载概要生成历史指令列表
+        raw_summary_history = text_cfg.get("summary_instructions_history", [])
+        self.summary_instructions_history = []
+        for item in raw_summary_history:
+            if isinstance(item, str):
+                self.summary_instructions_history.append({"name": "", "content": item})
+            elif isinstance(item, dict):
+                self.summary_instructions_history.append(item)
+        
+        summary_current_instruction = text_cfg.get("summary_instructions", "你是一个专业的小说编辑，擅长为小说节点生成精炼、准确的概要。")
+        
+        # 确保当前概要生成指令在历史列表中
+        if summary_current_instruction:
+            exists = False
+            for inst in self.summary_instructions_history:
+                if inst.get("content") == summary_current_instruction:
+                    exists = True
+                    break
+            if not exists:
+                self.summary_instructions_history.insert(0, {"name": "", "content": summary_current_instruction})
+            
+        self.update_summary_instruction_combo()
+        
+        # 设置当前选中的概要生成指令文本
+        self.summary_instruction_input.setPlainText(summary_current_instruction)
+        # 尝试在下拉框中定位到当前指令
+        idx = -1
+        for i, inst in enumerate(self.summary_instructions_history):
+            if inst.get("content") == summary_current_instruction:
+                idx = i
+                break
+        if idx >= 0:
+            self.summary_instruction_combo.setCurrentIndex(idx)
 
         img_cfg = self.config.get("image_api", {})
         self.img_type_combo.setCurrentText(img_cfg.get("type", "openai"))
@@ -284,9 +491,26 @@ class SettingsDialog(QDialog):
 
     def save_config(self):
         # 在保存配置时，如果当前文本框里的内容不在历史记录里，自动帮用户存一份
-        current_instruction = self.txt_instruction_input.toPlainText().strip()
-        if current_instruction and current_instruction not in self.instructions_history:
-            self.instructions_history.append(current_instruction)
+        current_text_instruction = self.text_instruction_input.toPlainText().strip()
+        if current_text_instruction:
+            exists = False
+            for inst in self.text_instructions_history:
+                if inst.get("content") == current_text_instruction:
+                    exists = True
+                    break
+            if not exists:
+                self.text_instructions_history.append({"name": "", "content": current_text_instruction})
+        
+        # 同样处理概要生成指令
+        current_summary_instruction = self.summary_instruction_input.toPlainText().strip()
+        if current_summary_instruction:
+            exists = False
+            for inst in self.summary_instructions_history:
+                if inst.get("content") == current_summary_instruction:
+                    exists = True
+                    break
+            if not exists:
+                self.summary_instructions_history.append({"name": "", "content": current_summary_instruction})
 
         new_config = {
             "proxy": {
@@ -294,17 +518,17 @@ class SettingsDialog(QDialog):
                 "url": self.proxy_url_input.text().strip()
             },
             "text_api": {
-                # ... 保持你原有的 text_api 内容不变 ...
                 "type": self.txt_type_combo.currentText(),
                 "base_url": self.txt_base_url_input.text().strip(),
                 "api_key": self.txt_api_key_input.text().strip(),
                 "model": self.txt_model_combo.currentText().strip(),
                 "timeout": self.spin_timeout.value(),
-                "instructions": current_instruction,
-                "instructions_history": self.instructions_history # 新增字段落盘
+                "instructions": current_text_instruction,
+                "instructions_history": self.text_instructions_history,
+                "summary_instructions": current_summary_instruction,
+                "summary_instructions_history": self.summary_instructions_history
             },
             "image_api": {
-                # ... 保持你原有的 image_api 内容不变 ...
                 "type": self.img_type_combo.currentText(),
                 "base_url": self.img_base_url_input.text().strip(),
                 "api_key": self.img_api_key_input.text().strip(),
