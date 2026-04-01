@@ -463,12 +463,6 @@ class NovelTreeMixin:
 
             target_list.append(new_node)
 
-            if (
-                "nodes" not in self.outline_tree_data
-                or not self.outline_tree_data["nodes"]
-            ):
-                self.outline_tree_data["nodes"] = target_list
-
             try:
                 with open(
                     self.workspace.tree_json_file, "w", encoding="utf-8"
