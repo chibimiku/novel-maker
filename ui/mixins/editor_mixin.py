@@ -22,10 +22,46 @@ if TYPE_CHECKING:
 class EditorMixin:
     """编辑器区域的保存、删除、导出以及字数统计。"""
 
+    def _calculate_node_word_count(self: "NovelCreatorWindow", node: dict) -> int:
+        """递归计算节点及其所有子节点的字数总和"""
+        total_count = 0
+        
+        # 如果是3级节点，计算自身字数
+        file_path = node.get("file_path")
+        if file_path:
+            full_path = os.path.join(self.workspace.text_path, file_path)
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                        clean_text = text.replace(" ", "").replace("\n", "").replace("\t", "")
+                        total_count += len(clean_text)
+                except Exception:
+                    pass
+        
+        # 递归计算子节点
+        for child in node.get("children", []):
+            total_count += self._calculate_node_word_count(child)
+        
+        return total_count
+
     def update_word_count(self: "NovelCreatorWindow"):
-        text = self.content_editor.toPlainText()
-        clean_text = text.replace(" ", "").replace("\n", "").replace("\t", "")
-        self.word_count_label.setText(f"当前字数: {len(clean_text)}")
+        if not self.current_editing_node or not self.current_editing_item:
+            self.word_count_label.setText("当前字数: 0")
+            return
+        
+        from ui.utils import get_item_level
+        node_level = get_item_level(self.current_editing_item)
+        
+        # 如果是1级或2级节点，计算所有子节点字数之和
+        if node_level in [1, 2]:
+            total_count = self._calculate_node_word_count(self.current_editing_node)
+            self.word_count_label.setText(f"当前字数: {total_count}")
+        else:
+            # 3级节点保持原行为
+            text = self.content_editor.toPlainText()
+            clean_text = text.replace(" ", "").replace("\n", "").replace("\t", "")
+            self.word_count_label.setText(f"当前字数: {len(clean_text)}")
 
     def save_current_node(self: "NovelCreatorWindow"):
         if not self.workspace:

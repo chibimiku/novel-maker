@@ -247,6 +247,8 @@ class NovelCreatorWindow(
 
         # 添加工具菜单
         tool_menu = menubar.addMenu('工具')
+        import_text_action = tool_menu.addAction('从文本新建工作区')
+        import_text_action.triggered.connect(self.new_workspace_from_text)
         timeline_action = tool_menu.addAction('时间线校对')
         timeline_action.triggered.connect(self.open_timeline_dialog)
 
@@ -457,6 +459,26 @@ class NovelCreatorWindow(
         self.setting_tree.clear()
         self.novel_tree.clear()
         self.node_map.clear()
+        
+        # 清空当前选中节点状态和编辑器内容
+        self.current_editing_node = None
+        self.current_editing_item = None
+        self.current_setting_path = None
+        self.summary_editor.clear()
+        self.summary_editor.setEnabled(False)
+        self.content_editor.clear()
+        self.content_editor.setEnabled(False)
+        self.word_count_label.setText("当前字数: 0")
+        
+        # 禁用相关按钮
+        self.btn_select_all.setEnabled(False)
+        self.btn_select_none.setEnabled(False)
+        self.btn_generate.setEnabled(False)
+        self.btn_rewrite.setEnabled(False)
+        self.btn_regenerate_summary.setEnabled(False)
+        self.btn_undo.setEnabled(False)
+        self.btn_save.setEnabled(False)
+        self.btn_delete.setEnabled(False)
 
         # 渲染设定树（来自 SettingTreeMixin）
         self._refresh_setting_tree()

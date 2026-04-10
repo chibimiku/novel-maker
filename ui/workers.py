@@ -4,9 +4,12 @@
 """
 import os
 import json
+import uuid
+import re
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.workspace_manager import WorkspaceManager
 from ui.utils import clean_json_string
 
 
@@ -233,3 +236,462 @@ class GenerateTaskThread(QThread):
                 self.success_signal.emit(result)
         except Exception as e:
             self.error_signal.emit(str(e))
+
+
+# ================= 从文本导入工作区线程 =================
+class ImportTextWorkspaceThread(QThread):
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal(str) # 返回工作区路径
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, llm_client, selected_files, word_count, workspace_path, get_prompt_template_func, parent=None):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.selected_files = selected_files
+        self.word_count = word_count
+        self.workspace_path = workspace_path
+        self.get_prompt_template_func = get_prompt_template_func
+
+    def _get_prompt_template(self, template_name, default_content=""):
+        return self.get_prompt_template_func(template_name, default_content)
+
+    def _split_text_into_segments(self, content, target_word_count):
+        segments = []
+        lines = content.split('\n')
+        current_segment = []
+        current_word_count = 0
+        for line in lines:
+            line_word_count = len(line.replace(' ', ''))
+            if current_word_count + line_word_count > target_word_count * 1.2 and current_segment:
+                segments.append('\n'.join(current_segment).strip())
+                current_segment = [line]
+                current_word_count = line_word_count
+            else:
+                current_segment.append(line)
+                current_word_count += line_word_count
+        if current_segment:
+            segments.append('\n'.join(current_segment).strip())
+        return segments
+
+    def _create_chapter_node(self, title, summary):
+        return {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "summary": summary,
+            "children": [],
+            "_status": "ok"
+        }
+
+    def _create_section_node(self, title, summary):
+        return {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "summary": summary,
+            "children": [],
+            "_status": "ok"
+        }
+
+    def _create_scene_node(self, title, summary, content, workspace):
+        file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+        initial_content = f"# {title}\n\n{content}"
+        initial_md5 = workspace.save_markdown_file(file_name, initial_content)
+        return {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "summary": summary,
+            "file_path": file_name,
+            "md5": initial_md5,
+            "children": [],
+            "_status": "ok"
+        }
+
+    def _append_to_scene_node(self, scene_node, content, workspace):
+        file_path = scene_node.get("file_path")
+        if file_path:
+            full_path = os.path.join(workspace.text_path, file_path)
+            if os.path.exists(full_path):
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    existing_content = f.read()
+                new_content = existing_content + '\n\n' + content
+                new_md5 = workspace.save_markdown_file(file_path, new_content)
+                scene_node["md5"] = new_md5
+
+    def _process_text_files_simple(self, selected_files, word_count, workspace):
+        nodes = []
+        chapter_counter = 1
+        scene_counter = 1
+        for file_idx, file_path in enumerate(selected_files):
+            file_name = os.path.basename(file_path)
+            base_name = os.path.splitext(file_name)[0]
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(file_path, 'r', encoding='gbk') as f:
+                        content = f.read()
+                except Exception:
+                    continue
+            content = content.replace('\r\n', '\n').replace('\r', '\n')
+            chapter_title = f"第{chapter_counter}章 - {base_name}"
+            chapter_counter += 1
+            chapter_node = {
+                "id": str(uuid.uuid4()),
+                "title": chapter_title,
+                "summary": "",
+                "children": [],
+                "_status": "ok"
+            }
+            sections = self._split_into_sections(content)
+            if not sections:
+                sections = [content]
+            section_counter = 1
+            for section_content in sections:
+                section_title = f"第{section_counter}节"
+                section_counter += 1
+                section_node = {
+                    "id": str(uuid.uuid4()),
+                    "title": section_title,
+                    "summary": "",
+                    "children": [],
+                    "_status": "ok"
+                }
+                scenes = self._split_content_by_word_count(section_content, word_count)
+                for scene_content in scenes:
+                    scene_title = f"场景{scene_counter}"
+                    scene_counter += 1
+                    file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+                    initial_content = f"# {scene_title}\n\n{scene_content}"
+                    initial_md5 = workspace.save_markdown_file(file_name, initial_content)
+                    scene_node = {
+                        "id": str(uuid.uuid4()),
+                        "title": scene_title,
+                        "summary": "",
+                        "file_path": file_name,
+                        "md5": initial_md5,
+                        "children": [],
+                        "_status": "ok"
+                    }
+                    section_node["children"].append(scene_node)
+                chapter_node["children"].append(section_node)
+            nodes.append(chapter_node)
+        outline_tree_data = {
+            "project_name": os.path.basename(workspace.workspace_path),
+            "nodes": nodes
+        }
+        return outline_tree_data
+
+    def _split_into_sections(self, content):
+        sections = []
+        pattern = r'^#{1,6}\s+.*$|^第[一二三四五六七八九十百千\d]+[章节卷篇].*$'
+        lines = content.split('\n')
+        current_section = []
+        for line in lines:
+            if re.match(pattern, line.strip()):
+                if current_section:
+                    sections.append('\n'.join(current_section).strip())
+                current_section = [line]
+            else:
+                current_section.append(line)
+        if current_section:
+            sections.append('\n'.join(current_section).strip())
+        if len(sections) == 1 and not re.match(pattern, sections[0].split('\n')[0].strip()):
+            return []
+        return sections
+
+    def _split_content_by_word_count(self, content, target_word_count):
+        scenes = []
+        paragraphs = content.split('\n\n')
+        current_scene = []
+        current_word_count = 0
+        for para in paragraphs:
+            para_word_count = len(para.replace(' ', '').replace('\n', ''))
+            if current_word_count + para_word_count > target_word_count * 1.2 and current_scene:
+                scenes.append('\n\n'.join(current_scene).strip())
+                current_scene = [para]
+                current_word_count = para_word_count
+            else:
+                current_scene.append(para)
+                current_word_count += para_word_count
+        if current_scene:
+            scenes.append('\n\n'.join(current_scene).strip())
+        return scenes
+
+    def run(self):
+        try:
+            self.progress_signal.emit("开始从文本创建工作区...")
+
+            temp_workspace = WorkspaceManager(self.workspace_path)
+            temp_workspace.init_workspace()
+
+            if self.llm_client:
+                outline_tree_data = self._process_text_files_with_llm(
+                    self.selected_files, self.word_count, temp_workspace
+                )
+            else:
+                outline_tree_data = self._process_text_files_simple(
+                    self.selected_files, self.word_count, temp_workspace
+                )
+
+            temp_workspace.save_outline_tree(outline_tree_data)
+
+            if self.llm_client:
+                self._extract_settings_from_text(self.selected_files, temp_workspace)
+
+            self.success_signal.emit(self.workspace_path)
+
+        except Exception as e:
+            self.error_signal.emit(f"从文本创建工作区失败:\n{str(e)}")
+
+    def _process_text_files_with_llm(self, selected_files, word_count, workspace):
+        outline_tree_data = {
+            "project_name": os.path.basename(workspace.workspace_path),
+            "nodes": []
+        }
+
+        chapter_counter = 1
+        section_counter = 1
+        scene_counter = 1
+
+        for file_path in selected_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(file_path, 'r', encoding='gbk') as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+            content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+            segments = self._split_text_into_segments(content, word_count)
+
+            current_chapter = None
+            current_section = None
+            current_scene = None
+
+            for segment_idx, segment in enumerate(segments):
+                self.progress_signal.emit(f"处理第 {segment_idx + 1}/{len(segments)} 段文本...")
+
+                current_outline_str = json.dumps(outline_tree_data, ensure_ascii=False, indent=2)
+
+                prompt = self._get_prompt_template("text_import_process.txt", "")
+                prompt = prompt.format(
+                    current_outline=current_outline_str,
+                    text_content=segment
+                )
+
+                try:
+                    response = self.llm_client.generate_text(prompt)
+                    json_match = re.search(r'\{[\s\S]*\}', response)
+
+                    if json_match:
+                        result = json.loads(json_match.group())
+                        action = result.get("action", "new_scene")
+                        summary = result.get("summary", "")
+                        new_node_title = result.get("new_node_title", "")
+
+                        if action == "new_chapter":
+                            chapter_title = new_node_title or f"第{chapter_counter}章"
+                            chapter_counter += 1
+                            current_chapter = self._create_chapter_node(chapter_title, summary)
+                            outline_tree_data["nodes"].append(current_chapter)
+
+                            section_title = "第1节"
+                            current_section = self._create_section_node(section_title, "")
+                            current_chapter["children"].append(current_section)
+
+                            scene_title = f"场景{scene_counter}"
+                            scene_counter += 1
+                            scene_content = result.get("new_content", segment)
+                            current_scene = self._create_scene_node(scene_title, summary, scene_content, workspace)
+                            current_section["children"].append(current_scene)
+
+                        elif action == "new_section":
+                            if not current_chapter:
+                                chapter_title = f"第{chapter_counter}章"
+                                chapter_counter += 1
+                                current_chapter = self._create_chapter_node(chapter_title, "")
+                                outline_tree_data["nodes"].append(current_chapter)
+
+                            section_title = new_node_title or f"第{section_counter}节"
+                            section_counter += 1
+                            current_section = self._create_section_node(section_title, summary)
+                            current_chapter["children"].append(current_section)
+
+                            scene_title = f"场景{scene_counter}"
+                            scene_counter += 1
+                            scene_content = result.get("new_content", segment)
+                            current_scene = self._create_scene_node(scene_title, summary, scene_content, workspace)
+                            current_section["children"].append(current_scene)
+
+                        elif action == "new_scene":
+                            if not current_chapter:
+                                chapter_title = f"第{chapter_counter}章"
+                                chapter_counter += 1
+                                current_chapter = self._create_chapter_node(chapter_title, "")
+                                outline_tree_data["nodes"].append(current_chapter)
+
+                            if not current_section:
+                                section_title = f"第{section_counter}节"
+                                section_counter += 1
+                                current_section = self._create_section_node(section_title, "")
+                                current_chapter["children"].append(current_section)
+
+                            scene_title = new_node_title or f"场景{scene_counter}"
+                            scene_counter += 1
+                            scene_content = result.get("new_content", segment)
+                            current_scene = self._create_scene_node(scene_title, summary, scene_content, workspace)
+                            current_section["children"].append(current_scene)
+
+                        elif action == "append_to_current":
+                            if current_scene:
+                                self._append_to_scene_node(current_scene, segment, workspace)
+                            else:
+                                scene_title = f"场景{scene_counter}"
+                                scene_counter += 1
+                                current_scene = self._create_scene_node(scene_title, summary, segment, workspace)
+                                if not current_section:
+                                    if not current_chapter:
+                                        chapter_title = f"第{chapter_counter}章"
+                                        chapter_counter += 1
+                                        current_chapter = self._create_chapter_node(chapter_title, "")
+                                        outline_tree_data["nodes"].append(current_chapter)
+                                    section_title = f"第{section_counter}节"
+                                    section_counter += 1
+                                    current_section = self._create_section_node(section_title, "")
+                                    current_chapter["children"].append(current_section)
+                                current_section["children"].append(current_scene)
+
+                        elif action == "split":
+                            append_content = result.get("append_content", "")
+                            new_content = result.get("new_content", segment)
+
+                            if current_scene and append_content:
+                                self._append_to_scene_node(current_scene, append_content, workspace)
+
+                            if new_content:
+                                scene_title = new_node_title or f"场景{scene_counter}"
+                                scene_counter += 1
+                                current_scene = self._create_scene_node(scene_title, summary, new_content, workspace)
+                                if not current_section:
+                                    if not current_chapter:
+                                        chapter_title = f"第{chapter_counter}章"
+                                        chapter_counter += 1
+                                        current_chapter = self._create_chapter_node(chapter_title, "")
+                                        outline_tree_data["nodes"].append(current_chapter)
+                                    section_title = f"第{section_counter}节"
+                                    section_counter += 1
+                                    current_section = self._create_section_node(section_title, "")
+                                    current_chapter["children"].append(current_section)
+                                current_section["children"].append(current_scene)
+
+                except Exception as e:
+                    self.progress_signal.emit(f"<font color='red'>LLM处理失败，使用简单模式: {e}</font>")
+                    if not current_chapter:
+                        chapter_title = f"第{chapter_counter}章"
+                        chapter_counter += 1
+                        current_chapter = self._create_chapter_node(chapter_title, "")
+                        outline_tree_data["nodes"].append(current_chapter)
+                    if not current_section:
+                        section_title = f"第{section_counter}节"
+                        section_counter += 1
+                        current_section = self._create_section_node(section_title, "")
+                        current_chapter["children"].append(current_section)
+                    scene_title = f"场景{scene_counter}"
+                    scene_counter += 1
+                    current_scene = self._create_scene_node(scene_title, "", segment, workspace)
+                    current_section["children"].append(current_scene)
+
+        return outline_tree_data
+
+    def _extract_settings_from_text(self, selected_files, workspace):
+        self.progress_signal.emit("正在使用LLM提取设定...")
+
+        all_content = ""
+        for file_path in selected_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    all_content += f.read() + "\n"
+            except Exception:
+                continue
+
+        if len(all_content) > 10000:
+            all_content = all_content[:10000]
+
+        prompt = f"""请从以下文本中提取：
+1. 重要人物（姓名、性格特点等）
+2. 重要地点/场景
+3. 重要专有名词
+
+文本内容：
+{all_content}
+
+请以JSON格式返回，格式如下：
+{{
+  "characters": [
+    {{"name": "人物名", "description": "人物描述"}}
+  ],
+  "locations": [
+    {{"name": "地点名", "description": "地点描述"}}
+  ],
+  "terms": [
+    {{"name": "专有名词", "description": "名词描述"}}
+  ]
+}}
+
+只返回JSON，不要其他文字。"""
+
+        try:
+            response = self.llm_client.generate_text(prompt)
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                settings_data = json.loads(json_match.group())
+                for char in settings_data.get("characters", []):
+                    self._save_setting_to_workspace(
+                        workspace, "人物设定",
+                        char.get("name", "未命名人物"),
+                        {
+                            "姓名": char.get("name", ""),
+                            "年龄": "",
+                            "性别": "",
+                            "性格": "",
+                            "背景描述": char.get("description", ""),
+                            "特殊能力": ""
+                        }
+                    )
+                for loc in settings_data.get("locations", []):
+                    self._save_setting_to_workspace(
+                        workspace, "地点设定",
+                        loc.get("name", "未命名地点"),
+                        {
+                            "地点名称": loc.get("name", ""),
+                            "地理位置": "",
+                            "环境特征": loc.get("description", ""),
+                            "历史背景": ""
+                        }
+                    )
+                for term in settings_data.get("terms", []):
+                    self._save_setting_to_workspace(
+                        workspace, "名词设定",
+                        term.get("name", "未命名名词"),
+                        {
+                            "专有名词": term.get("name", ""),
+                            "类型": "",
+                            "详细定义": term.get("description", ""),
+                            "关联设定": ""
+                        }
+                    )
+                self.progress_signal.emit("设定提取完成！")
+        except Exception as e:
+            self.progress_signal.emit(f"<font color='red'>设定提取失败: {e}</font>")
+
+    def _save_setting_to_workspace(self, workspace, category, name, data):
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name)
+        file_name = f"{safe_name}_{uuid.uuid4().hex[:8]}.json"
+        file_path = os.path.join(workspace.settings_path, category, file_name)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)

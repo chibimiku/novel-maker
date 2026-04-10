@@ -319,9 +319,9 @@ class AdvancedDiffMergeDialog(QDialog):
         """将diff-match-patch的结果转换为行级差异，保留细粒度信息"""
         result: List[DiffLine] = []
         
-        # 过滤掉空的或只包含空白字符的片段
+        # 过滤掉空的片段
         def is_empty_segment(t):
-            return not t or t.strip() == ''
+            return not t
         
         # 将所有diffs首先分成"行块"，每个块以换行符结束
         # 这样可以确保同一行内的多个diff片段被正确处理
@@ -336,25 +336,32 @@ class AdvancedDiffMergeDialog(QDialog):
             
             for i, line in enumerate(lines):
                 has_newline = line.endswith('\n')
-                clean_line = line.rstrip('\n')
+                
+                # 只有在相等的部分遇到换行符，才进行断行
+                # 这样可以保证插入或删除中的换行符不会强制另一侧断行
+                should_split = has_newline and op == 0
+                
+                # 如果要断行，我们去掉末尾的换行符，因为 _update_preview 会用 \n 连接
+                # 如果不断行，我们保留换行符，这样它会成为 DiffLine 内部的换行
+                text_to_add = line.rstrip('\n') if should_split else line
                 
                 if op == -1:  # 删除
-                    current_orig_line.append(clean_line)
-                    if not is_empty_segment(clean_line):
-                        current_orig_segments.append(DiffSegment("delete", clean_line))
+                    current_orig_line.append(text_to_add)
+                    if not is_empty_segment(text_to_add):
+                        current_orig_segments.append(DiffSegment("delete", text_to_add))
                 elif op == 1:  # 插入
-                    current_mod_line.append(clean_line)
-                    if not is_empty_segment(clean_line):
-                        current_mod_segments.append(DiffSegment("insert", clean_line))
+                    current_mod_line.append(text_to_add)
+                    if not is_empty_segment(text_to_add):
+                        current_mod_segments.append(DiffSegment("insert", text_to_add))
                 else:  # 相等
-                    current_orig_line.append(clean_line)
-                    current_mod_line.append(clean_line)
-                    if not is_empty_segment(clean_line):
-                        current_orig_segments.append(DiffSegment("equal", clean_line))
-                        current_mod_segments.append(DiffSegment("equal", clean_line))
+                    current_orig_line.append(text_to_add)
+                    current_mod_line.append(text_to_add)
+                    if not is_empty_segment(text_to_add):
+                        current_orig_segments.append(DiffSegment("equal", text_to_add))
+                        current_mod_segments.append(DiffSegment("equal", text_to_add))
                 
-                # 遇到换行符时，创建一行DiffLine
-                if has_newline:
+                # 遇到换行符且是相等部分时，创建一行DiffLine
+                if should_split:
                     orig_line_text = ''.join(current_orig_line)
                     mod_line_text = ''.join(current_mod_line)
                     self._add_diff_line(result, orig_line_text, mod_line_text, 

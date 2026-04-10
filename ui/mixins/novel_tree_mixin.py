@@ -94,13 +94,29 @@ class NovelTreeMixin:
             # 如果是初次加载，默认全部展开
             self.novel_tree.expandAll()
         else:
-            # 否则，仅恢复之前展开的节点
+            # 先展开所有顶级节点（章），确保新增的节可见
+            root = self.novel_tree.invisibleRootItem()
+            for i in range(root.childCount()):
+                child = root.child(i)
+                if not child.text(0).startswith("+"):
+                    child.setExpanded(True)
+            
+            # 然后恢复之前展开的节点的状态
             def restore_expanded(parent_item):
                 for i in range(parent_item.childCount()):
                     child = parent_item.child(i)
                     n_id = child.data(0, Qt.ItemDataRole.UserRole)
                     if n_id and n_id in expanded_ids:
                         child.setExpanded(True)
+                    elif not n_id:
+                        # 对于没有ID的节点（比如新增的节点），如果有子节点也展开
+                        has_real_children = False
+                        for j in range(child.childCount()):
+                            if not child.child(j).text(0).startswith("+"):
+                                has_real_children = True
+                                break
+                        if has_real_children:
+                            child.setExpanded(True)
                     # 递归恢复子节点
                     restore_expanded(child)
                     
@@ -464,12 +480,19 @@ class NovelTreeMixin:
             target_list.append(new_node)
 
             try:
-                with open(
-                    self.workspace.tree_json_file, "w", encoding="utf-8"
-                ) as f:
-                    json.dump(self.outline_tree_data, f, ensure_ascii=False, indent=4)
+                self.workspace.save_outline_tree(self.outline_tree_data)
                 self.log_console.append(f"成功添加{node_type}: {title}")
                 self.refresh_ui_from_workspace()
+
+                root = self.novel_tree.invisibleRootItem()
+                new_item = find_item_by_data(root, new_node["id"])
+                if new_item:
+                    parent = new_item.parent()
+                    while parent:
+                        parent.setExpanded(True)
+                        parent = parent.parent()
+                    self.novel_tree.setCurrentItem(new_item)
+                    self.novel_tree.scrollToItem(new_item)
             except Exception as e:
                 QMessageBox.critical(
                     self, "错误", f"保存大纲 JSON 失败:\n{e}"  # type: ignore[arg-type]
@@ -1091,6 +1114,23 @@ class NovelTreeMixin:
             QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
             return
 
+        if not hasattr(self, 'modifying_nodes'):
+            self.modifying_nodes = set()
+
+        node_title = real_node.get("title", "未知节点")
+
+        if node_id in self.modifying_nodes:
+            msg = f"节点【{node_title}】正在生成修改中，请勿重复发起。"
+            self.log_console.append(f"<font color='orange'>{msg}</font>")
+            QMessageBox.warning(self, "提示", msg)
+            return
+
+        if self.workspace.has_pending_modify(node_id):
+            msg = f"节点【{node_title}】已有待合并的修改，请先处理。"
+            self.log_console.append(f"<font color='orange'>{msg}</font>")
+            QMessageBox.warning(self, "提示", msg)
+            return
+
         # 读取原文
         original_text = ""
         rel_path = real_node.get("file_path")
@@ -1106,6 +1146,7 @@ class NovelTreeMixin:
 
         self.log_console.append(f"<font color='cyan'>开始修改节点【{real_node.get('title')}】的内容...</font>")
         self.btn_save.setEnabled(False)
+        self.modifying_nodes.add(node_id)
 
         # 构建提示词
         prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
@@ -1127,11 +1168,13 @@ class NovelTreeMixin:
         from ui.workers import GenerateTaskThread
         self.modify_thread = GenerateTaskThread(self.llm_client, prompt)
         self.modify_thread.success_signal.connect(lambda result: self.on_modify_success(result, real_node, node_id, original_text, requirement))
-        self.modify_thread.error_signal.connect(self.on_modify_error)
+        self.modify_thread.error_signal.connect(lambda error: self.on_modify_error(error, node_id))
         self.modify_thread.start()
 
     def on_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str, requirement: str):
         """修改成功回调"""
+        if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+            self.modifying_nodes.remove(node_id)
         try:
             # 保存待合并修改
             self.workspace.save_pending_modify(node_id, original_text, result, requirement)
@@ -1147,8 +1190,10 @@ class NovelTreeMixin:
         finally:
             self.btn_save.setEnabled(True)
 
-    def on_modify_error(self: "NovelCreatorWindow", error_msg: str):
+    def on_modify_error(self: "NovelCreatorWindow", error_msg: str, node_id: str):
         """修改失败回调"""
+        if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+            self.modifying_nodes.remove(node_id)
         self.log_console.append(f"<font color='red'>修改内容失败: {error_msg}</font>")
         QMessageBox.critical(self, "错误", f"修改内容过程中发生异常:\n{error_msg}")
         self.btn_save.setEnabled(True)
@@ -1246,16 +1291,28 @@ class NovelTreeMixin:
         valid_nodes = []
         skipped_info = []
         
+        if not hasattr(self, 'modifying_nodes'):
+            self.modifying_nodes = set()
+        
         for item, node in checked_nodes:
             level = get_item_level(item)
             node_id = node.get("id")
+            node_title = node.get('title', '未知')
             
             if level in [1, 2]:
-                skipped_info.append(f"跳过【{node.get('title', '未知')}】：1级/2级节点无正文")
+                skipped_info.append(f"跳过【{node_title}】：1级/2级节点无正文")
                 continue
             
             if self.workspace.has_pending_modify(node_id):
-                skipped_info.append(f"跳过【{node.get('title', '未知')}】：已处于待合并状态")
+                msg = f"跳过【{node_title}】：已处于待合并状态"
+                skipped_info.append(msg)
+                self.log_console.append(f"<font color='orange'>{msg}</font>")
+                continue
+                
+            if node_id in self.modifying_nodes:
+                msg = f"跳过【{node_title}】：正在生成修改中"
+                skipped_info.append(msg)
+                self.log_console.append(f"<font color='orange'>{msg}</font>")
                 continue
             
             # 读取原文，检查是否有正文
@@ -1385,6 +1442,10 @@ class NovelTreeMixin:
         
         self.log_console.append(f"<hr><b>⏳ 正在处理节点: {node_title} (队列剩余 {len(self.batch_modify_queue)} 个)</b>")
         
+        if not hasattr(self, 'modifying_nodes'):
+            self.modifying_nodes = set()
+        self.modifying_nodes.add(node_id)
+        
         # 读取原文
         original_text = ""
         rel_path = next_node.get("file_path")
@@ -1395,6 +1456,8 @@ class NovelTreeMixin:
                     original_text = f.read()
         
         if not original_text:
+            if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+                self.modifying_nodes.remove(node_id)
             self.log_console.append(f"<font color='orange'>跳过【{node_title}】：无正文内容</font>")
             self.batch_modify_fail_count += 1
             self._process_next_batch_modify_node()
@@ -1423,12 +1486,14 @@ class NovelTreeMixin:
             lambda result: self.on_batch_modify_success(result, next_node, node_id, original_text)
         )
         self.batch_modify_thread.error_signal.connect(
-            lambda error: self.on_batch_modify_error(error, node_title)
+            lambda error: self.on_batch_modify_error(error, node_title, node_id)
         )
         self.batch_modify_thread.start()
     
     def on_batch_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str):
         """批量修改单个节点成功回调"""
+        if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+            self.modifying_nodes.remove(node_id)
         try:
             # 保存待合并修改
             self.workspace.save_pending_modify(node_id, original_text, result, self.batch_modify_requirement)
@@ -1443,8 +1508,10 @@ class NovelTreeMixin:
         finally:
             self._process_next_batch_modify_node()
     
-    def on_batch_modify_error(self: "NovelCreatorWindow", error_msg: str, node_title: str):
+    def on_batch_modify_error(self: "NovelCreatorWindow", error_msg: str, node_title: str, node_id: str):
         """批量修改单个节点失败回调"""
+        if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+            self.modifying_nodes.remove(node_id)
         self.batch_modify_fail_count += 1
         self.log_console.append(f"<font color='red'>❌ 节点【{node_title}】修改失败: {error_msg}</font>")
         self._process_next_batch_modify_node()
