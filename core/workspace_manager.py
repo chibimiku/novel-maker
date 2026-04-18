@@ -16,6 +16,9 @@ class WorkspaceManager:
         self.text_path = os.path.join(workspace_path, "正文")
         self.sys_data_path = os.path.join(workspace_path, "系统数据")
         self.pending_modifies_dir = os.path.join(self.sys_data_path, "pending_modifies")
+        self.instruction_profile_file = os.path.join(
+            self.sys_data_path, "instruction_profile.json"
+        )
         
         self.tree_json_file = os.path.join(self.sys_data_path, "outline_tree.json")
         self.setting_dirs = ["公共设定", "人物设定", "名词设定", "地点设定", "其他设定"]
@@ -206,6 +209,24 @@ class WorkspaceManager:
         file_path = os.path.join(self.pending_modifies_dir, f"{node_id}.json")
         if os.path.exists(file_path):
             os.remove(file_path)
+
+    def save_instruction_profile(self, profile: dict) -> None:
+        """保存工作区级别的 instruction 绑定信息。"""
+        os.makedirs(self.sys_data_path, exist_ok=True)
+        with open(self.instruction_profile_file, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=4)
+
+    def load_instruction_profile(self) -> dict | None:
+        """加载工作区级别的 instruction 绑定信息。"""
+        if not os.path.exists(self.instruction_profile_file):
+            return None
+        try:
+            with open(self.instruction_profile_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.error(f"加载 instruction_profile.json 失败: {e}")
+            return None
 
     def get_all_pending_node_ids(self) -> list:
         """获取所有有待合并修改的节点ID列表"""

@@ -13,6 +13,7 @@ from ui.summary_sync_worker import SummarySyncWorker
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QInputDialog,
     QMenu,
@@ -33,10 +34,126 @@ if TYPE_CHECKING:
 class NovelTreeMixin:
     """小说大纲树的渲染、节点交互与大纲自动生成。"""
 
+    def _trace_add_btn(self: "NovelCreatorWindow", msg: str):
+        """统一输出“+新增...”相关调试日志。"""
+        if not getattr(self, "_debug_add_button", False):
+            return
+        text = f"[AddBtnDebug] {msg}"
+        if hasattr(self, "log_console") and self.log_console:
+            self.log_console.append(f"<font color='#9AA0A6'>{text}</font>")
+        else:
+            print(text)
+
+    def set_add_button_debug_enabled(self: "NovelCreatorWindow", enabled: bool):
+        """设置“+新增...”调试日志开关并持久化。"""
+        self._debug_add_button = bool(enabled)
+        self._save_debug_add_button_enabled(self._debug_add_button)
+        if hasattr(self, "log_console") and self.log_console:
+            status = "已开启" if self._debug_add_button else "已关闭"
+            self.log_console.append(f"AddBtn 调试日志{status}。")
+
+    def _get_item_path(self: "NovelCreatorWindow", item) -> str:
+        """返回节点路径，便于调试定位。"""
+        if not item:
+            return "(None)"
+        if item == self.novel_tree.invisibleRootItem():
+            return "(ROOT)"
+        names = []
+        cur = item
+        while cur and cur != self.novel_tree.invisibleRootItem():
+            names.append(cur.text(0))
+            cur = cur.parent()
+        names.reverse()
+        return " / ".join(names) if names else "(ROOT)"
+
+    def _scan_add_button_health(self: "NovelCreatorWindow", stage: str):
+        """扫描整棵树每个可添加子节点的父节点，输出按钮完整性。"""
+        if not getattr(self, "_debug_add_button", False):
+            return
+        root = self.novel_tree.invisibleRootItem()
+        checked = 0
+        issue_count = 0
+
+        def scan(parent_item):
+            nonlocal checked, issue_count
+            child_level = 1 if parent_item == root else get_item_level(parent_item) + 1
+            if child_level > 3:
+                return
+
+            add_count = 0
+            for i in range(parent_item.childCount()):
+                if parent_item.child(i).text(0).startswith("+"):
+                    add_count += 1
+
+            checked += 1
+            path = self._get_item_path(parent_item)
+            real_count, add_count_detail, child_titles = self._get_children_debug_info(parent_item)
+            self._trace_add_btn(
+                f"{stage}: check parent='{path}', child_level={child_level}, "
+                f"childCount={parent_item.childCount()}, realChildCount={real_count}, addBtnCount={add_count_detail}, "
+                f"children={child_titles}"
+            )
+            if add_count_detail != 1:
+                issue_count += 1
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    scan(child)
+
+        scan(root)
+        self._trace_add_btn(f"{stage}: summary checked={checked}, issueParents={issue_count}")
+
+    def _get_full_node_name_from_item(self: "NovelCreatorWindow", item) -> str:
+        """根据树节点回溯完整路径名称（章/节/场景）。"""
+        if not item:
+            return ""
+        names = []
+        cur = item
+        while cur and cur != self.novel_tree.invisibleRootItem():
+            if cur.text(0).startswith("+"):
+                cur = cur.parent()
+                continue
+            node_id = cur.data(0, Qt.ItemDataRole.UserRole)
+            node = self.node_map.get(node_id) if node_id else None
+            title = (node or {}).get("title") or cur.text(0)
+            names.append(title)
+            cur = cur.parent()
+        names.reverse()
+        return " / ".join(names)
+
+    def _update_summary_header(self: "NovelCreatorWindow", full_name: str = ""):
+        """复用概要区既有标题行，按需附加完整节点名称。"""
+        base = "节点概要 (Summary - 保存至系统数据):"
+        label = getattr(self, "summary_title_label", None)
+        if not label:
+            return
+        if full_name:
+            label.setText(f"{base} {full_name}")
+            label.setToolTip(full_name)
+        else:
+            label.setText(base)
+            label.setToolTip(base)
+
+    def _get_children_debug_info(self: "NovelCreatorWindow", parent_item):
+        """返回子节点调试信息：真实子节点数、加号按钮数、标题列表。"""
+        child_titles = []
+        real_count = 0
+        add_count = 0
+        for i in range(parent_item.childCount()):
+            t = parent_item.child(i).text(0)
+            child_titles.append(t)
+            if t.startswith("+"):
+                add_count += 1
+            else:
+                real_count += 1
+        return real_count, add_count, child_titles
+
     # ================= 小说树渲染 ================= #
 
     def _refresh_novel_tree(self: "NovelCreatorWindow"):
         """渲染右侧的小说大纲目录树（带折叠状态记忆）。"""
+        self._trace_add_btn("refresh start")
         
         # 1. 在清空前，记录当前展开的节点 ID
         is_first_load = self.novel_tree.topLevelItemCount() == 0
@@ -88,39 +205,214 @@ class NovelTreeMixin:
 
         # 构建 UI 树
         self._build_novel_tree_ui(nodes_ref, self.novel_tree, level=1)
+        self._scan_add_button_health("after_build")
+        # 兜底自愈：补齐/纠正所有层级的“+新增...”按钮
+        self._ensure_novel_tree_add_buttons()
+        self._scan_add_button_health("after_ensure_all")
         
         # 3. 恢复折叠状态
         if is_first_load:
-            # 如果是初次加载，默认全部展开
-            self.novel_tree.expandAll()
-        else:
-            # 先展开所有顶级节点（章），确保新增的节可见
+            # 首次加载默认展开到“节”层，便于直接看到“+ 新增场景...”
             root = self.novel_tree.invisibleRootItem()
             for i in range(root.childCount()):
                 child = root.child(i)
                 if not child.text(0).startswith("+"):
                     child.setExpanded(True)
-            
-            # 然后恢复之前展开的节点的状态
+                    for j in range(child.childCount()):
+                        sec = child.child(j)
+                        if not sec.text(0).startswith("+"):
+                            sec.setExpanded(True)
+        else:
+            # 非首次加载时严格恢复用户上次的展开/收起状态
             def restore_expanded(parent_item):
                 for i in range(parent_item.childCount()):
                     child = parent_item.child(i)
                     n_id = child.data(0, Qt.ItemDataRole.UserRole)
-                    if n_id and n_id in expanded_ids:
-                        child.setExpanded(True)
-                    elif not n_id:
-                        # 对于没有ID的节点（比如新增的节点），如果有子节点也展开
-                        has_real_children = False
-                        for j in range(child.childCount()):
-                            if not child.child(j).text(0).startswith("+"):
-                                has_real_children = True
-                                break
-                        if has_real_children:
-                            child.setExpanded(True)
-                    # 递归恢复子节点
+                    if n_id:
+                        child.setExpanded(n_id in expanded_ids)
                     restore_expanded(child)
-                    
+
             restore_expanded(self.novel_tree.invisibleRootItem())
+        self._trace_add_btn("refresh done")
+
+    def _ensure_novel_tree_add_buttons(self: "NovelCreatorWindow"):
+        """递归自愈“+新增...”按钮：缺失补齐、重复去重、并固定在末尾。"""
+        titles = {1: "+ 新增章...", 2: "+ 新增节...", 3: "+ 新增场景..."}
+
+        def get_child_level(parent_item) -> int:
+            # parent_item 为不可见根节点时，子节点层级是 1
+            if parent_item == self.novel_tree.invisibleRootItem():
+                return 1
+            return get_item_level(parent_item) + 1
+
+        def ensure_for_parent(parent_item):
+            child_level = get_child_level(parent_item)
+            if child_level > 3:
+                return
+
+            expected_text = titles.get(child_level, "+ 新增节点...")
+            add_btn_indexes = []
+            add_btn_items = []
+            path = self._get_item_path(parent_item)
+            real_count, add_count_detail, child_titles = self._get_children_debug_info(parent_item)
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if child.text(0).startswith("+"):
+                    add_btn_indexes.append(i)
+                    add_btn_items.append(child)
+
+            self._trace_add_btn(
+                f"ensure_all: parent='{path}', child_level={child_level}, "
+                f"childCount={parent_item.childCount()}, realChildCount={real_count}, "
+                f"addBtnFound={len(add_btn_items)}, expected='{expected_text}', children={child_titles}"
+            )
+
+            # 若没有“+”按钮则创建一个；若有多个则只保留最后一个并删除其余。
+            if not add_btn_items:
+                add_btn = QTreeWidgetItem(parent_item, [expected_text])
+                add_btn.setForeground(0, QColor(NODE_ADD_BTN))
+                add_btn.setToolTip(0, expected_text)
+                add_btn.setFlags(
+                    add_btn.flags()
+                    & ~Qt.ItemFlag.ItemIsDragEnabled
+                    & ~Qt.ItemFlag.ItemIsDropEnabled
+                )
+                self._trace_add_btn(
+                    f"ensure_all: create add button parent='{path}', text='{expected_text}'"
+                )
+            else:
+                keep_btn = add_btn_items[-1]
+                keep_btn.setText(0, expected_text)
+                keep_btn.setForeground(0, QColor(NODE_ADD_BTN))
+                keep_btn.setToolTip(0, expected_text)
+                keep_btn.setFlags(
+                    keep_btn.flags()
+                    & ~Qt.ItemFlag.ItemIsDragEnabled
+                    & ~Qt.ItemFlag.ItemIsDropEnabled
+                )
+                self._trace_add_btn(
+                    f"ensure_all: keep/normalize parent='{path}', keepIndex={add_btn_indexes[-1]}, text='{expected_text}'"
+                )
+
+                # 删除多余“+”按钮（从后往前删，避免索引漂移）
+                for idx in reversed(add_btn_indexes[:-1]):
+                    parent_item.takeChild(idx)
+                    self._trace_add_btn(
+                        f"ensure_all: remove duplicate parent='{path}', removedIndex={idx}"
+                    )
+
+                # 将保留按钮移动到末尾
+                idx_keep = -1
+                for i in range(parent_item.childCount()):
+                    if parent_item.child(i) is keep_btn:
+                        idx_keep = i
+                        break
+                if idx_keep != -1 and idx_keep < parent_item.childCount() - 1:
+                    moved = parent_item.takeChild(idx_keep)
+                    parent_item.addChild(moved)
+                    self._trace_add_btn(
+                        f"ensure_all: move-to-tail parent='{path}', fromIndex={idx_keep}"
+                    )
+
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.text(0).startswith("+"):
+                    ensure_for_parent(child)
+
+        ensure_for_parent(self.novel_tree.invisibleRootItem())
+
+    def _ensure_add_button_for_item(self: "NovelCreatorWindow", item):
+        """单节点兜底：确保章/节节点下存在且仅存在一个正确的“+新增...”按钮。"""
+        if not item or item.text(0).startswith("+"):
+            self._trace_add_btn("ensure_one: skip (None or add-button item)")
+            return
+
+        item_level = get_item_level(item)
+        if item_level >= 3:
+            self._trace_add_btn(
+                f"ensure_one: skip level>=3 path='{self._get_item_path(item)}', level={item_level}"
+            )
+            return
+
+        expected_by_level = {1: "+ 新增节...", 2: "+ 新增场景..."}
+        expected_text = expected_by_level.get(item_level)
+        if not expected_text:
+            self._trace_add_btn(
+                f"ensure_one: skip no-expected-text path='{self._get_item_path(item)}', level={item_level}"
+            )
+            return
+
+        add_btn_indexes = []
+        add_btn_items = []
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.text(0).startswith("+"):
+                add_btn_indexes.append(i)
+                add_btn_items.append(child)
+        path = self._get_item_path(item)
+        real_count, _, child_titles = self._get_children_debug_info(item)
+        self._trace_add_btn(
+            f"ensure_one: parent='{path}', level={item_level}, childCount={item.childCount()}, "
+            f"realChildCount={real_count}, addBtnFound={len(add_btn_items)}, expected='{expected_text}', "
+            f"children={child_titles}"
+        )
+        if item_level == 1 and real_count == 0:
+            self._trace_add_btn(
+                f"ensure_one: chapter '{path}' has no real section node yet, only add button."
+            )
+
+        if not add_btn_items:
+            add_btn = QTreeWidgetItem(item, [expected_text])
+            add_btn.setForeground(0, QColor(NODE_ADD_BTN))
+            add_btn.setToolTip(0, expected_text)
+            add_btn.setFlags(
+                add_btn.flags()
+                & ~Qt.ItemFlag.ItemIsDragEnabled
+                & ~Qt.ItemFlag.ItemIsDropEnabled
+            )
+            self._trace_add_btn(
+                f"ensure_one: create parent='{path}', text='{expected_text}'"
+            )
+            return
+
+        keep_btn = add_btn_items[-1]
+        keep_btn.setText(0, expected_text)
+        keep_btn.setForeground(0, QColor(NODE_ADD_BTN))
+        keep_btn.setToolTip(0, expected_text)
+        keep_btn.setFlags(
+            keep_btn.flags()
+            & ~Qt.ItemFlag.ItemIsDragEnabled
+            & ~Qt.ItemFlag.ItemIsDropEnabled
+        )
+        self._trace_add_btn(
+            f"ensure_one: keep/normalize parent='{path}', keepIndex={add_btn_indexes[-1]}"
+        )
+
+        for idx in reversed(add_btn_indexes[:-1]):
+            item.takeChild(idx)
+            self._trace_add_btn(
+                f"ensure_one: remove duplicate parent='{path}', removedIndex={idx}"
+            )
+
+        idx_keep = -1
+        for i in range(item.childCount()):
+            if item.child(i) is keep_btn:
+                idx_keep = i
+                break
+        if idx_keep != -1 and idx_keep < item.childCount() - 1:
+            moved = item.takeChild(idx_keep)
+            item.addChild(moved)
+            self._trace_add_btn(
+                f"ensure_one: move-to-tail parent='{path}', fromIndex={idx_keep}"
+            )
+
+    def on_novel_item_expanded(self: "NovelCreatorWindow", item):
+        """节点展开时执行局部自愈，防止个别节点“+新增...”丢失。"""
+        self._trace_add_btn(
+            f"expanded: path='{self._get_item_path(item)}', level={get_item_level(item) if item else 'N/A'}"
+        )
+        self._ensure_add_button_for_item(item)
 
     def _build_novel_tree_ui(
         self: "NovelCreatorWindow", nodes: list, parent_widget, level: int = 1
@@ -164,6 +456,7 @@ class NovelTreeMixin:
             node_id = node.get("id")
             self.node_map[node_id] = node
             item.setData(0, Qt.ItemDataRole.UserRole, node_id)
+            item.setToolTip(0, self._get_full_node_name_from_item(item))
 
             status = node.get("_status", "ok")
             file_path = node.get("file_path")
@@ -201,11 +494,17 @@ class NovelTreeMixin:
 
             self._build_novel_tree_ui(node["children"], item, level + 1)
 
+        # 用父节点在树中的真实深度决定按钮文案，避免层级参数偏移导致按钮错误/缺失
         titles = {1: "+ 新增章...", 2: "+ 新增节...", 3: "+ 新增场景..."}
-        btn_text = titles.get(level, "+ 新增节点...")
+        if parent_widget == self.novel_tree:
+            add_level = 1
+        else:
+            add_level = get_item_level(parent_widget) + 1
+        btn_text = titles.get(add_level, "+ 新增节点...")
 
         add_btn = QTreeWidgetItem(parent_widget, [btn_text])
         add_btn.setForeground(0, QColor(NODE_ADD_BTN))
+        add_btn.setToolTip(0, btn_text)
         add_btn.setFlags(
             add_btn.flags()
             & ~Qt.ItemFlag.ItemIsDragEnabled
@@ -271,6 +570,96 @@ class NovelTreeMixin:
             self._pre_drag_tree_snapshot = None
         
         self.log_console.append("系统通知：节点位置结构已自动保存。")
+
+    def auto_fix_outline_for_scene_addition(self: "NovelCreatorWindow"):
+        """一键修复：给没有“节”子节点的章（含序章）补默认节，便于新增场景。"""
+        if not self.workspace:
+            QMessageBox.information(
+                self, "提示", "请先加载工作区。"  # type: ignore[arg-type]
+            )
+            return
+
+        if self.outline_tree_data is None:
+            self.outline_tree_data = self.workspace.load_outline_tree()
+        nodes = self.outline_tree_data.setdefault("nodes", [])
+
+        changed = False
+        fixed_titles = []
+        normalized_sections = 0
+        fixed_section_ids = []
+
+        for chapter in nodes:
+            if not isinstance(chapter, dict):
+                continue
+
+            chapter_title = chapter.get("title", "未命名章")
+            children = chapter.get("children")
+            if not isinstance(children, list):
+                children = []
+                chapter["children"] = children
+                changed = True
+
+            # 核心修复：章下没有任何节时，自动补一个空节（包含序章）。
+            if len(children) == 0:
+                new_section = {
+                    "id": str(uuid.uuid4()),
+                    "title": "第1节",
+                    "summary": "",
+                    "children": [],
+                    "_status": "ok",
+                }
+                children.append(new_section)
+                fixed_titles.append(chapter_title)
+                fixed_section_ids.append(new_section["id"])
+                changed = True
+                self._trace_add_btn(
+                    f"repair_action: add default section for chapter='{chapter_title}'"
+                )
+
+            # 兼容老数据：保证每个“节”至少有 children 字段，便于显示“+新增场景...”
+            for section in children:
+                if isinstance(section, dict) and not isinstance(section.get("children"), list):
+                    section["children"] = []
+                    normalized_sections += 1
+                    changed = True
+
+        if not changed:
+            QMessageBox.information(
+                self, "修复结果", "未发现需要修复的章结构。当前已可直接新增节/场景。"  # type: ignore[arg-type]
+            )
+            self.log_console.append("结构修复：未发现异常，无需修改。")
+            return
+
+        self.workspace.save_outline_tree(self.outline_tree_data)
+        self._refresh_novel_tree()
+
+        # 修复后自动展开相关节点，确保“+ 新增场景...”立即可见
+        root = self.novel_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            ch_item = root.child(i)
+            if ch_item.text(0).startswith("+"):
+                continue
+            if ch_item.text(0) in fixed_titles:
+                ch_item.setExpanded(True)
+                for j in range(ch_item.childCount()):
+                    sec_item = ch_item.child(j)
+                    if sec_item.text(0).startswith("+"):
+                        continue
+                    sec_id = sec_item.data(0, Qt.ItemDataRole.UserRole)
+                    if sec_id in fixed_section_ids:
+                        sec_item.setExpanded(True)
+
+        msg_parts = []
+        if fixed_titles:
+            msg_parts.append(f"已补齐空节的章：{', '.join(fixed_titles)}")
+        if normalized_sections:
+            msg_parts.append(f"已规范化节节点 children 字段：{normalized_sections} 处")
+        final_msg = "；".join(msg_parts) if msg_parts else "结构修复完成。"
+
+        self.log_console.append(f"结构修复完成：{final_msg}")
+        QMessageBox.information(
+            self, "修复完成", final_msg  # type: ignore[arg-type]
+        )
 
     def _build_node_data_from_item(self: "NovelCreatorWindow", item, all_nodes_dict=None, original_parent_data=None):
         node_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -354,6 +743,11 @@ class NovelTreeMixin:
         # === 拦截并处理 “+新增” 按钮 ===
         if item.text(0).startswith("+"):
             parent_item = item.parent()
+            parent_path = self._get_item_path(parent_item) if parent_item else "(ROOT)"
+            self._trace_add_btn(
+                f"click_add: text='{item.text(0)}', parent='{parent_path}', "
+                f"parentLevel={get_item_level(parent_item) if parent_item else 0}"
+            )
             if parent_item:
                 parent_node_id = parent_item.data(0, Qt.ItemDataRole.UserRole)
                 real_parent_node = self.node_map.get(parent_node_id)
@@ -379,6 +773,7 @@ class NovelTreeMixin:
         self.current_editing_item = item
         self.current_setting_path = None
         node_level = get_item_level(item)
+        self._update_summary_header(self._get_full_node_name_from_item(item))
         
         # 重置回退缓冲区
         self.undo_stack = []
@@ -407,8 +802,6 @@ class NovelTreeMixin:
         self.summary_editor.setEnabled(True)
         self.btn_save.setEnabled(True)
         self.btn_regenerate_summary.setEnabled(True)
-        self.btn_select_all.setEnabled(True)
-        self.btn_select_none.setEnabled(True)
 
         # 2. 加载正文 (仅对第3级开放)
         if node_level == 3:
@@ -529,6 +922,28 @@ class NovelTreeMixin:
 
     # ================= 小说大纲右键菜单 ================= #
 
+    def expand_all_novel_nodes(self: "NovelCreatorWindow"):
+        if not self.workspace:
+            return
+        self.novel_tree.expandAll()
+
+    def collapse_all_novel_nodes(self: "NovelCreatorWindow"):
+        if not self.workspace:
+            return
+        self.novel_tree.collapseAll()
+
+    def expand_single_novel_node(self: "NovelCreatorWindow", item):
+        if not item or item.text(0).startswith("+"):
+            return
+        if item.childCount() > 0:
+            item.setExpanded(True)
+
+    def collapse_single_novel_node(self: "NovelCreatorWindow", item):
+        if not item or item.text(0).startswith("+"):
+            return
+        if item.childCount() > 0:
+            item.setExpanded(False)
+
     def show_novel_context_menu(self: "NovelCreatorWindow", position):
         if not self.workspace:
             return
@@ -570,6 +985,27 @@ class NovelTreeMixin:
             if real_node:
                 level = get_item_level(item)
                 has_pending = self.workspace.has_pending_modify(node_id) if node_id else False
+
+                select_all_action = menu.addAction("✅ 全选")
+                select_all_action.triggered.connect(self.select_all_nodes)
+                select_none_action = menu.addAction("⬜ 全不选")
+                select_none_action.triggered.connect(self.select_none_nodes)
+                expand_all_action = menu.addAction("⬇️ 展开全部")
+                expand_all_action.triggered.connect(self.expand_all_novel_nodes)
+                collapse_all_action = menu.addAction("⬆️ 收起全部")
+                collapse_all_action.triggered.connect(self.collapse_all_novel_nodes)
+                menu.addSeparator()
+
+                if item.childCount() > 0:
+                    expand_action = menu.addAction("⬇️ 展开此节点")
+                    expand_action.triggered.connect(lambda checked=False, target=item: self.expand_single_novel_node(target))
+                    collapse_action = menu.addAction("⬆️ 收起此节点")
+                    collapse_action.triggered.connect(lambda checked=False, target=item: self.collapse_single_novel_node(target))
+                    if item.isExpanded():
+                        expand_action.setEnabled(False)
+                    else:
+                        collapse_action.setEnabled(False)
+                    menu.addSeparator()
                 
                 # 只对1级和2级节点添加增加子节点的选项
                 if level in [1, 2]:
@@ -735,7 +1171,13 @@ class NovelTreeMixin:
                 self.btn_save.setEnabled(False)
 
                 checked_paths = self.get_checked_settings()
-                builder = ContextBuilder(self.workspace)
+                text_cfg = (self.config or {}).get("text_api", {})
+                builder = ContextBuilder(
+                    self.workspace,
+                    model_context_size=text_cfg.get("model_context_size"),
+                    model_capabilities=text_cfg.get("model_capabilities", []),
+                    compression_profile=text_cfg.get("world_context_compression_profile", "balanced"),
+                )
                 settings_text = builder._build_settings_text(checked_paths)
 
                 default_prompt = ""
@@ -886,7 +1328,13 @@ class NovelTreeMixin:
         
         try:
             # 构建上下文
-            builder = ContextBuilder(self.workspace)
+            text_cfg = (self.config or {}).get("text_api", {})
+            builder = ContextBuilder(
+                self.workspace,
+                model_context_size=text_cfg.get("model_context_size"),
+                model_capabilities=text_cfg.get("model_capabilities", []),
+                compression_profile=text_cfg.get("world_context_compression_profile", "balanced"),
+            )
             checked_paths = self.get_checked_settings()
             
             # 获取父节点和同级节点
@@ -1070,7 +1518,7 @@ class NovelTreeMixin:
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
 
         class ModifyRequestDialog(QDialog):
-            def __init__(self, parent, node_title):
+            def __init__(self, parent, node_title, append_writing_style_default: bool):
                 super().__init__(parent)
                 self.setWindowTitle(f"修改内容 - {node_title}")
                 self.setMinimumWidth(600)
@@ -1083,6 +1531,10 @@ class NovelTreeMixin:
                 self.requirement_edit = QTextEdit()
                 self.requirement_edit.setPlaceholderText("例如：将这段内容的语气改得更加轻松幽默，或者增加一些环境描写...")
                 layout.addWidget(self.requirement_edit)
+
+                self.append_writing_style_cb = QCheckBox("附加当前写作风格（写作Instruction）")
+                self.append_writing_style_cb.setChecked(bool(append_writing_style_default))
+                layout.addWidget(self.append_writing_style_cb)
 
                 btn_layout = QHBoxLayout()
                 btn_layout.addStretch()
@@ -1102,13 +1554,50 @@ class NovelTreeMixin:
             def get_requirement(self):
                 return self.requirement_edit.toPlainText().strip()
 
-        dialog = ModifyRequestDialog(self, real_node.get("title", "未知节点"))
+            def should_append_writing_style(self):
+                return self.append_writing_style_cb.isChecked()
+
+        dialog = ModifyRequestDialog(
+            self,
+            real_node.get("title", "未知节点"),
+            bool(getattr(self, "_append_writing_style_on_modify", False)),
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             requirement = dialog.get_requirement()
             if requirement:
-                self.start_modify_content(real_node, node_id, requirement)
+                append_writing_style = dialog.should_append_writing_style()
+                self._append_writing_style_on_modify = append_writing_style
+                self._save_modify_style_option(append_writing_style)
+                self._save_workspace_instruction_profile()
+                self.start_modify_content(
+                    real_node, node_id, requirement, append_writing_style
+                )
 
-    def start_modify_content(self: "NovelCreatorWindow", real_node: dict, node_id: str, requirement: str):
+    def _build_modify_system_instruction(
+        self: "NovelCreatorWindow", append_writing_style: bool
+    ) -> str:
+        text_cfg = (self.config or {}).get("text_api", {})
+        modify_instruction = text_cfg.get(
+            "modify_instructions", self._get_default_modify_instruction()
+        )
+        writing_instruction = text_cfg.get(
+            "instructions", self._get_default_writing_instruction()
+        )
+        if append_writing_style:
+            return (
+                f"{modify_instruction}\n\n"
+                "【附加要求】在执行修改时，必须继续遵循当前写作风格 Instruction：\n"
+                f"{writing_instruction}"
+            )
+        return modify_instruction
+
+    def start_modify_content(
+        self: "NovelCreatorWindow",
+        real_node: dict,
+        node_id: str,
+        requirement: str,
+        append_writing_style: bool = False,
+    ):
         """开始修改内容的LLM请求"""
         if not self.llm_client:
             QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
@@ -1164,9 +1653,19 @@ class NovelTreeMixin:
 4. 如果原文有标题（# 开头），请保留
 """
 
+        modify_system_instruction = self._build_modify_system_instruction(
+            append_writing_style
+        )
+        mode_text = "编辑Instruction + 写作风格" if append_writing_style else "仅编辑Instruction"
+        self.log_console.append(
+            f"<font color='gray'>本次修改使用系统指令模式：{mode_text}</font>"
+        )
+
         # 发送请求
         from ui.workers import GenerateTaskThread
-        self.modify_thread = GenerateTaskThread(self.llm_client, prompt)
+        self.modify_thread = GenerateTaskThread(
+            self.llm_client, prompt, modify_system_instruction
+        )
         self.modify_thread.success_signal.connect(lambda result: self.on_modify_success(result, real_node, node_id, original_text, requirement))
         self.modify_thread.error_signal.connect(lambda error: self.on_modify_error(error, node_id))
         self.modify_thread.start()

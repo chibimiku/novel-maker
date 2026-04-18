@@ -2,6 +2,7 @@
 暗色主题样式表模块
 提供精心调校的 QSS 暗色主题，适配 AI小说创作器的所有组件。
 """
+import os
 
 # ===================== 调色板常量 =====================
 # 背景层级（由深到浅）
@@ -42,6 +43,14 @@ NODE_NORMAL  = "#e0e0e0"   # 正常节点文字
 NODE_MISSING = "#78909c"   # 缺失文件（柔灰蓝）
 NODE_ERROR   = "#ef5350"   # 外部修改/异常
 NODE_ADD_BTN = "#64b5f6"   # "+ 新增" 按钮
+
+# 主题图标路径（使用 file URL，确保 QSS 可直接加载）
+_THEME_DIR = os.path.dirname(os.path.abspath(__file__))
+_ICONS_DIR = os.path.join(_THEME_DIR, "icons")
+# QSS 在 Windows 下对 file:/// 前缀兼容性不稳定，这里直接使用绝对路径（正斜杠）
+_TREE_ARROW_RIGHT = os.path.join(_ICONS_DIR, "tree-expand-right.svg").replace("\\", "/")
+_TREE_ARROW_DOWN = os.path.join(_ICONS_DIR, "tree-expand-down.svg").replace("\\", "/")
+_CHECKMARK_ICON = os.path.join(_ICONS_DIR, "checkmark.svg").replace("\\", "/")
 
 # ===================== QSS 样式表 =====================
 
@@ -205,6 +214,14 @@ QTreeWidget::branch {{
     background-color: transparent;
 }}
 
+QTreeWidget::branch:closed:has-children {{
+    image: url("{_TREE_ARROW_RIGHT}");
+}}
+
+QTreeWidget::branch:open:has-children {{
+    image: url("{_TREE_ARROW_DOWN}");
+}}
+
 QTreeWidget::branch:has-siblings:!adjoins-item {{
     border-image: none;
 }}
@@ -253,11 +270,11 @@ QCheckBox {{
 }}
 
 QCheckBox::indicator {{
-    width: 18px;
-    height: 18px;
-    border: 2px solid {BORDER};
-    border-radius: 4px;
-    background-color: {BG_ELEVATED};
+    width: 14px;
+    height: 14px;
+    border: 1px solid {TEXT_SECONDARY};
+    border-radius: 3px;
+    background-color: {BG_SURFACE};
 }}
 
 QCheckBox::indicator:hover {{
@@ -267,9 +284,33 @@ QCheckBox::indicator:hover {{
 QCheckBox::indicator:checked {{
     background-color: {ACCENT};
     border-color: {ACCENT};
+    image: url("{_CHECKMARK_ICON}");
 }}
 
 QCheckBox::indicator:checked:hover {{
+    background-color: {ACCENT_HOVER};
+    border-color: {ACCENT_HOVER};
+}}
+
+QTreeWidget::indicator {{
+    width: 14px;
+    height: 14px;
+    border: 1px solid {TEXT_SECONDARY};
+    border-radius: 3px;
+    background-color: {BG_SURFACE};
+}}
+
+QTreeWidget::indicator:hover {{
+    border-color: {ACCENT};
+}}
+
+QTreeWidget::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    image: url("{_CHECKMARK_ICON}");
+}}
+
+QTreeWidget::indicator:checked:hover {{
     background-color: {ACCENT_HOVER};
     border-color: {ACCENT_HOVER};
 }}

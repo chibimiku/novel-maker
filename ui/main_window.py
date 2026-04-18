@@ -8,9 +8,10 @@ import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
-                             QLabel, QCheckBox, QSpinBox, QAbstractItemView)
-from PyQt6.QtGui import QKeySequence, QAction, QShortcut
-from PyQt6.QtCore import Qt, QTimer
+                             QLabel, QCheckBox, QSpinBox, QAbstractItemView,
+                             QProxyStyle, QStyle, QSizePolicy)
+from PyQt6.QtGui import QKeySequence, QAction, QShortcut, QCloseEvent
+from PyQt6.QtCore import Qt, QTimer, QEvent
 
 # 导入暗色主题配色常量
 from ui.theme import TEXT_SECONDARY
@@ -161,6 +162,25 @@ class NovelTreeWidget(QTreeWidget):
             else:
                 self._rescue_add_button_children(child)
 
+
+class CompactTreeStyle(QProxyStyle):
+    """紧凑树样式：缩小复选框、展开箭头与缩进，提升可视空间。"""
+    def __init__(self, base_style=None, indicator_size=12, indentation=14):
+        super().__init__(base_style)
+        self._indicator_size = indicator_size
+        self._indentation = indentation
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric in (
+            QStyle.PixelMetric.PM_IndicatorWidth,
+            QStyle.PixelMetric.PM_IndicatorHeight,
+            QStyle.PixelMetric.PM_SmallIconSize,
+        ):
+            return self._indicator_size
+        if metric == QStyle.PixelMetric.PM_TreeViewIndentation:
+            return self._indentation
+        return super().pixelMetric(metric, option, widget)
+
 class NovelCreatorWindow(
     EditorMixin,
     GenerationMixin,
@@ -187,6 +207,7 @@ class NovelCreatorWindow(
         # 批量生成相关的状态变量
         self.batch_generate_queue = []
         self.is_batch_generating = False
+        self._is_batch_generation_context = False
         
         # 回退缓冲区相关变量
         self.undo_stack = []              # 回退缓冲区，最多保存20次变更
@@ -196,11 +217,19 @@ class NovelCreatorWindow(
         
         # 拖拽前的树数据快照
         self._pre_drag_tree_snapshot = None
+        # “+新增...”调试日志开关（持久化）
+        self._debug_add_button = self._get_debug_add_button_enabled()
+        # “修改内容”时是否附加写作风格（持久化）
+        self._append_writing_style_on_modify = self._get_modify_style_option()
 
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config) if self.config else None
 
         self.init_ui()
+        self._ui_state_save_timer = QTimer(self)
+        self._ui_state_save_timer.setSingleShot(True)
+        self._ui_state_save_timer.timeout.connect(self._save_window_ui_state)
+        self._restore_window_ui_state()
 
         # 自动加载最近的工作区
         sys_state = self._load_sys_state()
@@ -249,6 +278,12 @@ class NovelCreatorWindow(
         tool_menu = menubar.addMenu('工具')
         import_text_action = tool_menu.addAction('从文本新建工作区')
         import_text_action.triggered.connect(self.new_workspace_from_text)
+        repair_outline_action = tool_menu.addAction('修复章节结构(补节后可新增场景)')
+        repair_outline_action.triggered.connect(self.auto_fix_outline_for_scene_addition)
+        debug_add_btn_action = tool_menu.addAction('显示AddBtn调试日志')
+        debug_add_btn_action.setCheckable(True)
+        debug_add_btn_action.setChecked(self._debug_add_button)
+        debug_add_btn_action.toggled.connect(self.set_add_button_debug_enabled)
         timeline_action = tool_menu.addAction('时间线校对')
         timeline_action.triggered.connect(self.open_timeline_dialog)
 
@@ -257,8 +292,14 @@ class NovelCreatorWindow(
         main_layout = QVBoxLayout(main_widget)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(True)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, True)
+        splitter.setCollapsible(2, True)
+        self.main_splitter = splitter
 
         self.setting_tree = QTreeWidget()
+        self.setting_tree.setMinimumWidth(0)
         self.setting_tree.setHeaderLabel("世界观设定")
         self.setting_tree.itemClicked.connect(self.on_setting_node_clicked)
         self.setting_tree.itemChanged.connect(self.on_setting_item_changed)
@@ -268,12 +309,21 @@ class NovelCreatorWindow(
 
         # 使用我们自定义的 NovelTreeWidget
         self.novel_tree = NovelTreeWidget()
+        self.novel_tree.setMinimumWidth(0)
         self.novel_tree.main_window = self  # 绑定主窗口引用
         self.novel_tree.setHeaderLabel("小说大纲结构")
+        self.novel_tree.setItemsExpandable(True)
+        self.novel_tree.setRootIsDecorated(True)
+        self.novel_tree.setExpandsOnDoubleClick(True)
+        self.novel_tree.setStyle(
+            CompactTreeStyle(self.novel_tree.style(), indicator_size=12, indentation=14)
+        )
+        self.novel_tree.setStyleSheet("QTreeWidget { font-size: 12px; }")
 
         self.novel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.novel_tree.customContextMenuRequested.connect(self.show_novel_context_menu)
         self.novel_tree.itemChanged.connect(self.on_novel_item_changed)
+        self.novel_tree.itemExpanded.connect(self.on_novel_item_expanded)
 
         self.rename_shortcut = QShortcut(QKeySequence("F2"), self.novel_tree)
         self.rename_shortcut.activated.connect(self.rename_current_node)
@@ -288,15 +338,18 @@ class NovelCreatorWindow(
 
         # ================= 右侧：拆分概要与正文区 =================
         detail_widget = QWidget()
+        detail_widget.setMinimumWidth(0)
         detail_layout = QVBoxLayout(detail_widget)
 
         editor_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.editor_splitter = editor_splitter
 
         # 上半部：概要 (保存在 JSON 中)
         summary_widget = QWidget()
         summary_layout = QVBoxLayout(summary_widget)
         summary_layout.setContentsMargins(0, 0, 0, 0)
-        summary_layout.addWidget(QLabel("节点概要 (Summary - 保存至系统数据):"))
+        self.summary_title_label = QLabel("节点概要 (Summary - 保存至系统数据):")
+        summary_layout.addWidget(self.summary_title_label)
         self.summary_editor = QTextEdit()
         self.summary_editor.setEnabled(False)
         summary_layout.addWidget(self.summary_editor)
@@ -349,8 +402,6 @@ class NovelCreatorWindow(
 
         # 底部按钮
         btn_layout = QHBoxLayout()
-        self.btn_select_all = QPushButton("全选")
-        self.btn_select_none = QPushButton("全不选")
         self.btn_batch_generate = QPushButton("🚀 批量生成缺失场景")
         self.btn_generate = QPushButton("🔄 结合上下文生成正文")
         self.btn_rewrite = QPushButton("✍️ 基于原文重写(扩/缩)")
@@ -359,8 +410,6 @@ class NovelCreatorWindow(
         self.btn_save = QPushButton("💾 保存当前节点")
         self.btn_delete = QPushButton("🗑️ 删除当前节点")
 
-        self.btn_select_all.clicked.connect(self.select_all_nodes)
-        self.btn_select_none.clicked.connect(self.select_none_nodes)
         self.btn_batch_generate.clicked.connect(self.start_batch_generate)
         self.btn_generate.clicked.connect(self.generate_current_node)
         self.btn_rewrite.clicked.connect(self.rewrite_current_node)
@@ -369,17 +418,24 @@ class NovelCreatorWindow(
         self.btn_save.clicked.connect(self.save_current_node)
         self.btn_delete.clicked.connect(self.delete_current_node)
 
-        self.btn_select_all.setEnabled(False)
-        self.btn_select_none.setEnabled(False)
         self.btn_generate.setEnabled(False)
         self.btn_rewrite.setEnabled(False)
         self.btn_regenerate_summary.setEnabled(False)
         self.btn_undo.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_delete.setEnabled(False)
+        compact_buttons = [
+            self.btn_batch_generate,
+            self.btn_generate,
+            self.btn_rewrite,
+            self.btn_regenerate_summary,
+            self.btn_undo,
+            self.btn_save,
+            self.btn_delete,
+        ]
+        for btn in compact_buttons:
+            btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
-        btn_layout.addWidget(self.btn_select_all)
-        btn_layout.addWidget(self.btn_select_none)
         btn_layout.addWidget(self.btn_batch_generate)
         btn_layout.addWidget(self.btn_generate)
         btn_layout.addWidget(self.btn_rewrite)
@@ -390,7 +446,12 @@ class NovelCreatorWindow(
         detail_layout.addLayout(btn_layout)
 
         splitter.addWidget(detail_widget)
-        splitter.setSizes([200, 300, 700])
+        splitter.setSizes([180, 430, 590])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 3)
+        splitter.splitterMoved.connect(self._schedule_window_ui_state_save)
+        editor_splitter.splitterMoved.connect(self._schedule_window_ui_state_save)
         main_layout.addWidget(splitter, stretch=4)
 
         self.log_console = QTextBrowser()
@@ -402,11 +463,27 @@ class NovelCreatorWindow(
 
     def _handle_drop_sync(self):
         """处理拖放动作完成后的数据同步与 UI 安全刷新"""
+        current_id = None
+        current_item = self.novel_tree.currentItem()
+        if current_item and not current_item.text(0).startswith("+"):
+            current_id = current_item.data(0, Qt.ItemDataRole.UserRole)
+
         # 1. 整理 UI：将可能被挤到上面的 "+" 按钮重新沉降到底部
         self._cleanup_tree_add_buttons()
         
         # 2. 反向同步：从已经排序好的完美 UI 树中提取数据，覆盖保存到 JSON 中
         self.sync_tree_data_from_ui()
+
+        # 3. 重新渲染整棵树，确保每个父节点都补齐 "+" 占位按钮
+        self._refresh_novel_tree()
+
+        # 4. 尝试恢复拖拽前/后的当前选中项，避免刷新后焦点丢失
+        if current_id:
+            from ui.utils import find_item_by_data
+            item = find_item_by_data(self.novel_tree.invisibleRootItem(), current_id)
+            if item:
+                self.novel_tree.setCurrentItem(item)
+                self.current_editing_item = item
 
     def undo_last_change(self):
         """回退到最近一次变更前的状态"""
@@ -466,13 +543,13 @@ class NovelCreatorWindow(
         self.current_setting_path = None
         self.summary_editor.clear()
         self.summary_editor.setEnabled(False)
+        self.summary_title_label.setText("节点概要 (Summary - 保存至系统数据):")
+        self.summary_title_label.setToolTip("节点概要 (Summary - 保存至系统数据):")
         self.content_editor.clear()
         self.content_editor.setEnabled(False)
         self.word_count_label.setText("当前字数: 0")
         
         # 禁用相关按钮
-        self.btn_select_all.setEnabled(False)
-        self.btn_select_none.setEnabled(False)
         self.btn_generate.setEnabled(False)
         self.btn_rewrite.setEnabled(False)
         self.btn_regenerate_summary.setEnabled(False)
@@ -486,9 +563,6 @@ class NovelCreatorWindow(
         # 渲染小说大纲树（来自 NovelTreeMixin）
         self._refresh_novel_tree()
         
-        # 启用全选和全不选按钮
-        self.btn_select_all.setEnabled(True)
-        self.btn_select_none.setEnabled(True)
 
     def on_novel_item_changed(self, item, column):
         """处理小说大纲树节点的勾选状态变化，实现 Windows 风格的勾选逻辑"""
@@ -586,6 +660,27 @@ class NovelCreatorWindow(
         # 打开时间线校对窗口
         dialog = TimelineDialog(self.outline_tree_data, self, self.workspace)
         dialog.exec()
+
+    def closeEvent(self, event: QCloseEvent):
+        self._save_window_ui_state()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event):
+        self._schedule_window_ui_state_save()
+        super().resizeEvent(event)
+
+    def moveEvent(self, event):
+        self._schedule_window_ui_state_save()
+        super().moveEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._schedule_window_ui_state_save()
+        super().changeEvent(event)
+
+    def _schedule_window_ui_state_save(self, *args):
+        if hasattr(self, "_ui_state_save_timer"):
+            self._ui_state_save_timer.start(350)
 
 
 if __name__ == '__main__':

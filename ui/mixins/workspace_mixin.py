@@ -582,6 +582,7 @@ class WorkspaceMixin:
 
             self.log_console.append(f"成功加载工作区: {folder_path}")
             self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
+            self._apply_workspace_instruction_profile()
 
             self.refresh_ui_from_workspace()
         except Exception as e:

@@ -1,16 +1,29 @@
 import os
 import json
 import logging
+from core.world_context_compressor import WorldContextCompressor, WorldSettingNode
 
 logger = logging.getLogger(__name__)
 
 class ContextBuilder:
-    def __init__(self, workspace_manager):
+    def __init__(
+        self,
+        workspace_manager,
+        model_context_size: int | None = None,
+        model_capabilities: list[str] | None = None,
+        compression_profile: str | None = None,
+    ):
         """
         初始化上下文构建器
         :param workspace_manager: WorkspaceManager 实例，用于读取本地文件
         """
         self.workspace = workspace_manager
+        self.world_compressor = WorldContextCompressor(
+            model_context_size=model_context_size,
+            model_capabilities=model_capabilities,
+            compression_profile=compression_profile,
+        )
+        self._compression_profile = self.world_compressor.compression_profile
 
     # 修改 context_builder.py，在类中新增以下方法：
 
@@ -83,7 +96,7 @@ class ContextBuilder:
         if not setting_paths:
             return "（无特定世界观设定）"
 
-        text_blocks = []
+        nodes: list[WorldSettingNode] = []
         for path in setting_paths:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
@@ -91,19 +104,39 @@ class ContextBuilder:
                 
                 setting_name = os.path.basename(path).replace(".json", "")
                 cat_name = os.path.basename(os.path.dirname(path))
-                
-                text_blocks.append(f"【{cat_name} - {setting_name}】")
-                for key, value in data.items():
-                    # 特别处理字典或列表类型的复合设定值
-                    if isinstance(value, str) and value.strip():  
-                        text_blocks.append(f"- {key}: {value}")
-                    elif isinstance(value, (dict, list)):
-                        text_blocks.append(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
-                text_blocks.append("") 
+                if isinstance(data, dict):
+                    nodes.append(
+                        WorldSettingNode(
+                            category=cat_name,
+                            name=setting_name,
+                            payload=data,
+                            priority=self._estimate_setting_priority(cat_name, data),
+                        )
+                    )
+                else:
+                    logger.warning(f"设定文件格式非 JSON 对象，已跳过: {path}")
             except Exception as e:
                 logger.error(f"读取设定文件失败 {path}: {e}")
-                
-        return "\n".join(text_blocks)
+
+        return self.world_compressor.compress(nodes)
+
+    def _estimate_setting_priority(self, category: str, data: dict) -> float:
+        """根据设定类型和字段密度，粗略估计压缩时优先级。"""
+        base_by_category = {
+            "人物设定": 1.35,
+            "公共设定": 1.25,
+            "地点设定": 1.15,
+            "名词设定": 1.05,
+            "其他设定": 1.0,
+        }
+        base = base_by_category.get(category, 1.0)
+        filled_fields = 0
+        for value in data.values():
+            if isinstance(value, str) and value.strip():
+                filled_fields += 1
+            elif isinstance(value, (list, dict)) and value:
+                filled_fields += 1
+        return base + min(0.8, filled_fields * 0.05)
 
     def _find_node_context(self, nodes: list, target_node: dict):
         """
@@ -140,50 +173,115 @@ class ContextBuilder:
         return parents, prev_node, next_node
 
     def _build_outline_context_text(self, parents: list, prev_node: dict, next_node: dict) -> str:
-        """构建上级大纲（概要）和前后文（概要+正文片段）的提示词文本"""
-        blocks = []
-        
-        # 1. 父级节点（章、节）：只读取字典里的 summary
+        """
+        构建上级大纲（概要）和前后文（概要+正文片段）的提示词文本。
+        注意：父级（1/2级）概要始终原样保留，不做压缩；
+        仅在预算不足时压缩相邻场景（prev/next）的概要文本。
+        """
+        blocks: list[str] = []
+
+        # 1) 父级节点（章、节）不压缩
         if parents:
             blocks.append("【所属章节大纲】")
             for p in parents:
                 title = p.get("title", "未命名")
                 summary = p.get("summary", "").strip() or "(该层级无概要)"
                 blocks.append(f"<{title}> 概要:\n{summary}\n")
+        parent_text_len = len("\n".join(blocks))
 
-        # 2. 上一相邻节点：读取 summary，并读取 MD 文件末尾作为文风和情节衔接
+        adjacent_items: list[dict] = []
         if prev_node:
-            prev_title = prev_node.get("title")
-            prev_summary = prev_node.get("summary", "").strip()
             prev_content = self._read_node_content(prev_node).strip()
-            
-            blocks.append(f"【上一相邻场景: {prev_title}】")
-            
-            # 【修复点 3】：强制输出概要，即使为空也给占位提示，确保上下文结构完整
-            blocks.append(f"剧情概要: {prev_summary if prev_summary else '(本场景暂无概要)'}")
-            
-            if prev_content:
-                # 截取最后 500 个字符用于衔接
-                tail = prev_content[-500:] if len(prev_content) > 500 else prev_content
-                blocks.append(f"正文结尾参考:\n...{tail}\n")
-
-        # 3. 下一相邻节点：同理，读取 MD 文件开头
+            adjacent_items.append(
+                {
+                    "label": f"【上一相邻场景: {prev_node.get('title')}】",
+                    "summary": prev_node.get("summary", "").strip(),
+                    "content_ref": (
+                        prev_content[-500:] if len(prev_content) > 500 else prev_content
+                    ),
+                    "content_prefix": "正文结尾参考:\n...",
+                    "content_suffix": "\n",
+                }
+            )
         if next_node:
-            next_title = next_node.get("title")
-            next_summary = next_node.get("summary", "").strip()
             next_content = self._read_node_content(next_node).strip()
-            
-            blocks.append(f"【下一相邻场景: {next_title}】")
-            
-            # 【修复点 3】：同上，强制输出下一场景的概要
-            blocks.append(f"剧情概要: {next_summary if next_summary else '(本场景暂无概要)'}")
-            
-            if next_content:
-                # 截取开篇 300 个字符
-                head = next_content[:300] if len(next_content) > 300 else next_content
-                blocks.append(f"正文开篇参考:\n{head}...\n")
+            adjacent_items.append(
+                {
+                    "label": f"【下一相邻场景: {next_node.get('title')}】",
+                    "summary": next_node.get("summary", "").strip(),
+                    "content_ref": (
+                        next_content[:300] if len(next_content) > 300 else next_content
+                    ),
+                    "content_prefix": "正文开篇参考:\n",
+                    "content_suffix": "...\n",
+                }
+            )
+
+        summary_limit = None
+        if adjacent_items:
+            raw_adjacent_len = 0
+            for item in adjacent_items:
+                raw_adjacent_len += (
+                    len(item["label"])
+                    + len(item["summary"])
+                    + len(item["content_ref"])
+                    + 64
+                )
+            available = max(
+                320, self._get_outline_adjacent_budget_chars() - parent_text_len
+            )
+            if raw_adjacent_len > available:
+                summary_limit = self._get_adjacent_summary_limit(
+                    available_chars=available,
+                    summary_count=len(adjacent_items),
+                )
+
+        # 2) 相邻场景：按需压缩概要（仅概要，父级不动）
+        for item in adjacent_items:
+            blocks.append(item["label"])
+            summary_text = item["summary"] or "(本场景暂无概要)"
+            if summary_limit and item["summary"]:
+                summary_text = self._truncate_text_with_ellipsis(
+                    item["summary"], summary_limit
+                )
+            blocks.append(f"剧情概要: {summary_text}")
+            if item["content_ref"]:
+                blocks.append(
+                    f"{item['content_prefix']}{item['content_ref']}{item['content_suffix']}"
+                )
 
         return "\n".join(blocks) if blocks else "（无相关大纲上下文）"
+
+    def _get_outline_adjacent_budget_chars(self) -> int:
+        """估算前后相邻场景在提示词中可占用的字符预算。"""
+        ratio_map = {
+            "conservative": 0.22,
+            "balanced": 0.16,
+            "aggressive": 0.12,
+        }
+        ratio = ratio_map.get(self._compression_profile, 0.16)
+        budget_tokens = int(self.world_compressor.model_context_size * ratio)
+        return max(900, int(budget_tokens * 1.4))
+
+    def _get_adjacent_summary_limit(self, available_chars: int, summary_count: int) -> int:
+        """计算每个相邻概要可保留的最大长度。"""
+        if summary_count <= 0:
+            return 120
+        profile_caps = {
+            "conservative": 260,
+            "balanced": 170,
+            "aggressive": 110,
+        }
+        hard_cap = profile_caps.get(self._compression_profile, 170)
+        # 给概要分配约 38% 的可用预算，其余留给相邻正文片段结构
+        per_limit = int(max(60, (available_chars * 0.38) / summary_count))
+        return min(hard_cap, per_limit)
+
+    def _truncate_text_with_ellipsis(self, text: str, max_chars: int) -> str:
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max(0, max_chars - 11)].rstrip() + "...(省略)"
 
     def _read_node_content(self, node: dict) -> str:
         """辅助方法：通过节点字典读取对应的 Markdown 文件内容"""

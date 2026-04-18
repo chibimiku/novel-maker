@@ -149,6 +149,10 @@ class SettingTreeMixin:
     def on_setting_node_clicked(self: "NovelCreatorWindow", item, column):
         if not self.workspace:
             return
+        if hasattr(self, "summary_title_label"):
+            base = "节点概要 (Summary - 保存至系统数据):"
+            self.summary_title_label.setText(base)
+            self.summary_title_label.setToolTip(base)
 
         # 1. 如果点击的是新增按钮
         if item.text(0).startswith("+"):
