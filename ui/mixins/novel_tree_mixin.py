@@ -395,6 +395,23 @@ class NovelTreeMixin:
         names.reverse()
         return " / ".join(names)
 
+    def _get_node_path_from_outline(self: "NovelCreatorWindow", node_id: str) -> str:
+        """从 outline_tree_data 中查找节点的完整层级路径（章/节/场景）。"""
+        def walk(nodes, path):
+            for node in nodes:
+                current_path = path + [node.get("title", "未知节点")]
+                if node.get("id") == node_id:
+                    return current_path
+                children = node.get("children")
+                if children:
+                    result = walk(children, current_path)
+                    if result:
+                        return result
+            return None
+
+        result = walk(self.outline_tree_data.get("nodes", []), [])
+        return " / ".join(result) if result else ""
+
     def _update_summary_header(self: "NovelCreatorWindow", full_name: str = ""):
         """复用概要区既有标题行，按需附加完整节点名称。"""
         base = "节点概要 (Summary - 保存至系统数据):"
@@ -2213,28 +2230,32 @@ class NovelTreeMixin:
             "I'm sorry", "I cannot", "I can't", "I'm unable",
             "As an AI", "As a language model",
         ]
-        for pattern in refusal_patterns:
-            if pattern in result_stripped:
-                return True, f"LLM 返回了拒绝修改的回复（检测到关键词: \"{pattern}\"）"
+
+        def _contains_refusal(text: str) -> tuple[bool, str]:
+            for pattern in refusal_patterns:
+                if pattern in text:
+                    return True, pattern
+            return False, ""
+
+        has_refusal, matched_pattern = _contains_refusal(result_stripped)
 
         if len(original_stripped) > 50:
             matcher = SequenceMatcher(None, result_stripped, original_stripped)
             similarity = matcher.ratio()
             if similarity > 0.95:
-                return True, f"LLM 返回内容与原文几乎一致（相似度 {similarity:.1%}），可能未实际修改"
+                if has_refusal:
+                    return True, f"LLM 返回了拒绝修改的回复（相似度 {similarity:.1%}，检测到关键词: \"{matched_pattern}\"）"
+                return False, ""
 
         if len(original_stripped) > 200:
             ratio = len(result_stripped) / len(original_stripped)
             if ratio < 0.01:
-                short_refusal_patterns = [
-                    "不能修改", "无法修改", "不能这样做", "不能这么做",
-                    "无法进行", "我做不到", "不支持", "不提供",
-                    "cannot", "can't", "unable",
-                ]
-                for pattern in short_refusal_patterns:
-                    if pattern.lower() in result_stripped.lower():
-                        return True, f"LLM 返回了极短拒绝回复（仅为原文的 {ratio:.1%}，检测到关键词: \"{pattern}\"）"
-                return True, f"LLM 返回内容过短（仅为原文的 {ratio:.1%}），可能是错误/拒绝消息"
+                if has_refusal:
+                    return True, f"LLM 返回了极短拒绝回复（仅为原文的 {ratio:.1%}，检测到关键词: \"{matched_pattern}\"）"
+                return False, ""
+
+        if has_refusal:
+            return True, f"LLM 返回了拒绝修改的回复（检测到关键词: \"{matched_pattern}\"）"
 
         return False, ""
 
@@ -2452,6 +2473,119 @@ class NovelTreeMixin:
         except Exception as e:
             self.log_console.append(f"<font color='red'>合并失败: {e}</font>")
             QMessageBox.critical(self, "错误", f"合并失败:\n{e}")
+
+    def batch_merge_all_pending(self: "NovelCreatorWindow"):
+        """一键全部合并所有待合并修改（不进入逐行对比，直接应用LLM修改版）"""
+        if not self.workspace:
+            QMessageBox.warning(self, "提示", "请先打开工作区。")
+            return
+
+        pending_ids = self.workspace.get_all_pending_node_ids()
+
+        merge_list = []
+        for node_id in pending_ids:
+            pending_data = self.workspace.get_pending_modify(node_id)
+            if not pending_data:
+                continue
+            real_node = self.node_map.get(node_id)
+            if not real_node:
+                continue
+            rel_path = real_node.get("file_path")
+            if not rel_path:
+                continue
+            merge_list.append((node_id, real_node, pending_data))
+
+        if not merge_list:
+            QMessageBox.information(self, "提示", "当前没有待合并的修改。")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("一键全部合并")
+        dialog.setMinimumWidth(450)
+        dialog.setMinimumHeight(300)
+
+        dialog_layout = QVBoxLayout()
+
+        info_label = QLabel(
+            f"即将直接应用以下 {len(merge_list)} 个节点的修改内容（不进入逐行对比）："
+        )
+        info_label.setWordWrap(True)
+        dialog_layout.addWidget(info_label)
+
+        node_list = QListWidget()
+        for node_id, real_node, _ in merge_list:
+            full_path = self._get_node_path_from_outline(node_id) or real_node.get("title", "未知节点")
+            node_list.addItem(QListWidgetItem(f"  • {full_path}"))
+        dialog_layout.addWidget(node_list)
+
+        warn_label = QLabel("此操作将直接用 LLM 生成的修改版覆盖原文。\n确定要全部合并吗？")
+        warn_label.setWordWrap(True)
+        dialog_layout.addWidget(warn_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        yes_btn = QPushButton("确定合并")
+        no_btn = QPushButton("取消")
+        btn_layout.addWidget(yes_btn)
+        btn_layout.addWidget(no_btn)
+        dialog_layout.addLayout(btn_layout)
+
+        dialog.setLayout(dialog_layout)
+        yes_btn.clicked.connect(dialog.accept)
+        no_btn.clicked.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        success_count = 0
+        fail_count = 0
+        current_node_was_merged = False
+        current_node_result = ""
+
+        for node_id, real_node, pending_data in merge_list:
+            try:
+                result_text = pending_data["modified_text"]
+                rel_path = real_node.get("file_path")
+
+                new_md5 = self.workspace.save_markdown_file(rel_path, result_text)
+                real_node["md5"] = new_md5
+
+                self.workspace.delete_pending_modify(node_id)
+
+                node_title = real_node.get("title", "未知节点")
+                self.log_console.append(
+                    f"<font color='green'>✅ 已合并：【{node_title}】</font>"
+                )
+                success_count += 1
+
+                if (
+                    self.current_editing_node
+                    and self.current_editing_node.get("id") == node_id
+                ):
+                    current_node_was_merged = True
+                    current_node_result = result_text
+
+            except Exception as e:
+                node_title = real_node.get("title", "未知节点")
+                self.log_console.append(
+                    f"<font color='red'>合并失败：【{node_title}】: {e}</font>"
+                )
+                fail_count += 1
+
+        self.workspace.save_outline_tree(self.outline_tree_data)
+        self._auto_export_html_if_enabled("一键全部合并")
+        self._refresh_novel_tree()
+
+        if current_node_was_merged:
+            self.content_editor.setText(current_node_result)
+            self.current_node_original_content = current_node_result
+            self.current_node_original_summary = self.summary_editor.toPlainText()
+
+        QMessageBox.information(
+            self,
+            "全部合并完成",
+            f"合并完成！\n成功：{success_count} 个\n失败：{fail_count} 个",
+        )
 
     def discard_pending_modify(self: "NovelCreatorWindow", node_id: str):
         """丢弃待合并修改"""

@@ -391,6 +391,11 @@ class NovelCreatorWindow(
         tool_menu.addAction(proofread_action)
         proofread_action.triggered.connect(self.open_proofread_tool_entry)
 
+        tool_menu.addSeparator()
+        batch_merge_all_action = QAction('一键全部合并待修改内容', self)
+        tool_menu.addAction(batch_merge_all_action)
+        batch_merge_all_action.triggered.connect(self.batch_merge_all_pending)
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
