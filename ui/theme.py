@@ -535,6 +535,91 @@ QToolTip {{
     padding: 4px 8px;
 }}
 
+/* ==================== 表格视图 ==================== */
+QTableWidget {{
+    background-color: {BG_SURFACE};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    gridline-color: {BORDER};
+    font-size: 13px;
+}}
+
+QTableWidget::item {{
+    padding: 6px 8px;
+    color: {TEXT_PRIMARY};
+    background-color: {BG_SURFACE};
+}}
+
+QTableWidget::item:selected {{
+    background-color: {BG_SELECTED};
+    color: white;
+}}
+
+QTableWidget::item:alternate {{
+    background-color: {BG_ELEVATED};
+}}
+
+QTableWidget QHeaderView::section {{
+    background-color: {BG_BASE};
+    color: {TEXT_SECONDARY};
+    border: none;
+    border-bottom: 2px solid {ACCENT};
+    padding: 6px 8px;
+    font-weight: bold;
+    font-size: 13px;
+}}
+
+/* ==================== 纯文本编辑（只读） ==================== */
+QPlainTextEdit {{
+    background-color: {BG_ELEVATED};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 8px;
+    selection-background-color: {BG_SELECTED};
+    selection-color: white;
+    font-size: 13px;
+}}
+
+QPlainTextEdit:focus {{
+    border-color: {ACCENT};
+}}
+
+/* ==================== 分组框 ==================== */
+QGroupBox {{
+    background-color: {BG_SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 16px 12px 12px 12px;
+    font-weight: bold;
+    color: {TEXT_PRIMARY};
+}}
+
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0px 8px;
+    color: {ACCENT};
+}}
+
+/* ==================== 进度条 ==================== */
+QProgressBar {{
+    background-color: {BG_ELEVATED};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    text-align: center;
+    font-size: 12px;
+    min-height: 18px;
+}}
+
+QProgressBar::chunk {{
+    background-color: {ACCENT};
+    border-radius: 3px;
+}}
+
 /* ==================== 表单布局标签 ==================== */
 QFormLayout QLabel {{
     color: {TEXT_SECONDARY};

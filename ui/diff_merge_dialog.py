@@ -180,6 +180,7 @@ class AdvancedDiffMergeDialog(QDialog):
 
         self.dmp = diff_match_patch()
         self.diff_lines: List[DiffLine] = []
+        self._max_render_diff_widgets = 400
         
         self.init_ui()
         self.parse_and_render_diff()
@@ -423,8 +424,24 @@ class AdvancedDiffMergeDialog(QDialog):
                 widget = child.widget()
                 if widget is not None:
                     widget.deleteLater()
+
+        # 仅渲染变更行，避免大文本下创建过多 QTextEdit 造成界面卡顿
+        changed_lines = [line for line in self.diff_lines if line.line_type != "equal"]
+        if not changed_lines:
+            self.diff_layout.addWidget(QLabel("没有检测到差异。"))
+            self.diff_layout.addStretch()
+            return
+
+        visible_lines = changed_lines[: self._max_render_diff_widgets]
+        if len(changed_lines) > len(visible_lines):
+            tip = QLabel(
+                f"变更行较多，仅展示前 {len(visible_lines)} 项；合并结果仍会基于全部内容计算。"
+            )
+            tip.setStyleSheet("color: #999;")
+            self.diff_layout.addWidget(tip)
+
         # 添加差异行
-        for diff_line in self.diff_lines:
+        for diff_line in visible_lines:
             widget = DiffLineWidget(diff_line)
             widget.selection_changed.connect(self.on_line_selection_changed)
             self.diff_layout.addWidget(widget)

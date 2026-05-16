@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from core.world_context_compressor import WorldContextCompressor, WorldSettingNode
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,8 @@ class ContextBuilder:
         model_context_size: int | None = None,
         model_capabilities: list[str] | None = None,
         compression_profile: str | None = None,
+        children_summary_compress_trigger_ratio: float | None = None,
+        children_summary_group_budget_ratio: float | None = None,
     ):
         """
         初始化上下文构建器
@@ -24,6 +27,49 @@ class ContextBuilder:
             compression_profile=compression_profile,
         )
         self._compression_profile = self.world_compressor.compression_profile
+        self._children_summary_compress_trigger_ratio = self._normalize_ratio(
+            children_summary_compress_trigger_ratio,
+            default_value=0.27,
+            min_value=0.05,
+            max_value=0.8,
+        )
+        self._children_summary_group_budget_ratio = self._normalize_ratio(
+            children_summary_group_budget_ratio,
+            default_value=0.24,
+            min_value=0.04,
+            max_value=0.6,
+        )
+
+    def _normalize_ratio(
+        self,
+        ratio: float | None,
+        default_value: float,
+        min_value: float,
+        max_value: float,
+    ) -> float:
+        """归一化比例参数，支持 [0,1] 小数和 [0,100] 百分数输入。"""
+        if ratio is None:
+            return default_value
+        try:
+            value = float(ratio)
+        except Exception:
+            return default_value
+        # 兼容把 27 当作 27% 的输入
+        if value > 1:
+            value = value / 100.0
+        if value <= 0:
+            return default_value
+        return max(min_value, min(max_value, value))
+
+    def _get_children_summary_trigger_tokens(self) -> int:
+        """按模型上下文长度计算子节点压缩触发 token 阈值。"""
+        context_size = max(2048, int(self.world_compressor.model_context_size or 8192))
+        return max(600, int(context_size * self._children_summary_compress_trigger_ratio))
+
+    def _get_children_group_budget_tokens(self) -> int:
+        """按模型上下文长度计算分组压缩单组 token 预算。"""
+        context_size = max(2048, int(self.world_compressor.model_context_size or 8192))
+        return max(450, int(context_size * self._children_summary_group_budget_ratio))
 
     # 修改 context_builder.py，在类中新增以下方法：
 
@@ -261,7 +307,13 @@ class ContextBuilder:
         }
         ratio = ratio_map.get(self._compression_profile, 0.16)
         budget_tokens = int(self.world_compressor.model_context_size * ratio)
-        return max(900, int(budget_tokens * 1.4))
+        estimated_chars = max(900, int(budget_tokens * 1.4))
+        hard_caps = {
+            "conservative": 9000,
+            "balanced": 6500,
+            "aggressive": 4500,
+        }
+        return min(estimated_chars, hard_caps.get(self._compression_profile, 6500))
 
     def _get_adjacent_summary_limit(self, available_chars: int, summary_count: int) -> int:
         """计算每个相邻概要可保留的最大长度。"""
@@ -300,6 +352,234 @@ class ContextBuilder:
             except Exception:
                 return ""
         return ""
+
+    def _estimate_token_count(self, text: str) -> int:
+        """粗略估算 token 数，便于在本地做超长判断。"""
+        if not text:
+            return 0
+        cjk_count = 0
+        for ch in text:
+            code_point = ord(ch)
+            if 0x4E00 <= code_point <= 0x9FFF:
+                cjk_count += 1
+        non_cjk = max(0, len(text) - cjk_count)
+        return cjk_count + int(non_cjk / 4) + 1
+
+    def _split_children_for_llm_compress(
+        self,
+        child_items: list[dict],
+        group_token_budget: int,
+    ) -> list[list[dict]]:
+        """按估算 token 预算将子节点切分为多个分组。"""
+        if not child_items:
+            return []
+        groups: list[list[dict]] = []
+        current_group: list[dict] = []
+        current_tokens = 0
+        for item in child_items:
+            item_tokens = self._estimate_token_count(
+                f"{item['idx']}. {item['title']}\n{item['summary']}\n"
+            )
+            if current_group and current_tokens + item_tokens > group_token_budget:
+                groups.append(current_group)
+                current_group = [item]
+                current_tokens = item_tokens
+                continue
+            current_group.append(item)
+            current_tokens += item_tokens
+        if current_group:
+            groups.append(current_group)
+        return groups
+
+    def _parse_compacted_children_json(
+        self,
+        raw_text: str,
+        fallback_group: list[dict],
+    ) -> list[dict]:
+        """
+        解析 LLM 返回的子节点压缩 JSON；失败时回退到原文。
+        期望格式: [{"idx":1,"title":"场景1","summary":"..."}, ...]
+        """
+        try:
+            cleaned = raw_text.strip()
+            match = re.search(r"\[[\s\S]*\]", cleaned)
+            if match:
+                cleaned = match.group(0)
+            data = json.loads(cleaned)
+            if not isinstance(data, list):
+                raise ValueError("not list")
+            parsed: list[dict] = []
+            for i, item in enumerate(data):
+                if not isinstance(item, dict):
+                    continue
+                idx = int(item.get("idx", fallback_group[i]["idx"] if i < len(fallback_group) else i + 1))
+                title = str(item.get("title", "")).strip() or (
+                    fallback_group[i]["title"] if i < len(fallback_group) else f"子节点{idx}"
+                )
+                summary = str(item.get("summary", "")).strip()
+                if not summary and i < len(fallback_group):
+                    summary = fallback_group[i]["summary"]
+                parsed.append({"idx": idx, "title": title, "summary": summary})
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+        return fallback_group
+
+    def _compress_children_summaries_with_llm(
+        self,
+        children: list[dict],
+        llm_client,
+        progress_callback=None,
+    ) -> list[dict]:
+        """
+        对超长子节点概要执行两阶段压缩：
+        1) 分组压缩
+        2) 全局去重拼接
+        """
+        child_items = []
+        for idx, child in enumerate(children, start=1):
+            child_items.append(
+                {
+                    "idx": idx,
+                    "title": child.get("title", "未命名"),
+                    "summary": child.get("summary", "").strip() or "(暂无概要)",
+                }
+            )
+        if not child_items:
+            return []
+
+        # 单组预算按模型窗口比例计算，避免不同模型下过早或过晚切分
+        groups = self._split_children_for_llm_compress(
+            child_items,
+            group_token_budget=self._get_children_group_budget_tokens(),
+        )
+        compacted_groups: list[list[dict]] = []
+
+        for group_index, group in enumerate(groups, start=1):
+            if callable(progress_callback):
+                progress_callback(
+                    f"子节点概要过长，正在执行分组压缩 {group_index}/{len(groups)}..."
+                )
+            group_payload = []
+            for item in group:
+                group_payload.append(
+                    f"{item['idx']}. <{item['title']}>\n{item['summary']}"
+                )
+            group_prompt = f"""你是小说大纲压缩助手。请压缩以下子节点概要。
+
+要求：
+1. 保留每个子节点的核心剧情，不得杜撰，不得打乱顺序。
+2. 每个子节点保留时间/地点/人物/事件主干，压缩为 70-160 字。
+3. 仅输出 JSON 数组，不要任何解释文字。
+4. 输出格式严格为：
+[
+  {{"idx": 1, "title": "场景1", "summary": "压缩后的概要"}}
+]
+
+待压缩内容：
+{chr(10).join(group_payload)}
+"""
+            try:
+                if callable(progress_callback):
+                    progress_callback(
+                        f"正在提交压缩请求（分组 {group_index}/{len(groups)}）..."
+                    )
+                raw = llm_client.generate_text(
+                    prompt=group_prompt.strip(),
+                    override_system_instruction=llm_client.summary_system_instruction,
+                    progress_callback=progress_callback,
+                )
+                compacted_groups.append(
+                    self._parse_compacted_children_json(raw, group)
+                )
+            except Exception:
+                compacted_groups.append(group)
+
+        if len(compacted_groups) == 1:
+            return compacted_groups[0]
+
+        if callable(progress_callback):
+            progress_callback("正在拼接各分组概要并去重...")
+        merge_source = []
+        for group in compacted_groups:
+            for item in group:
+                merge_source.append(
+                    {
+                        "idx": item["idx"],
+                        "title": item["title"],
+                        "summary": item["summary"],
+                    }
+                )
+        merge_prompt = f"""你将收到同一批子节点的分组压缩结果，请去重并拼接为最终版本。
+
+要求：
+1. 保持 idx 顺序递增。
+2. 删除重复信息，但不能丢失关键剧情主干。
+3. 每个节点 summary 控制在 70-160 字。
+4. 仅输出 JSON 数组，不要解释。
+5. 输出格式：
+[
+  {{"idx": 1, "title": "场景1", "summary": "最终去重后的概要"}}
+]
+
+分组结果：
+{json.dumps(merge_source, ensure_ascii=False, indent=2)}
+"""
+        try:
+            if callable(progress_callback):
+                progress_callback("正在提交压缩请求（最终去重拼接）...")
+            merged_raw = llm_client.generate_text(
+                prompt=merge_prompt.strip(),
+                override_system_instruction=llm_client.summary_system_instruction,
+                progress_callback=progress_callback,
+            )
+            merged = self._parse_compacted_children_json(merged_raw, merge_source)
+            return sorted(merged, key=lambda x: int(x.get("idx", 0)))
+        except Exception:
+            # 去重拼接失败时，回退到分组结果直连
+            merged_fallback = []
+            for group in compacted_groups:
+                merged_fallback.extend(group)
+            return sorted(merged_fallback, key=lambda x: int(x.get("idx", 0)))
+
+    def _build_children_context_text(
+        self,
+        children: list[dict],
+        llm_client=None,
+        progress_callback=None,
+    ) -> str:
+        """构建子节点信息文本；超长时触发分组压缩+去重拼接。"""
+        if not children:
+            return ""
+        raw_blocks = []
+        for child in children:
+            child_title = child.get("title", "未命名")
+            child_summary = child.get("summary", "").strip() or "(暂无概要)"
+            raw_blocks.append(f"<{child_title}> 概要:\n{child_summary}\n")
+        raw_text = "\n".join(raw_blocks)
+
+        trigger_tokens = self._get_children_summary_trigger_tokens()
+        raw_tokens = self._estimate_token_count(raw_text)
+        if not llm_client or raw_tokens <= trigger_tokens:
+            return raw_text
+        if callable(progress_callback):
+            progress_callback(
+                "检测到子节点概要超长，触发分组压缩："
+                f"当前约 {raw_tokens} tokens，阈值约 {trigger_tokens} tokens。"
+            )
+
+        compacted_items = self._compress_children_summaries_with_llm(
+            children=children,
+            llm_client=llm_client,
+            progress_callback=progress_callback,
+        )
+        compacted_blocks = []
+        for item in compacted_items:
+            compacted_blocks.append(
+                f"{item.get('idx', 0)}. <{item.get('title', '未命名')}> 概要:\n{item.get('summary', '(暂无概要)')}\n"
+            )
+        return "\n".join(compacted_blocks)
     
     def build_summary_sync_prompt(self, node_title: str, node_level: int, old_summary: str, actual_content: str) -> str:
         """构建校验和同步概要的提示词"""
@@ -353,9 +633,17 @@ class ContextBuilder:
 """
         return prompt.strip()
 
-    def build_summary_prompt(self, target_node: dict, tree_data: dict, checked_setting_paths: list) -> list:
+    def build_summary_prompt(
+        self,
+        target_node: dict,
+        tree_data: dict,
+        checked_setting_paths: list,
+        llm_client=None,
+        progress_callback=None,
+    ) -> list:
         """构建生成场景概要(Summary)的专属上下文"""
         target_title = target_node.get("title", "未命名场景")
+        settings_text = self._build_settings_text(checked_setting_paths)
         
         # 获取父节点、子节点和同级节点
         parents = []
@@ -447,10 +735,12 @@ class ContextBuilder:
         # 子节点信息
         if children:
             context_blocks.append("【子节点信息】")
-            for child in children:
-                child_title = child.get("title", "未命名")
-                child_summary = child.get("summary", "").strip() or "(暂无概要)"
-                context_blocks.append(f"<{child_title}> 概要:\n{child_summary}\n")
+            children_context = self._build_children_context_text(
+                children=children,
+                llm_client=llm_client,
+                progress_callback=progress_callback,
+            )
+            context_blocks.append(children_context)
         
         # 对于第3级节点，添加正文内容和前后相邻节点信息
         if target_level == 3:
@@ -489,7 +779,10 @@ class ContextBuilder:
         prompt = f"""
 你是一个专业的小说编辑。请根据提供的上下文信息，为指定的场景生成一个精准、结构化的剧情概要(Summary)。
 
-### 一、 核心要素提取要求（最高优先级，必须100%遵守）
+### 一、 世界观与设定参考
+{settings_text}
+
+### 二、 核心要素提取要求（最高优先级，必须100%遵守）
 无论正文有多长、内容有多复杂，你必须逐一捕捉并在概要中明确写出以下所有维度的信息，缺一不可：
 
 1. **时间要素**：
@@ -511,7 +804,7 @@ class ContextBuilder:
    - 必须写明【关键冲突或转折点】
    - 必须记录【重要物品的获得/失去/转移】
 
-### 二、 当前任务
+### 三、 当前任务
 请为场景【{target_title}】生成剧情概要，要求：
 1. 概要必须完整包含上述第一部分"核心要素提取要求"的全部4个维度，缺一则视为不合格
 2. 语言凝练，控制在 150-400 字之间（为确保要素完整，可适当超出400字）
@@ -520,7 +813,7 @@ class ContextBuilder:
 5. 如果是2级节点，请确保概要与同级节点的内容连贯，符合其在序列中的位置
 6. 如果是3级场景节点，请完全基于提供的【当前场景正文】内容生成概要，不要自行捏造不存在的剧情
 
-### 三、 输出格式与要求（绝对红线）
+### 四、 输出格式与要求（绝对红线）
 1. 请直接输出概要内容，不要添加任何前缀或后缀。
 2. 必须采用结构化的格式输出，包含以下明确的标识：
    【时间】：...
@@ -531,7 +824,7 @@ class ContextBuilder:
 3. 严禁任何助手语气与客套话，如"好的"、"已为您生成"等
 4. 确保概要内容与上下文信息逻辑连贯
 
-### 四、 上下文信息
+### 五、 上下文信息
 {context_text}
 """
         

@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +20,15 @@ class WorkspaceManager:
         self.instruction_profile_file = os.path.join(
             self.sys_data_path, "instruction_profile.json"
         )
+        self.workspace_profile_file = os.path.join(
+            self.sys_data_path, "workspace_profile.json"
+        )
         
         self.tree_json_file = os.path.join(self.sys_data_path, "outline_tree.json")
         self.setting_dirs = ["公共设定", "人物设定", "名词设定", "地点设定", "其他设定"]
         
         self._pending_modify_cache = {}
+        self._pending_modify_lock = threading.RLock()
         self._load_all_pending_modifies()
 
     def init_workspace(self):
@@ -167,24 +172,27 @@ class WorkspaceManager:
 
     def _load_all_pending_modifies(self):
         """加载所有待合并的修改到缓存中"""
-        if not os.path.exists(self.pending_modifies_dir):
-            return
-        for filename in os.listdir(self.pending_modifies_dir):
-            if filename.endswith(".json"):
-                node_id = filename[:-5]
-                try:
-                    with open(os.path.join(self.pending_modifies_dir, filename), "r", encoding="utf-8") as f:
-                        self._pending_modify_cache[node_id] = json.load(f)
-                except Exception as e:
-                    logger.error(f"加载待合并修改失败 {filename}: {e}")
+        with self._pending_modify_lock:
+            if not os.path.exists(self.pending_modifies_dir):
+                return
+            for filename in os.listdir(self.pending_modifies_dir):
+                if filename.endswith(".json"):
+                    node_id = filename[:-5]
+                    try:
+                        with open(os.path.join(self.pending_modifies_dir, filename), "r", encoding="utf-8") as f:
+                            self._pending_modify_cache[node_id] = json.load(f)
+                    except Exception as e:
+                        logger.error(f"加载待合并修改失败 {filename}: {e}")
 
     def has_pending_modify(self, node_id: str) -> bool:
         """检查节点是否有待合并的修改"""
-        return node_id in self._pending_modify_cache
+        with self._pending_modify_lock:
+            return node_id in self._pending_modify_cache
 
     def get_pending_modify(self, node_id: str) -> dict | None:
         """获取节点的待合并修改"""
-        return self._pending_modify_cache.get(node_id)
+        with self._pending_modify_lock:
+            return self._pending_modify_cache.get(node_id)
 
     def save_pending_modify(self, node_id: str, original_text: str, modified_text: str, request_prompt: str) -> None:
         """保存待合并的修改"""
@@ -194,7 +202,8 @@ class WorkspaceManager:
             "modified_text": modified_text,
             "request_prompt": request_prompt,
         }
-        self._pending_modify_cache[node_id] = data
+        with self._pending_modify_lock:
+            self._pending_modify_cache[node_id] = data
         
         os.makedirs(self.pending_modifies_dir, exist_ok=True)
         file_path = os.path.join(self.pending_modifies_dir, f"{node_id}.json")
@@ -203,8 +212,9 @@ class WorkspaceManager:
 
     def delete_pending_modify(self, node_id: str) -> None:
         """删除节点的待合并修改"""
-        if node_id in self._pending_modify_cache:
-            del self._pending_modify_cache[node_id]
+        with self._pending_modify_lock:
+            if node_id in self._pending_modify_cache:
+                del self._pending_modify_cache[node_id]
         
         file_path = os.path.join(self.pending_modifies_dir, f"{node_id}.json")
         if os.path.exists(file_path):
@@ -227,6 +237,35 @@ class WorkspaceManager:
         except Exception as e:
             logger.error(f"加载 instruction_profile.json 失败: {e}")
             return None
+
+    def load_workspace_profile(self) -> dict:
+        """加载工作区级配置（例如 NSFW 开关）。"""
+        if not os.path.exists(self.workspace_profile_file):
+            return {}
+        try:
+            with open(self.workspace_profile_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"加载 workspace_profile.json 失败: {e}")
+            return {}
+
+    def save_workspace_profile(self, profile: dict) -> None:
+        """保存工作区级配置。"""
+        os.makedirs(self.sys_data_path, exist_ok=True)
+        with open(self.workspace_profile_file, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=4)
+
+    def get_is_nsfw(self) -> bool:
+        """读取工作区 NSFW 标记。"""
+        profile = self.load_workspace_profile()
+        return bool(profile.get("is_nsfw", False))
+
+    def set_is_nsfw(self, is_nsfw: bool) -> None:
+        """写入工作区 NSFW 标记。"""
+        profile = self.load_workspace_profile()
+        profile["is_nsfw"] = bool(is_nsfw)
+        self.save_workspace_profile(profile)
 
     def get_all_pending_node_ids(self) -> list:
         """获取所有有待合并修改的节点ID列表"""

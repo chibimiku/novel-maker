@@ -1,9 +1,10 @@
 import os
 import json
+import copy
 import requests
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QComboBox, QTextEdit, 
-                             QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox, QInputDialog)
+                             QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox, QInputDialog, QDoubleSpinBox)
 from PyQt6.QtCore import Qt
 
 class SettingsDialog(QDialog):
@@ -23,6 +24,10 @@ class SettingsDialog(QDialog):
         self.summary_instructions_history = [] # 存放概要生成历史指令的列表
         self.modify_instructions_history = [] # 存放编辑改写历史指令的列表
         self.text_model_meta_catalog = {}
+        self.text_api_profiles = {"normal": {}, "nsfw": {}}
+        self._current_text_profile_key = "normal"
+        self._is_switching_text_profile = False
+        self.recent_api_configs = []
         
         self.init_ui()
         self.populate_data()
@@ -34,7 +39,11 @@ class SettingsDialog(QDialog):
                     return json.load(f)
             except Exception as e:
                 QMessageBox.warning(self, "警告", f"读取配置文件失败，将使用默认空配置。\n{e}")
-        return {"text_api": {}, "image_api": {}}
+        return {
+            "text_api": {},
+            "image_api": {},
+            "task_completion_notification_enabled": True,
+        }
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -45,6 +54,12 @@ class SettingsDialog(QDialog):
         # --- 文本模型 Tab ---
         self.text_tab = QWidget()
         self.text_layout = QFormLayout(self.text_tab)
+
+        self.text_profile_combo = QComboBox()
+        self.text_profile_combo.addItem("普通小说配置", "normal")
+        self.text_profile_combo.addItem("NSFW小说配置", "nsfw")
+        self.text_profile_combo.currentIndexChanged.connect(self.on_text_profile_changed)
+        self.text_layout.addRow("配置目标:", self.text_profile_combo)
         
         self.txt_type_combo = QComboBox()
         self.txt_type_combo.addItems(["openai", "gemini"])
@@ -55,8 +70,17 @@ class SettingsDialog(QDialog):
         self.text_layout.addRow("请求地址 (Base URL):", self.txt_base_url_input)
         
         self.txt_api_key_input = QLineEdit()
-        self.txt_api_key_input.setEchoMode(QLineEdit.EchoMode.Password) # 密码掩码
-        self.text_layout.addRow("API Key:", self.txt_api_key_input)
+        self.txt_api_key_input.setEchoMode(QLineEdit.EchoMode.Password) # 默认掩码
+        txt_api_key_layout = QHBoxLayout()
+        txt_api_key_layout.addWidget(self.txt_api_key_input, stretch=1)
+        self.btn_toggle_txt_api_key = QPushButton("显示 Key")
+        self.btn_toggle_txt_api_key.clicked.connect(
+            lambda: self.toggle_api_key_visibility(
+                self.txt_api_key_input, self.btn_toggle_txt_api_key
+            )
+        )
+        txt_api_key_layout.addWidget(self.btn_toggle_txt_api_key)
+        self.text_layout.addRow("API Key:", txt_api_key_layout)
         
         # 模型选择与获取按钮组合
         self.txt_model_combo = QComboBox()
@@ -85,6 +109,14 @@ class SettingsDialog(QDialog):
         self.spin_model_context_size.setSuffix(" tokens")
         self.text_layout.addRow("上下文大小 (Context):", self.spin_model_context_size)
 
+        self.cb_auto_continue_on_incomplete = QCheckBox("返回疑似截断时自动续请求")
+        self.text_layout.addRow("自动续请求:", self.cb_auto_continue_on_incomplete)
+
+        self.spin_auto_continue_max_rounds = QSpinBox()
+        self.spin_auto_continue_max_rounds.setRange(0, 10)
+        self.spin_auto_continue_max_rounds.setSuffix(" 轮")
+        self.text_layout.addRow("最大续请求轮次:", self.spin_auto_continue_max_rounds)
+
         self.world_compression_profile_combo = QComboBox()
         self.world_compression_profile_combo.addItem(
             "保守 (预算系数=0.45, 节点基线=180, 字段上限=320)", "conservative"
@@ -97,12 +129,43 @@ class SettingsDialog(QDialog):
         )
         self.text_layout.addRow("世界观压缩策略:", self.world_compression_profile_combo)
 
+        self.spin_children_compress_trigger_ratio = QDoubleSpinBox()
+        self.spin_children_compress_trigger_ratio.setRange(5.0, 80.0)
+        self.spin_children_compress_trigger_ratio.setDecimals(1)
+        self.spin_children_compress_trigger_ratio.setSingleStep(1.0)
+        self.spin_children_compress_trigger_ratio.setSuffix(" %")
+        self.spin_children_compress_trigger_ratio.setToolTip(
+            "当“子节点概要总量”超过上下文窗口的该比例时，触发分组压缩。"
+        )
+        self.text_layout.addRow("子节点压缩触发阈值:", self.spin_children_compress_trigger_ratio)
+
+        self.spin_children_group_budget_ratio = QDoubleSpinBox()
+        self.spin_children_group_budget_ratio.setRange(4.0, 60.0)
+        self.spin_children_group_budget_ratio.setDecimals(1)
+        self.spin_children_group_budget_ratio.setSingleStep(1.0)
+        self.spin_children_group_budget_ratio.setSuffix(" %")
+        self.spin_children_group_budget_ratio.setToolTip(
+            "分组压缩时，每组可占上下文窗口的比例。"
+        )
+        self.text_layout.addRow("子节点分组预算比例:", self.spin_children_group_budget_ratio)
+
         
         self.tabs.addTab(self.text_tab, "📝 文本生成模型")
 
         # --- 系统指令 Tab ---
         self.instructions_tab = QWidget()
         self.instructions_tab_layout = QVBoxLayout(self.instructions_tab)
+
+        instructions_profile_layout = QHBoxLayout()
+        instructions_profile_layout.addWidget(QLabel("配置目标:"))
+        self.instructions_profile_combo = QComboBox()
+        self.instructions_profile_combo.addItem("普通小说配置", "normal")
+        self.instructions_profile_combo.addItem("NSFW小说配置", "nsfw")
+        self.instructions_profile_combo.currentIndexChanged.connect(
+            self.on_text_profile_changed
+        )
+        instructions_profile_layout.addWidget(self.instructions_profile_combo, stretch=1)
+        self.instructions_tab_layout.addLayout(instructions_profile_layout)
         
         # 使用子选项卡分离文本生成和概要生成指令
         self.instructions_sub_tabs = QTabWidget()
@@ -207,8 +270,17 @@ class SettingsDialog(QDialog):
         self.image_layout.addRow("请求地址 (Base URL):", self.img_base_url_input)
         
         self.img_api_key_input = QLineEdit()
-        self.img_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.image_layout.addRow("API Key:", self.img_api_key_input)
+        self.img_api_key_input.setEchoMode(QLineEdit.EchoMode.Password) # 默认掩码
+        img_api_key_layout = QHBoxLayout()
+        img_api_key_layout.addWidget(self.img_api_key_input, stretch=1)
+        self.btn_toggle_img_api_key = QPushButton("显示 Key")
+        self.btn_toggle_img_api_key.clicked.connect(
+            lambda: self.toggle_api_key_visibility(
+                self.img_api_key_input, self.btn_toggle_img_api_key
+            )
+        )
+        img_api_key_layout.addWidget(self.btn_toggle_img_api_key)
+        self.image_layout.addRow("API Key:", img_api_key_layout)
         
         self.img_model_combo = QComboBox()
         self.img_model_combo.setEditable(True)
@@ -234,11 +306,24 @@ class SettingsDialog(QDialog):
         self.proxy_layout.addRow("代理地址 (URL):", self.proxy_url_input)
         
         self.tabs.addTab(self.proxy_tab, "🌐 网络代理")
+
+        # --- 通知 Tab ---
+        self.notify_tab = QWidget()
+        self.notify_layout = QFormLayout(self.notify_tab)
+        self.cb_task_completion_notification = QCheckBox(
+            "任务执行结束时弹出系统通知（Windows）"
+        )
+        self.cb_task_completion_notification.setChecked(True)
+        self.notify_layout.addRow(self.cb_task_completion_notification)
+        self.tabs.addTab(self.notify_tab, "🔔 通知")
         
         main_layout.addWidget(self.tabs)
 
         # --- 底部按钮 ---
         btn_layout = QHBoxLayout()
+        self.btn_load_recent_api = QPushButton("🕘 最近使用")
+        self.btn_load_recent_api.clicked.connect(self.load_recent_api_config)
+        btn_layout.addWidget(self.btn_load_recent_api)
         btn_layout.addStretch()
         self.btn_save = QPushButton("💾 保存配置")
         self.btn_cancel = QPushButton("取消")
@@ -249,6 +334,16 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(self.btn_cancel)
         btn_layout.addWidget(self.btn_save)
         main_layout.addLayout(btn_layout)
+
+    def toggle_api_key_visibility(self, input_widget: QLineEdit, toggle_button: QPushButton):
+        """切换 API Key 的显示/隐藏状态。默认隐藏，仅在用户点击后显示。"""
+        is_password = input_widget.echoMode() == QLineEdit.EchoMode.Password
+        if is_password:
+            input_widget.setEchoMode(QLineEdit.EchoMode.Normal)
+            toggle_button.setText("隐藏 Key")
+        else:
+            input_widget.setEchoMode(QLineEdit.EchoMode.Password)
+            toggle_button.setText("显示 Key")
 
     # ================= 历史指令的逻辑处理 =================
     def update_text_instruction_combo(self):
@@ -461,14 +556,177 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "成功", "已删除该指令模板！")
     # ==========================================================
 
-    def populate_data(self):
-        text_cfg = self.config.get("text_api", {})
+    def _default_text_profile(self):
+        return {
+            "type": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "",
+            "model": "gpt-4o",
+            "timeout": 120,
+            "model_capabilities": [],
+            "model_context_size": 8192,
+            "world_context_compression_profile": "balanced",
+            "children_summary_compress_trigger_ratio": 0.27,
+            "children_summary_group_budget_ratio": 0.24,
+            "auto_continue_on_incomplete": True,
+            "auto_continue_max_rounds": 3,
+            "model_meta_catalog": {},
+            "instructions": "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。",
+            "instructions_history": [],
+            "summary_instructions": "你是一个专业的小说编辑，擅长为小说节点生成精炼、准确的概要。",
+            "summary_instructions_history": [],
+            "modify_instructions": "你是一个专业的小说改写编辑。你必须严格遵循用户的修改要求，对原文进行高质量改写。只输出修改后的完整正文，不要附加解释。",
+            "modify_instructions_history": [],
+        }
+
+    def _normalize_text_profile(self, raw_profile):
+        profile = self._default_text_profile()
+        if isinstance(raw_profile, dict):
+            profile.update(raw_profile)
+        profile["model_capabilities"] = self._normalize_capabilities(
+            profile.get("model_capabilities", [])
+        )
+        profile["model_meta_catalog"] = (
+            profile.get("model_meta_catalog", {})
+            if isinstance(profile.get("model_meta_catalog", {}), dict)
+            else {}
+        )
+        profile["world_context_compression_profile"] = self._normalize_compression_profile(
+            profile.get("world_context_compression_profile", "balanced")
+        )
+        profile["children_summary_compress_trigger_ratio"] = self._normalize_ratio(
+            profile.get("children_summary_compress_trigger_ratio", 0.27),
+            default_value=0.27,
+            min_value=0.05,
+            max_value=0.8,
+        )
+        profile["children_summary_group_budget_ratio"] = self._normalize_ratio(
+            profile.get("children_summary_group_budget_ratio", 0.24),
+            default_value=0.24,
+            min_value=0.04,
+            max_value=0.6,
+        )
+        profile["auto_continue_on_incomplete"] = bool(
+            profile.get("auto_continue_on_incomplete", True)
+        )
+        try:
+            rounds = int(profile.get("auto_continue_max_rounds", 3))
+        except Exception:
+            rounds = 3
+        profile["auto_continue_max_rounds"] = max(0, min(10, rounds))
+        return profile
+
+    def _normalize_ratio(self, raw_value, default_value, min_value, max_value):
+        """归一化比例：支持 0-1 小数和 0-100 百分数。"""
+        try:
+            value = float(raw_value)
+        except Exception:
+            value = default_value
+        if value > 1:
+            value = value / 100.0
+        if value <= 0:
+            value = default_value
+        return max(min_value, min(max_value, value))
+
+    def _extract_text_api_profiles(self):
+        raw_profiles = self.config.get("text_api_profiles", {})
+        if isinstance(raw_profiles, dict):
+            normal_raw = raw_profiles.get("normal")
+            nsfw_raw = raw_profiles.get("nsfw")
+        else:
+            normal_raw = None
+            nsfw_raw = None
+        legacy_text = self.config.get("text_api", {})
+        if not isinstance(legacy_text, dict):
+            legacy_text = {}
+        if normal_raw is None:
+            normal_raw = legacy_text
+        if nsfw_raw is None:
+            nsfw_raw = copy.deepcopy(normal_raw if isinstance(normal_raw, dict) else legacy_text)
+        return {
+            "normal": self._normalize_text_profile(normal_raw),
+            "nsfw": self._normalize_text_profile(nsfw_raw),
+        }
+
+    def _collect_current_text_profile_from_ui(self):
+        current_text_instruction = self.text_instruction_input.toPlainText().strip()
+        if current_text_instruction and not any(
+            inst.get("content") == current_text_instruction
+            for inst in self.text_instructions_history
+        ):
+            self.text_instructions_history.append({"name": "", "content": current_text_instruction})
+
+        current_summary_instruction = self.summary_instruction_input.toPlainText().strip()
+        if current_summary_instruction and not any(
+            inst.get("content") == current_summary_instruction
+            for inst in self.summary_instructions_history
+        ):
+            self.summary_instructions_history.append({"name": "", "content": current_summary_instruction})
+
+        current_modify_instruction = self.modify_instruction_input.toPlainText().strip()
+        if current_modify_instruction and not any(
+            inst.get("content") == current_modify_instruction
+            for inst in self.modify_instructions_history
+        ):
+            self.modify_instructions_history.append({"name": "", "content": current_modify_instruction})
+
+        model_name = self.txt_model_combo.currentText().strip()
+        model_capabilities = self._normalize_capabilities(
+            self.txt_model_capabilities_input.text().strip()
+        )
+        model_context_size = int(self.spin_model_context_size.value())
+        compression_profile = self._normalize_compression_profile(
+            self.world_compression_profile_combo.currentData()
+        )
+        children_trigger_ratio = self._normalize_ratio(
+            self.spin_children_compress_trigger_ratio.value() / 100.0,
+            default_value=0.27,
+            min_value=0.05,
+            max_value=0.8,
+        )
+        children_group_budget_ratio = self._normalize_ratio(
+            self.spin_children_group_budget_ratio.value() / 100.0,
+            default_value=0.24,
+            min_value=0.04,
+            max_value=0.6,
+        )
+        if model_name:
+            self.text_model_meta_catalog[model_name] = {
+                "capabilities": model_capabilities,
+                "context_size": model_context_size,
+            }
+
+        return {
+            "type": self.txt_type_combo.currentText(),
+            "base_url": self.txt_base_url_input.text().strip(),
+            "api_key": self.txt_api_key_input.text().strip(),
+            "model": model_name,
+            "timeout": self.spin_timeout.value(),
+            "model_capabilities": model_capabilities,
+            "model_context_size": model_context_size,
+            "world_context_compression_profile": compression_profile,
+            "children_summary_compress_trigger_ratio": children_trigger_ratio,
+            "children_summary_group_budget_ratio": children_group_budget_ratio,
+            "auto_continue_on_incomplete": self.cb_auto_continue_on_incomplete.isChecked(),
+            "auto_continue_max_rounds": int(self.spin_auto_continue_max_rounds.value()),
+            "model_meta_catalog": self.text_model_meta_catalog,
+            "instructions": current_text_instruction,
+            "instructions_history": self.text_instructions_history,
+            "summary_instructions": current_summary_instruction,
+            "summary_instructions_history": self.summary_instructions_history,
+            "modify_instructions": current_modify_instruction,
+            "modify_instructions_history": self.modify_instructions_history,
+        }
+
+    def _apply_text_profile_to_ui(self, text_cfg):
+        text_cfg = self._normalize_text_profile(text_cfg)
         self.txt_type_combo.setCurrentText(text_cfg.get("type", "openai"))
         self.txt_base_url_input.setText(text_cfg.get("base_url", "https://api.openai.com/v1"))
         self.txt_api_key_input.setText(text_cfg.get("api_key", ""))
         current_text_model = text_cfg.get("model", "gpt-4o")
         self.txt_model_combo.setCurrentText(current_text_model)
         self.spin_timeout.setValue(text_cfg.get("timeout", 120))
+
         self.text_model_meta_catalog = {}
         raw_catalog = text_cfg.get("model_meta_catalog", {})
         if isinstance(raw_catalog, dict):
@@ -491,8 +749,19 @@ class SettingsDialog(QDialog):
         idx = self.world_compression_profile_combo.findData(compression_profile)
         if idx >= 0:
             self.world_compression_profile_combo.setCurrentIndex(idx)
-        
-        # 加载文本生成历史指令列表
+        self.spin_children_compress_trigger_ratio.setValue(
+            float(text_cfg.get("children_summary_compress_trigger_ratio", 0.27)) * 100.0
+        )
+        self.spin_children_group_budget_ratio.setValue(
+            float(text_cfg.get("children_summary_group_budget_ratio", 0.24)) * 100.0
+        )
+        self.cb_auto_continue_on_incomplete.setChecked(
+            bool(text_cfg.get("auto_continue_on_incomplete", True))
+        )
+        self.spin_auto_continue_max_rounds.setValue(
+            int(text_cfg.get("auto_continue_max_rounds", 3))
+        )
+
         raw_text_history = text_cfg.get("instructions_history", [])
         self.text_instructions_history = []
         for item in raw_text_history:
@@ -500,33 +769,21 @@ class SettingsDialog(QDialog):
                 self.text_instructions_history.append({"name": "", "content": item})
             elif isinstance(item, dict):
                 self.text_instructions_history.append(item)
-        
-        text_current_instruction = text_cfg.get("instructions", "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。")
-        
-        # 确保当前文本生成指令在历史列表中
-        if text_current_instruction:
-            exists = False
-            for inst in self.text_instructions_history:
-                if inst.get("content") == text_current_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.text_instructions_history.insert(0, {"name": "", "content": text_current_instruction})
-            
+        text_current_instruction = text_cfg.get("instructions", self._default_text_profile()["instructions"])
+        if text_current_instruction and not any(
+            inst.get("content") == text_current_instruction
+            for inst in self.text_instructions_history
+        ):
+            self.text_instructions_history.insert(0, {"name": "", "content": text_current_instruction})
         self.update_text_instruction_combo()
-        
-        # 设置当前选中的文本生成指令文本
         self.text_instruction_input.setPlainText(text_current_instruction)
-        # 尝试在下拉框中定位到当前指令
-        idx = -1
-        for i, inst in enumerate(self.text_instructions_history):
-            if inst.get("content") == text_current_instruction:
-                idx = i
-                break
+        idx = next(
+            (i for i, inst in enumerate(self.text_instructions_history) if inst.get("content") == text_current_instruction),
+            -1,
+        )
         if idx >= 0:
             self.text_instruction_combo.setCurrentIndex(idx)
-        
-        # 加载概要生成历史指令列表
+
         raw_summary_history = text_cfg.get("summary_instructions_history", [])
         self.summary_instructions_history = []
         for item in raw_summary_history:
@@ -534,33 +791,23 @@ class SettingsDialog(QDialog):
                 self.summary_instructions_history.append({"name": "", "content": item})
             elif isinstance(item, dict):
                 self.summary_instructions_history.append(item)
-        
-        summary_current_instruction = text_cfg.get("summary_instructions", "你是一个专业的小说编辑，擅长为小说节点生成精炼、准确的概要。")
-        
-        # 确保当前概要生成指令在历史列表中
-        if summary_current_instruction:
-            exists = False
-            for inst in self.summary_instructions_history:
-                if inst.get("content") == summary_current_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.summary_instructions_history.insert(0, {"name": "", "content": summary_current_instruction})
-            
+        summary_current_instruction = text_cfg.get(
+            "summary_instructions", self._default_text_profile()["summary_instructions"]
+        )
+        if summary_current_instruction and not any(
+            inst.get("content") == summary_current_instruction
+            for inst in self.summary_instructions_history
+        ):
+            self.summary_instructions_history.insert(0, {"name": "", "content": summary_current_instruction})
         self.update_summary_instruction_combo()
-        
-        # 设置当前选中的概要生成指令文本
         self.summary_instruction_input.setPlainText(summary_current_instruction)
-        # 尝试在下拉框中定位到当前指令
-        idx = -1
-        for i, inst in enumerate(self.summary_instructions_history):
-            if inst.get("content") == summary_current_instruction:
-                idx = i
-                break
+        idx = next(
+            (i for i, inst in enumerate(self.summary_instructions_history) if inst.get("content") == summary_current_instruction),
+            -1,
+        )
         if idx >= 0:
             self.summary_instruction_combo.setCurrentIndex(idx)
 
-        # 加载编辑改写历史指令列表
         raw_modify_history = text_cfg.get("modify_instructions_history", [])
         self.modify_instructions_history = []
         for item in raw_modify_history:
@@ -568,33 +815,75 @@ class SettingsDialog(QDialog):
                 self.modify_instructions_history.append({"name": "", "content": item})
             elif isinstance(item, dict):
                 self.modify_instructions_history.append(item)
-
         modify_current_instruction = text_cfg.get(
-            "modify_instructions",
-            "你是一个专业的小说改写编辑。你必须严格遵循用户的修改要求，对原文进行高质量改写。只输出修改后的完整正文，不要附加解释。",
+            "modify_instructions", self._default_text_profile()["modify_instructions"]
         )
-
-        # 确保当前编辑改写指令在历史列表中
-        if modify_current_instruction:
-            exists = False
-            for inst in self.modify_instructions_history:
-                if inst.get("content") == modify_current_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.modify_instructions_history.insert(0, {"name": "", "content": modify_current_instruction})
-
+        if modify_current_instruction and not any(
+            inst.get("content") == modify_current_instruction
+            for inst in self.modify_instructions_history
+        ):
+            self.modify_instructions_history.insert(0, {"name": "", "content": modify_current_instruction})
         self.update_modify_instruction_combo()
-
-        # 设置当前选中的编辑改写指令文本
         self.modify_instruction_input.setPlainText(modify_current_instruction)
-        idx = -1
-        for i, inst in enumerate(self.modify_instructions_history):
-            if inst.get("content") == modify_current_instruction:
-                idx = i
-                break
+        idx = next(
+            (i for i, inst in enumerate(self.modify_instructions_history) if inst.get("content") == modify_current_instruction),
+            -1,
+        )
         if idx >= 0:
             self.modify_instruction_combo.setCurrentIndex(idx)
+
+    def on_text_profile_changed(self, index):
+        if self._is_switching_text_profile:
+            return
+        sender_combo = self.sender()
+        if isinstance(sender_combo, QComboBox):
+            new_key = sender_combo.itemData(index) or "normal"
+        else:
+            new_key = self.text_profile_combo.itemData(index) or "normal"
+        if new_key == self._current_text_profile_key:
+            return
+        self.text_api_profiles[self._current_text_profile_key] = self._collect_current_text_profile_from_ui()
+        self._current_text_profile_key = str(new_key)
+        self._is_switching_text_profile = True
+        try:
+            sync_idx = self.text_profile_combo.findData(self._current_text_profile_key)
+            if sync_idx >= 0:
+                self.text_profile_combo.blockSignals(True)
+                self.text_profile_combo.setCurrentIndex(sync_idx)
+                self.text_profile_combo.blockSignals(False)
+                self.instructions_profile_combo.blockSignals(True)
+                self.instructions_profile_combo.setCurrentIndex(sync_idx)
+                self.instructions_profile_combo.blockSignals(False)
+            self._apply_text_profile_to_ui(self.text_api_profiles.get(self._current_text_profile_key, {}))
+            self._refresh_generation_instruction_labels()
+        finally:
+            self._is_switching_text_profile = False
+
+    def _refresh_generation_instruction_labels(self):
+        mode_name = "NSFW文本生成" if self._current_text_profile_key == "nsfw" else "普通文本生成"
+        self.instructions_sub_tabs.setTabText(0, f"📝 {mode_name}系统指令")
+        self.text_instruction_input.setPlaceholderText(
+            f"{mode_name}系统提示词，例如：你是一个专业的小说家..."
+        )
+
+    def populate_data(self):
+        self.text_api_profiles = self._extract_text_api_profiles()
+        initial_key = "normal"
+        if self.parent() is not None and bool(getattr(self.parent(), "_workspace_is_nsfw", False)):
+            initial_key = "nsfw"
+        idx = self.text_profile_combo.findData(initial_key)
+        if idx < 0:
+            idx = 0
+            initial_key = "normal"
+        self._current_text_profile_key = initial_key
+        self.text_profile_combo.blockSignals(True)
+        self.text_profile_combo.setCurrentIndex(idx)
+        self.text_profile_combo.blockSignals(False)
+        self.instructions_profile_combo.blockSignals(True)
+        self.instructions_profile_combo.setCurrentIndex(idx)
+        self.instructions_profile_combo.blockSignals(False)
+        self._apply_text_profile_to_ui(self.text_api_profiles.get(self._current_text_profile_key, {}))
+        self._refresh_generation_instruction_labels()
 
         img_cfg = self.config.get("image_api", {})
         self.img_type_combo.setCurrentText(img_cfg.get("type", "openai"))
@@ -605,6 +894,12 @@ class SettingsDialog(QDialog):
         proxy_cfg = self.config.get("proxy", {})
         self.cb_enable_proxy.setChecked(proxy_cfg.get("enabled", False))
         self.proxy_url_input.setText(proxy_cfg.get("url", "http://127.0.0.1:7890"))
+        self.cb_task_completion_notification.setChecked(
+            bool(self.config.get("task_completion_notification_enabled", True))
+        )
+        self.recent_api_configs = self._deduplicate_recent_api_configs(
+            self.config.get("recent_api_configs", [])
+        )[:20]
 
 
 
@@ -644,6 +939,158 @@ class SettingsDialog(QDialog):
         if value in ("conservative", "balanced", "aggressive"):
             return value
         return "balanced"
+
+    def _normalize_image_api(self, raw_image_api):
+        image_api = raw_image_api if isinstance(raw_image_api, dict) else {}
+        return {
+            "type": str(image_api.get("type", "openai")).strip() or "openai",
+            "base_url": str(
+                image_api.get("base_url", "https://api.openai.com/v1")
+            ).strip()
+            or "https://api.openai.com/v1",
+            "api_key": str(image_api.get("api_key", "")).strip(),
+            "model": str(image_api.get("model", "dall-e-3")).strip() or "dall-e-3",
+        }
+
+    def _normalize_proxy_config(self, raw_proxy):
+        proxy = raw_proxy if isinstance(raw_proxy, dict) else {}
+        return {
+            "enabled": bool(proxy.get("enabled", False)),
+            "url": str(proxy.get("url", "http://127.0.0.1:7890")).strip()
+            or "http://127.0.0.1:7890",
+        }
+
+    def _normalize_api_snapshot(self, raw_snapshot):
+        snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+        raw_text_profiles = snapshot.get("text_api_profiles", {})
+        if isinstance(raw_text_profiles, dict):
+            normal_raw = raw_text_profiles.get("normal", {})
+            nsfw_raw = raw_text_profiles.get("nsfw", {})
+        else:
+            normal_raw = {}
+            nsfw_raw = {}
+        text_api_profiles = {
+            "normal": self._normalize_text_profile(normal_raw),
+            "nsfw": self._normalize_text_profile(nsfw_raw),
+        }
+        active_profile = str(snapshot.get("text_api_active_profile", "normal")).strip().lower()
+        if active_profile not in ("normal", "nsfw"):
+            active_profile = "normal"
+        return {
+            "text_api_profiles": text_api_profiles,
+            "text_api_active_profile": active_profile,
+            "image_api": self._normalize_image_api(snapshot.get("image_api", {})),
+            "proxy": self._normalize_proxy_config(snapshot.get("proxy", {})),
+        }
+
+    def _snapshot_to_unique_key(self, snapshot):
+        normalized = self._normalize_api_snapshot(snapshot)
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+    def _deduplicate_recent_api_configs(self, recent_list):
+        normalized_list = []
+        seen = set()
+        for item in recent_list if isinstance(recent_list, list) else []:
+            normalized = self._normalize_api_snapshot(item)
+            key = self._snapshot_to_unique_key(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_list.append(normalized)
+        return normalized_list
+
+    def _build_current_api_snapshot(self):
+        current_profiles = {
+            "normal": self._normalize_text_profile(self.text_api_profiles.get("normal", {})),
+            "nsfw": self._normalize_text_profile(self.text_api_profiles.get("nsfw", {})),
+        }
+        active_profile = self._current_text_profile_key if self._current_text_profile_key in ("normal", "nsfw") else "normal"
+        return {
+            "text_api_profiles": current_profiles,
+            "text_api_active_profile": active_profile,
+            "image_api": self._normalize_image_api(
+                {
+                    "type": self.img_type_combo.currentText(),
+                    "base_url": self.img_base_url_input.text().strip(),
+                    "api_key": self.img_api_key_input.text().strip(),
+                    "model": self.img_model_combo.currentText().strip(),
+                }
+            ),
+            "proxy": self._normalize_proxy_config(
+                {
+                    "enabled": self.cb_enable_proxy.isChecked(),
+                    "url": self.proxy_url_input.text().strip(),
+                }
+            ),
+        }
+
+    def _build_recent_api_item_label(self, item, index):
+        snapshot = self._normalize_api_snapshot(item)
+        active_profile = snapshot.get("text_api_active_profile", "normal")
+        text_profile = snapshot.get("text_api_profiles", {}).get(active_profile, {})
+        text_model = str(text_profile.get("model", "")).strip() or "-"
+        text_type = str(text_profile.get("type", "")).strip() or "-"
+        image_cfg = snapshot.get("image_api", {})
+        image_model = str(image_cfg.get("model", "")).strip() or "-"
+        return f"{index + 1}. [{active_profile}] 文本:{text_type}/{text_model} | 图像:{image_model}"
+
+    def _apply_recent_api_snapshot_to_ui(self, snapshot):
+        normalized = self._normalize_api_snapshot(snapshot)
+        self.text_api_profiles = copy.deepcopy(normalized["text_api_profiles"])
+        self._current_text_profile_key = normalized["text_api_active_profile"]
+
+        idx = self.text_profile_combo.findData(self._current_text_profile_key)
+        if idx < 0:
+            idx = 0
+            self._current_text_profile_key = "normal"
+
+        self._is_switching_text_profile = True
+        try:
+            self.text_profile_combo.blockSignals(True)
+            self.text_profile_combo.setCurrentIndex(idx)
+            self.text_profile_combo.blockSignals(False)
+            self.instructions_profile_combo.blockSignals(True)
+            self.instructions_profile_combo.setCurrentIndex(idx)
+            self.instructions_profile_combo.blockSignals(False)
+        finally:
+            self._is_switching_text_profile = False
+
+        self._apply_text_profile_to_ui(
+            self.text_api_profiles.get(self._current_text_profile_key, {})
+        )
+        self._refresh_generation_instruction_labels()
+
+        image_cfg = normalized["image_api"]
+        self.img_type_combo.setCurrentText(image_cfg.get("type", "openai"))
+        self.img_base_url_input.setText(image_cfg.get("base_url", "https://api.openai.com/v1"))
+        self.img_api_key_input.setText(image_cfg.get("api_key", ""))
+        self.img_model_combo.setCurrentText(image_cfg.get("model", "dall-e-3"))
+
+        proxy_cfg = normalized["proxy"]
+        self.cb_enable_proxy.setChecked(proxy_cfg.get("enabled", False))
+        self.proxy_url_input.setText(proxy_cfg.get("url", "http://127.0.0.1:7890"))
+
+    def load_recent_api_config(self):
+        if not self.recent_api_configs:
+            QMessageBox.information(self, "提示", "暂无最近使用的 API 配置。")
+            return
+        labels = [
+            self._build_recent_api_item_label(item, idx)
+            for idx, item in enumerate(self.recent_api_configs)
+        ]
+        selected_text, ok = QInputDialog.getItem(
+            self,
+            "最近使用",
+            "请选择要加载的 API 配置：",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not selected_text:
+            return
+        selected_index = labels.index(selected_text)
+        self._apply_recent_api_snapshot_to_ui(self.recent_api_configs[selected_index])
+        QMessageBox.information(self, "成功", "已加载最近使用的 API 配置。")
 
     def _extract_model_meta(self, model_item):
         if not isinstance(model_item, dict):
@@ -747,81 +1194,44 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "提示", "当前仅支持自动拉取 OpenAI 兼容格式 (如 DeepSeek, Moonshot 等) 的模型列表。对于 Gemini，请手动输入模型名称（如 gemini-1.5-pro）。")
 
     def save_config(self):
-        # 在保存配置时，如果当前文本框里的内容不在历史记录里，自动帮用户存一份
-        current_text_instruction = self.text_instruction_input.toPlainText().strip()
-        if current_text_instruction:
-            exists = False
-            for inst in self.text_instructions_history:
-                if inst.get("content") == current_text_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.text_instructions_history.append({"name": "", "content": current_text_instruction})
-        
-        # 同样处理概要生成指令
-        current_summary_instruction = self.summary_instruction_input.toPlainText().strip()
-        if current_summary_instruction:
-            exists = False
-            for inst in self.summary_instructions_history:
-                if inst.get("content") == current_summary_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.summary_instructions_history.append({"name": "", "content": current_summary_instruction})
-
-        # 同样处理编辑改写指令
-        current_modify_instruction = self.modify_instruction_input.toPlainText().strip()
-        if current_modify_instruction:
-            exists = False
-            for inst in self.modify_instructions_history:
-                if inst.get("content") == current_modify_instruction:
-                    exists = True
-                    break
-            if not exists:
-                self.modify_instructions_history.append({"name": "", "content": current_modify_instruction})
-
-        model_name = self.txt_model_combo.currentText().strip()
-        model_capabilities = self._normalize_capabilities(
-            self.txt_model_capabilities_input.text().strip()
+        self.text_api_profiles[self._current_text_profile_key] = (
+            self._collect_current_text_profile_from_ui()
         )
-        model_context_size = int(self.spin_model_context_size.value())
-        compression_profile = self._normalize_compression_profile(
-            self.world_compression_profile_combo.currentData()
+        normal_profile = self._normalize_text_profile(
+            self.text_api_profiles.get("normal", {})
         )
-        if model_name:
-            self.text_model_meta_catalog[model_name] = {
-                "capabilities": model_capabilities,
-                "context_size": model_context_size,
-            }
+        nsfw_profile = self._normalize_text_profile(
+            self.text_api_profiles.get("nsfw", {})
+        )
+        text_api_profiles = {"normal": normal_profile, "nsfw": nsfw_profile}
+        text_api_active_profile = "normal"
+        if self.parent() is not None and bool(getattr(self.parent(), "_workspace_is_nsfw", False)):
+            text_api_active_profile = "nsfw"
+        active_text_api = copy.deepcopy(text_api_profiles[text_api_active_profile])
+        active_text_api["text_generation_mode"] = text_api_active_profile
+        current_snapshot = self._build_current_api_snapshot()
+        merged_recent = [current_snapshot] + self.recent_api_configs
+        self.recent_api_configs = self._deduplicate_recent_api_configs(merged_recent)[:20]
 
         new_config = {
             "proxy": {
                 "enabled": self.cb_enable_proxy.isChecked(),
                 "url": self.proxy_url_input.text().strip()
             },
-            "text_api": {
-                "type": self.txt_type_combo.currentText(),
-                "base_url": self.txt_base_url_input.text().strip(),
-                "api_key": self.txt_api_key_input.text().strip(),
-                "model": self.txt_model_combo.currentText().strip(),
-                "timeout": self.spin_timeout.value(),
-                "model_capabilities": model_capabilities,
-                "model_context_size": model_context_size,
-                "world_context_compression_profile": compression_profile,
-                "model_meta_catalog": self.text_model_meta_catalog,
-                "instructions": current_text_instruction,
-                "instructions_history": self.text_instructions_history,
-                "summary_instructions": current_summary_instruction,
-                "summary_instructions_history": self.summary_instructions_history,
-                "modify_instructions": current_modify_instruction,
-                "modify_instructions_history": self.modify_instructions_history,
-            },
+            "text_api_profiles": text_api_profiles,
+            "text_api_active_profile": text_api_active_profile,
+            "text_generation_mode": text_api_active_profile,
+            "text_api": active_text_api,
             "image_api": {
                 "type": self.img_type_combo.currentText(),
                 "base_url": self.img_base_url_input.text().strip(),
                 "api_key": self.img_api_key_input.text().strip(),
                 "model": self.img_model_combo.currentText().strip()
-            }
+            },
+            "task_completion_notification_enabled": (
+                self.cb_task_completion_notification.isChecked()
+            ),
+            "recent_api_configs": self.recent_api_configs,
         }
         
         # 确保 conf 目录存在

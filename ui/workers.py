@@ -10,6 +10,7 @@ import re
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.workspace_manager import WorkspaceManager
+from core.html_exporter import HtmlExporter
 from ui.utils import clean_json_string
 
 
@@ -34,7 +35,11 @@ class OutlineBuildingThread(QThread):
             json_sys_prompt = "你现在是一个专业的数据结构化助手。你必须严格按照用户的要求输出纯 JSON 格式的数据。绝对不允许使用 Markdown 代码块（严禁出现 ```json 和 ```），严禁包含任何前言或解释说明。"
             
             prompt = self.prompt_tpl.format(idea=self.idea, settings_text=self.settings_text)
-            res_raw = self.llm_client.generate_text(prompt, override_system_instruction=json_sys_prompt)
+            res_raw = self.llm_client.generate_text(
+                prompt,
+                override_system_instruction=json_sys_prompt,
+                progress_callback=self.progress_signal.emit,
+            )
             
             if res_raw and res_raw.strip().startswith("> **生成失败:**"):
                 self.error_signal.emit(res_raw)
@@ -89,7 +94,11 @@ class WorldBuildingThread(QThread):
                         existing_context += f"【{cat}】: {', '.join(files)}\n"
 
             prompt_1 = self.prompt_1_tpl.format(idea=self.idea, existing_context=existing_context)
-            list_res_raw = self.llm_client.generate_text(prompt_1, override_system_instruction=json_sys_prompt)
+            list_res_raw = self.llm_client.generate_text(
+                prompt_1,
+                override_system_instruction=json_sys_prompt,
+                progress_callback=self.progress_signal.emit,
+            )
 
             if list_res_raw and list_res_raw.strip().startswith("> **生成失败:**"):
                 self.error_signal.emit(list_res_raw)
@@ -132,7 +141,11 @@ class WorldBuildingThread(QThread):
                     cat=cat, name=name, summary=summary, template_str=template_str
                 )
 
-                detail_res_raw = self.llm_client.generate_text(prompt_2, override_system_instruction=json_sys_prompt)
+                detail_res_raw = self.llm_client.generate_text(
+                    prompt_2,
+                    override_system_instruction=json_sys_prompt,
+                    progress_callback=self.progress_signal.emit,
+                )
                 detail_res = clean_json_string(detail_res_raw)
                 
                 try:
@@ -199,7 +212,11 @@ class IndexGenerateThread(QThread):
             json_sys_prompt = "你现在是一个专业的数据归纳与结构化助手。你必须严格按照用户的要求输出纯 JSON 格式的数据，绝对不允许包含任何多余的解释文本或 Markdown 代码块。"
             prompt = self.prompt_tpl.format(category=self.category, all_content=all_content)
             
-            res_raw = self.llm_client.generate_text(prompt, override_system_instruction=json_sys_prompt)
+            res_raw = self.llm_client.generate_text(
+                prompt,
+                override_system_instruction=json_sys_prompt,
+                progress_callback=self.progress_signal.emit,
+            )
             res = clean_json_string(res_raw)
             
             try:
@@ -216,6 +233,7 @@ class IndexGenerateThread(QThread):
 # ================= 通用文本生成线程 =================
 class GenerateTaskThread(QThread):
     # 定义两个信号，用于向主线程传递成功的结果或失败的错误信息
+    progress_signal = pyqtSignal(str)
     success_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
 
@@ -227,13 +245,206 @@ class GenerateTaskThread(QThread):
 
     def run(self):
         try:
-            result = self.llm_client.generate_text(self.prompt_content, override_system_instruction=self.override_system_instruction)
+            result = self.llm_client.generate_text(
+                self.prompt_content,
+                override_system_instruction=self.override_system_instruction,
+                progress_callback=self.progress_signal.emit,
+            )
             # 【防雪崩修复】：拦截 llm_client 返回的文本格式错误信息
             if result and result.strip().startswith("> **生成失败:**"):
                 error_msg = result.replace("> **生成失败:**", "").strip()
                 self.error_signal.emit(error_msg)
             else:
                 self.success_signal.emit(result)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class ProofreadThread(QThread):
+    progress_signal = pyqtSignal(str)
+    meta_signal = pyqtSignal(dict)
+    success_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def __init__(
+        self,
+        llm_client,
+        workspace,
+        config,
+        mode: str,
+        resume: bool,
+        stop_event=None,
+        skip_existing_pending: bool = True,
+        include_categories: set[str] | None = None,
+        include_chapters: set[str] | None = None,
+        find_include_chapters: set[str] | None = None,
+        find_scene_title_keywords: list[str] | None = None,
+        parallel_passes: int | None = None,
+        parallel_solves: int | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.workspace = workspace
+        self.config = config or {}
+        self.mode = str(mode or "").strip().lower()
+        self.resume = bool(resume)
+        self.stop_event = stop_event
+        self.skip_existing_pending = bool(skip_existing_pending)
+        self.include_categories = include_categories
+        self.include_chapters = include_chapters
+        self.find_include_chapters = find_include_chapters
+        self.find_scene_title_keywords = find_scene_title_keywords
+        self.parallel_passes = parallel_passes
+        self.parallel_solves = parallel_solves
+
+    def run(self):
+        try:
+            if not self.workspace:
+                self.error_signal.emit("工作区为空，无法启动校对。")
+                return
+            if not self.llm_client:
+                self.error_signal.emit("未配置大模型 API，无法启动校对。请先在“设置”中配置。")
+                return
+
+            import os
+            import json
+
+            from modules.proofread import create_default_engine
+            from modules.proofread.engine import build_issue_from_dict
+
+            runtime_config = dict(self.config or {})
+            proofread_cfg = dict(runtime_config.get("proofread", {}) or {})
+            if self.parallel_passes is not None:
+                proofread_cfg["parallel_passes"] = int(self.parallel_passes)
+            if self.parallel_solves is not None:
+                proofread_cfg["parallel_solves"] = int(self.parallel_solves)
+            runtime_config["proofread"] = proofread_cfg
+
+            engine = create_default_engine(workspace=self.workspace, llm_client=self.llm_client, config=runtime_config)
+
+            if self.mode == "find":
+                data = engine.loader.load_workspace_data(
+                    include_chapters=self.find_include_chapters,
+                    scene_title_keywords=self.find_scene_title_keywords,
+                )
+                scene_list = data.get("scene_list", []) or []
+                tasks_total = len(scene_list) * len(engine.pass_instances)
+                self.meta_signal.emit(
+                    {
+                        "phase": "find",
+                        "scenes_total": len(scene_list),
+                        "passes_total": len(engine.pass_instances),
+                        "tasks_total": tasks_total,
+                        "resume": self.resume,
+                        "parallel_passes": proofread_cfg.get("parallel_passes"),
+                        "filters": {
+                            "chapters": sorted(self.find_include_chapters) if self.find_include_chapters else [],
+                            "keywords": [str(x) for x in (self.find_scene_title_keywords or []) if str(x).strip()],
+                        },
+                    }
+                )
+                try:
+                    if self.resume:
+                        issues = engine.resume_find_scoped(
+                            include_chapters=self.find_include_chapters,
+                            scene_title_keywords=self.find_scene_title_keywords,
+                            stop_event=self.stop_event,
+                            progress_callback=self.progress_signal.emit,
+                        )
+                    else:
+                        issues = engine.run_find_scoped(
+                            include_chapters=self.find_include_chapters,
+                            scene_title_keywords=self.find_scene_title_keywords,
+                            stop_event=self.stop_event,
+                            progress_callback=self.progress_signal.emit,
+                        )
+                except InterruptedError:
+                    self.success_signal.emit({"phase": "find", "status": "paused"})
+                    return
+
+                self.success_signal.emit(
+                    {
+                        "phase": "find",
+                        "status": "completed",
+                        "issues_count": len(issues or []),
+                    }
+                )
+                return
+
+            if self.mode == "solve":
+                issues_path = os.path.join(self.workspace.sys_data_path, "proofread_issues.json")
+                if not os.path.exists(issues_path):
+                    self.error_signal.emit("没有找到问题清单 proofread_issues.json，请先执行“查找问题（Find）”。")
+                    return
+                with open(issues_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                issue_items = None
+                if isinstance(raw, list):
+                    issue_items = raw
+                elif isinstance(raw, dict):
+                    issue_items = raw.get("issues")
+                if not isinstance(issue_items, list):
+                    self.error_signal.emit("proofread_issues.json 格式异常，期望为数组或包含 issues 的对象。")
+                    return
+                issues = [build_issue_from_dict(x) for x in issue_items if isinstance(x, dict)]
+
+                grouped = engine.solve_engine.group_issues_by_scene(
+                    issues=issues,
+                    include_categories=self.include_categories,
+                    include_chapters=self.include_chapters,
+                )
+                pending_skipped = 0
+                if self.skip_existing_pending and grouped:
+                    for node_id in grouped.keys():
+                        if self.workspace.has_pending_modify(node_id):
+                            pending_skipped += 1
+                self.meta_signal.emit(
+                    {
+                        "phase": "solve",
+                        "scenes_total": max(0, len(grouped) - pending_skipped),
+                        "pending_skipped": pending_skipped,
+                        "filters": {
+                            "categories": sorted(self.include_categories) if self.include_categories else [],
+                            "chapters": sorted(self.include_chapters) if self.include_chapters else [],
+                        },
+                        "resume": self.resume,
+                        "parallel_solves": proofread_cfg.get("parallel_solves"),
+                    }
+                )
+                try:
+                    if self.resume:
+                        stats = engine.resume_solve(
+                            issues=issues,
+                            stop_event=self.stop_event,
+                            progress_callback=self.progress_signal.emit,
+                            include_categories=self.include_categories,
+                            include_chapters=self.include_chapters,
+                            skip_existing_pending=self.skip_existing_pending,
+                        )
+                    else:
+                        stats = engine.run_solve(
+                            issues=issues,
+                            stop_event=self.stop_event,
+                            progress_callback=self.progress_signal.emit,
+                            include_categories=self.include_categories,
+                            include_chapters=self.include_chapters,
+                            skip_existing_pending=self.skip_existing_pending,
+                        )
+                except InterruptedError:
+                    self.success_signal.emit({"phase": "solve", "status": "paused"})
+                    return
+
+                self.success_signal.emit(
+                    {
+                        "phase": "solve",
+                        "status": "completed",
+                        "stats": stats or {},
+                    }
+                )
+                return
+
+            self.error_signal.emit(f"未知的校对模式: {self.mode}")
         except Exception as e:
             self.error_signal.emit(str(e))
 
@@ -484,7 +695,10 @@ class ImportTextWorkspaceThread(QThread):
                 )
 
                 try:
-                    response = self.llm_client.generate_text(prompt)
+                    response = self.llm_client.generate_text(
+                        prompt,
+                        progress_callback=self.progress_signal.emit,
+                    )
                     json_match = re.search(r'\{[\s\S]*\}', response)
 
                     if json_match:
@@ -645,7 +859,10 @@ class ImportTextWorkspaceThread(QThread):
 只返回JSON，不要其他文字。"""
 
         try:
-            response = self.llm_client.generate_text(prompt)
+            response = self.llm_client.generate_text(
+                prompt,
+                progress_callback=self.progress_signal.emit,
+            )
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 settings_data = json.loads(json_match.group())
@@ -695,3 +912,21 @@ class ImportTextWorkspaceThread(QThread):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+# ================= HTML 导出线程 =================
+class HtmlExportThread(QThread):
+    success_signal = pyqtSignal(str)  # output_file
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, workspace, parent=None):
+        super().__init__(parent)
+        self.workspace = workspace
+
+    def run(self):
+        try:
+            exporter = HtmlExporter(self.workspace)
+            output_file = exporter.export()
+            self.success_signal.emit(output_file)
+        except Exception as e:
+            self.error_signal.emit(str(e))

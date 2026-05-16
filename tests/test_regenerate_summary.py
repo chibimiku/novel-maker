@@ -15,17 +15,22 @@ class _FakeSignal:
 class _FakeThread:
     instances = []
 
-    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None):
+    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None, running=False):
         self.llm_client = llm_client
         self.prompt_content = prompt_content
         self.override_system_instruction = override_system_instruction
         self.success_signal = _FakeSignal()
         self.error_signal = _FakeSignal()
         self.started = False
+        self._running = running
         _FakeThread.instances.append(self)
 
     def start(self):
         self.started = True
+        self._running = True
+
+    def isRunning(self):
+        return self._running
 
 
 class _FakeButton:
@@ -64,15 +69,27 @@ class _FakeWorkspace:
 
 
 class _FakeItem:
-    def __init__(self, node_id):
+    def __init__(self, node_id, text="节点"):
         self._node_id = node_id
+        self._text = text
 
     def data(self, col, role):
         return self._node_id
 
+    def text(self, col):
+        return self._text
+
+
+class _FakeTree:
+    def __init__(self, item=None):
+        self._item = item
+
+    def currentItem(self):
+        return self._item
+
 
 class _FakeBuilder:
-    def __init__(self, workspace):
+    def __init__(self, workspace, **kwargs):
         self.workspace = workspace
 
     def build_summary_prompt(self, current_node, tree_data, checked_paths):
@@ -83,6 +100,7 @@ class _DummyWindow(GenerationMixin):
     def __init__(self):
         self.workspace = _FakeWorkspace()
         self.outline_tree_data = {"nodes": []}
+        self.config = {}
         self.llm_client = type("LLM", (), {"summary_system_instruction": "summary-sys"})()
         self.current_editing_node = None
         self.current_editing_item = None
@@ -96,6 +114,7 @@ class _DummyWindow(GenerationMixin):
         self.btn_save = _FakeButton()
         self.btn_delete = _FakeButton()
         self.btn_regenerate_summary = _FakeButton()
+        self.novel_tree = _FakeTree()
         self.saved_called = 0
         self.undo_saved = []
         self.restore_called = 0
@@ -103,7 +122,7 @@ class _DummyWindow(GenerationMixin):
         self.is_batch_generating = False
 
     def _get_current_node_from_tree(self):
-        return None
+        return GenerationMixin._get_current_node_from_tree(self)
 
     def _save_to_undo_stack(self, change_type, old_value):
         self.undo_saved.append((change_type, old_value))
@@ -197,12 +216,42 @@ class RegenerateSummaryTests(unittest.TestCase):
         win.current_editing_node = node
         win.current_editing_item = _FakeItem("n1")
         win.node_map["n1"] = node
-        win.generate_thread = object()
+        win.generate_thread = _FakeThread(None, "", running=True)
 
         win.regenerate_summary()
 
-        self.assertEqual(len(_FakeThread.instances), 0)
+        self.assertEqual(len(_FakeThread.instances), 1)
         self.assertTrue(any("已有生成任务在进行中" in msg for msg in win.log_console.messages))
+
+    @patch("ui.mixins.generation_mixin.ContextBuilder", _FakeBuilder)
+    @patch("ui.mixins.generation_mixin.GenerateTaskThread", _FakeThread)
+    def test_regenerate_summary_allows_stale_finished_thread_reference(self):
+        win = _DummyWindow()
+        node = {"id": "n1", "title": "节点1", "summary": "old"}
+        win.current_editing_node = node
+        win.current_editing_item = _FakeItem("n1")
+        win.node_map["n1"] = node
+        win.generate_thread = _FakeThread(None, "", running=False)
+
+        win.regenerate_summary()
+
+        self.assertEqual(len(_FakeThread.instances), 2)
+        self.assertTrue(_FakeThread.instances[-1].started)
+
+    @patch("ui.mixins.generation_mixin.ContextBuilder", _FakeBuilder)
+    @patch("ui.mixins.generation_mixin.GenerateTaskThread", _FakeThread)
+    def test_regenerate_summary_uses_tree_current_item_as_fallback(self):
+        win = _DummyWindow()
+        node = {"id": "n2", "title": "节点2", "summary": "old"}
+        win.node_map["n2"] = node
+        win.current_editing_item = None
+        win.current_editing_node = None
+        win.novel_tree = _FakeTree(_FakeItem("n2"))
+
+        win.regenerate_summary()
+
+        self.assertEqual(len(_FakeThread.instances), 1)
+        self.assertTrue(_FakeThread.instances[0].started)
 
 
 if __name__ == "__main__":

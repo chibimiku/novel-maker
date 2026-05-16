@@ -4,13 +4,22 @@ NovelCreatorWindow 主窗口 —— 仅保留 __init__ / init_ui / refresh_ui �
 """
 import sys
 import os
+from contextlib import contextmanager
+from typing import Any
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QCheckBox, QSpinBox, QAbstractItemView,
                              QProxyStyle, QStyle, QSizePolicy)
-from PyQt6.QtGui import QKeySequence, QAction, QShortcut, QCloseEvent
+from PyQt6.QtGui import (
+    QKeySequence,
+    QAction,
+    QShortcut,
+    QCloseEvent,
+    QTextCharFormat,
+    QPalette,
+)
 from PyQt6.QtCore import Qt, QTimer, QEvent
 
 # 导入暗色主题配色常量
@@ -21,6 +30,7 @@ from ui.timeline_dialog import TimelineDialog
 
 # 导入核心逻辑层组件
 from core.llm_client import LLMClient
+from core.workspace_manager import WorkspaceManager
 
 # 导入 Mixin 子模块
 from ui.mixins import (
@@ -48,7 +58,9 @@ class NovelTreeWidget(QTreeWidget):
             parent = parent.parent()
         return level
 
-    def dragMoveEvent(self, event):
+    def dragMoveEvent(self, event: Any):
+        if event is None:
+            return
         super().dragMoveEvent(event)
         if not event.isAccepted():
             return
@@ -65,7 +77,8 @@ class NovelTreeWidget(QTreeWidget):
         # 检查是否包含真正的业务子节点（排除 "+" 按钮）
         has_real_children = False
         for i in range(dragged_item.childCount()):
-            if not dragged_item.child(i).text(0).startswith("+"):
+            child = dragged_item.child(i)
+            if child and not child.text(0).startswith("+"):
                 has_real_children = True
                 break
 
@@ -87,6 +100,7 @@ class NovelTreeWidget(QTreeWidget):
                 event.ignore()
                 return
 
+
     def startDrag(self, supportedActions):
         """记录即将被拖拽的节点，并保存完整的树数据快照"""
         dragged_items = self.selectedItems()
@@ -98,7 +112,9 @@ class NovelTreeWidget(QTreeWidget):
                 self.main_window._pre_drag_tree_snapshot = copy.deepcopy(self.main_window.outline_tree_data)
         super().startDrag(supportedActions)
 
-    def dropEvent(self, event):
+    def dropEvent(self, event: Any):
+        if event is None:
+            return
         target_item = self.itemAt(event.position().toPoint())
         dragged_items = self.selectedItems()
         if not dragged_items:
@@ -110,7 +126,8 @@ class NovelTreeWidget(QTreeWidget):
 
         has_real_children = False
         for i in range(dragged_item.childCount()):
-            if not dragged_item.child(i).text(0).startswith("+"):
+            child = dragged_item.child(i)
+            if child and not child.text(0).startswith("+"):
                 has_real_children = True
                 break
 
@@ -141,26 +158,41 @@ class NovelTreeWidget(QTreeWidget):
         if self.main_window:
             QTimer.singleShot(0, self.main_window._handle_drop_sync)
 
-    def _rescue_add_button_children(self, parent_item=None):
+    def _rescue_add_button_children(self, parent_item: Any = None):
         """
         自愈机制：倒序遍历节点。如果发现 '+' 按钮被 Qt 强行塞了子节点，
         就把它提取出来，放到 '+' 按钮的前面（成为正常的同级节点）。
         """
         target = parent_item if parent_item else self.invisibleRootItem()
+        if target is None:
+            return
         # 必须倒序遍历，因为我们要执行插入操作，正序会打乱索引
         for i in range(target.childCount() - 1, -1, -1):
             child = target.child(i)
+            if child is None:
+                continue
             if child.text(0).startswith("+"):
                 # 如果发现加号按钮有子节点（非法状态）
                 while child.childCount() > 0:
                     # 将其提取出来
                     rescued_node = child.takeChild(0)
                     # 插入到 target 中，位置在当前加号按钮的正前方
-                    target.insertChild(i, rescued_node)
+                    if rescued_node is not None:
+                        target.insertChild(i, rescued_node)
                     # 递归检查刚被提取出来的节点
                     self._rescue_add_button_children(rescued_node)
             else:
                 self._rescue_add_button_children(child)
+
+
+class SafeLogBrowser(QTextBrowser):
+    """每次输出后重置当前字符样式，避免颜色串色到后续普通日志。"""
+
+    def append(self, text: str) -> None:  # type: ignore[override]
+        super().append(text)
+        fmt = QTextCharFormat()
+        fmt.setForeground(self.palette().color(QPalette.ColorRole.Text))
+        self.setCurrentCharFormat(fmt)
 
 
 class CompactTreeStyle(QProxyStyle):
@@ -196,13 +228,14 @@ class NovelCreatorWindow(
         self.resize(1200, 800)
 
         # 运行时状态变量
-        self.workspace = None             # 当前打开的工作区管理器实例
+        self.workspace: WorkspaceManager | None = None  # 当前打开的工作区管理器实例
         self.outline_tree_data = None     # 内存中维护的小说树状结构字典
         self.current_editing_node = None  # 当前正在编辑器中编辑的节点字典数据
         self.current_editing_item = None  # 当前在树状视图中选中的 QTreeWidgetItem 实例
         self.current_setting_path = None  # 当前编辑的设定文件绝对路径
         self.node_map = {}                # 节点内存引用的绝对映射表
         self._updating_settings = False
+        self.generate_thread = None       # 当前通用生成线程（正文/概要）
 
         # 批量生成相关的状态变量
         self.batch_generate_queue = []
@@ -217,13 +250,26 @@ class NovelCreatorWindow(
         
         # 拖拽前的树数据快照
         self._pre_drag_tree_snapshot = None
-        # “+新增...”调试日志开关（持久化）
-        self._debug_add_button = self._get_debug_add_button_enabled()
+        # 节点剪贴板缓存（配合系统剪贴板 JSON）
+        self._novel_node_clipboard = None
+        # 统一 Debug Log 开关（持久化）
+        self._debug_log_enabled = self._get_debug_log_enabled()
+        # 兼容旧变量读取
+        self._debug_add_button = self._debug_log_enabled
+        os.environ["PROOFREAD_DEBUG_LOG"] = "1" if self._debug_log_enabled else "0"
         # “修改内容”时是否附加写作风格（持久化）
         self._append_writing_style_on_modify = self._get_modify_style_option()
+        # 批量修改请求并发线程数（持久化）
+        self._batch_modify_thread_count = self._get_batch_modify_thread_count()
+        # 内容变更后自动导出 www 网页（持久化）
+        self._auto_export_www_enabled = self._get_auto_export_www_enabled()
+        # 生成前是否启用“设定集智能勾选”（会额外请求一次 LLM）
+        self._smart_setting_selection_enabled = self._get_smart_setting_selection_enabled()
+        # 工作区是否启用 NSFW 文本模型配置
+        self._workspace_is_nsfw = False
 
         self.config = self._load_config()
-        self.llm_client = LLMClient(self.config) if self.config else None
+        self.llm_client: LLMClient | None = LLMClient(self.config) if self.config else None
 
         self.init_ui()
         self._ui_state_save_timer = QTimer(self)
@@ -236,6 +282,36 @@ class NovelCreatorWindow(
         recent_workspaces = sys_state.get("recent_workspaces", [])
         if recent_workspaces and os.path.exists(recent_workspaces[0]):
             self._load_workspace_by_path(recent_workspaces[0])
+
+    def _set_loading_state(self, message: str, loading: bool) -> None:
+        """统一管理短时阻塞任务的可见状态，避免用户感知为“无响应”"""
+        if loading:
+            if not hasattr(self, "_loading_depth"):
+                self._loading_depth = 0
+            self._loading_depth += 1
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            statusbar = self.statusBar()
+            if statusbar is not None:
+                statusbar.showMessage(message or "处理中...")
+            QApplication.processEvents()
+            return
+
+        depth = max(int(getattr(self, "_loading_depth", 0)) - 1, 0)
+        self._loading_depth = depth
+        if depth == 0:
+            QApplication.restoreOverrideCursor()
+            statusbar = self.statusBar()
+            if statusbar is not None:
+                statusbar.clearMessage()
+            QApplication.processEvents()
+
+    @contextmanager
+    def loading_ui(self, message: str):
+        self._set_loading_state(message, True)
+        try:
+            yield
+        finally:
+            self._set_loading_state("", False)
 
     # ================= 初始化 UI ================= #
 
@@ -261,31 +337,59 @@ class NovelCreatorWindow(
         file_menu.addAction(reload_action)
         reload_action.triggered.connect(self.reload_workspace)
 
-        save_action = file_menu.addAction('保存全部')
+        save_action = QAction('保存全部', self)
+        file_menu.addAction(save_action)
         save_action.setShortcut(QKeySequence("Ctrl+S"))
         save_action.triggered.connect(self.save_all)
         
-        export_html_action = file_menu.addAction('🌐 导出为可阅读网页 (HTML)')
+        export_html_action = QAction('🌐 导出为可阅读网页 (HTML)', self)
+        file_menu.addAction(export_html_action)
         export_html_action.setShortcut(QKeySequence("Ctrl+E"))
         export_html_action.triggered.connect(self.export_to_html)
         
-        setting_menu = menubar.addMenu('设置')
-        settings_action = setting_menu.addAction('系统配置 (API/模型)')
+        setting_menu = QMenu('设置', self)
+        menubar.addMenu(setting_menu)
+        settings_action = QAction('系统配置 (API/模型)', self)
+        setting_menu.addAction(settings_action)
         settings_action.setShortcut(QKeySequence("Ctrl+P"))
         settings_action.triggered.connect(self.open_settings_dialog)
 
+        nsfw_corner_widget = QWidget(self)
+        nsfw_corner_layout = QHBoxLayout(nsfw_corner_widget)
+        nsfw_corner_layout.setContentsMargins(0, 0, 8, 0)
+        self.btn_open_workspace = QPushButton("打开工作区")
+        self.btn_open_workspace.setEnabled(False)
+        self.btn_open_workspace.clicked.connect(self.open_workspace_folder)
+        nsfw_corner_layout.addWidget(self.btn_open_workspace)
+        self.cb_workspace_nsfw = QCheckBox("NSFW工作区")
+        self.cb_workspace_nsfw.setEnabled(False)
+        self.cb_workspace_nsfw.setToolTip(
+            "勾选后，该工作区将使用 NSFW 文本模型配置（独立的 API/模型/Prompt）。"
+        )
+        self.cb_workspace_nsfw.toggled.connect(self.on_workspace_nsfw_toggled)
+        nsfw_corner_layout.addWidget(self.cb_workspace_nsfw)
+        menubar.setCornerWidget(nsfw_corner_widget, Qt.Corner.TopRightCorner)
+
         # 添加工具菜单
-        tool_menu = menubar.addMenu('工具')
-        import_text_action = tool_menu.addAction('从文本新建工作区')
+        tool_menu = QMenu('工具', self)
+        menubar.addMenu(tool_menu)
+        import_text_action = QAction('从文本新建工作区', self)
+        tool_menu.addAction(import_text_action)
         import_text_action.triggered.connect(self.new_workspace_from_text)
-        repair_outline_action = tool_menu.addAction('修复章节结构(补节后可新增场景)')
+        repair_outline_action = QAction('修复章节结构(补节后可新增场景)', self)
+        tool_menu.addAction(repair_outline_action)
         repair_outline_action.triggered.connect(self.auto_fix_outline_for_scene_addition)
-        debug_add_btn_action = tool_menu.addAction('显示AddBtn调试日志')
-        debug_add_btn_action.setCheckable(True)
-        debug_add_btn_action.setChecked(self._debug_add_button)
-        debug_add_btn_action.toggled.connect(self.set_add_button_debug_enabled)
-        timeline_action = tool_menu.addAction('时间线校对')
+        debug_log_action = QAction('显示 Debug Log', self)
+        tool_menu.addAction(debug_log_action)
+        debug_log_action.setCheckable(True)
+        debug_log_action.setChecked(self._debug_log_enabled)
+        debug_log_action.toggled.connect(self.set_debug_log_enabled)
+        timeline_action = QAction('时间线校对', self)
+        tool_menu.addAction(timeline_action)
         timeline_action.triggered.connect(self.open_timeline_dialog)
+        proofread_action = QAction('小说校对（独立模块）', self)
+        tool_menu.addAction(proofread_action)
+        proofread_action.triggered.connect(self.open_proofread_tool_entry)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -293,9 +397,6 @@ class NovelCreatorWindow(
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(True)
-        splitter.setCollapsible(0, True)
-        splitter.setCollapsible(1, True)
-        splitter.setCollapsible(2, True)
         self.main_splitter = splitter
 
         self.setting_tree = QTreeWidget()
@@ -390,6 +491,20 @@ class NovelCreatorWindow(
         self.cb_include_next.setChecked(True)
         param_layout.addWidget(self.cb_include_next)
 
+        self.cb_auto_export_www = QCheckBox("变动后自动更新www网页")
+        self.cb_auto_export_www.setChecked(self._auto_export_www_enabled)
+        self.cb_auto_export_www.toggled.connect(self.on_auto_export_www_toggled)
+        param_layout.addWidget(self.cb_auto_export_www)
+
+        self.cb_smart_setting_select = QCheckBox("智能选择设定集(额外请求LLM)")
+        self.cb_smart_setting_select.setChecked(self._smart_setting_selection_enabled)
+        self.cb_smart_setting_select.toggled.connect(self.on_smart_setting_selection_toggled)
+        self.cb_smart_setting_select.setToolTip(
+            "勾选后，生成正文/重写正文/生成概要前会先请求一次LLM，"
+            "根据当前任务上下文和设定文件名自动筛选要引入的设定。"
+        )
+        param_layout.addWidget(self.cb_smart_setting_select)
+
         param_layout.addWidget(QLabel(" 目标生成字数:"))
         self.spin_word_count = QSpinBox()
         self.spin_word_count.setRange(50, 20000)
@@ -446,6 +561,9 @@ class NovelCreatorWindow(
         detail_layout.addLayout(btn_layout)
 
         splitter.addWidget(detail_widget)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, True)
+        splitter.setCollapsible(2, True)
         splitter.setSizes([180, 430, 590])
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -454,7 +572,7 @@ class NovelCreatorWindow(
         editor_splitter.splitterMoved.connect(self._schedule_window_ui_state_save)
         main_layout.addWidget(splitter, stretch=4)
 
-        self.log_console = QTextBrowser()
+        self.log_console = SafeLogBrowser()
         self.log_console.setFixedHeight(150)
         self.log_console.append("系统初始化完成。")
         main_layout.addWidget(self.log_console, stretch=1)
@@ -480,7 +598,8 @@ class NovelCreatorWindow(
         # 4. 尝试恢复拖拽前/后的当前选中项，避免刷新后焦点丢失
         if current_id:
             from ui.utils import find_item_by_data
-            item = find_item_by_data(self.novel_tree.invisibleRootItem(), current_id)
+            root_item = self.novel_tree.invisibleRootItem()
+            item = find_item_by_data(root_item, current_id) if root_item else None
             if item:
                 self.novel_tree.setCurrentItem(item)
                 self.current_editing_item = item
@@ -634,8 +753,12 @@ class NovelCreatorWindow(
                 select_all_recursive(item.child(i))
 
         root = self.novel_tree.invisibleRootItem()
+        if root is None:
+            return
         for i in range(root.childCount()):
-            select_all_recursive(root.child(i))
+            child = root.child(i)
+            if child is not None:
+                select_all_recursive(child)
 
     def select_none_nodes(self):
         """全不选所有节点"""
@@ -646,8 +769,12 @@ class NovelCreatorWindow(
                 select_none_recursive(item.child(i))
 
         root = self.novel_tree.invisibleRootItem()
+        if root is None:
+            return
         for i in range(root.childCount()):
-            select_none_recursive(root.child(i))
+            child = root.child(i)
+            if child is not None:
+                select_none_recursive(child)
 
     def open_timeline_dialog(self):
         """打开时间线校对窗口"""
@@ -659,6 +786,31 @@ class NovelCreatorWindow(
         
         # 打开时间线校对窗口
         dialog = TimelineDialog(self.outline_tree_data, self, self.workspace)
+        dialog.exec()
+
+    def open_proofread_tool_entry(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from ui.dialogs import ProofreadDialog
+
+        workspace_path = ""
+        if self.workspace:
+            workspace_path = getattr(self.workspace, "workspace_path", "") or ""
+
+        if not workspace_path:
+            QMessageBox.information(self, "小说校对", "请先加载工作区，然后再使用小说校对。")
+            return
+
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+
+        self.log_console.append("<b>已打开小说校对窗口。</b>")
+        dialog = ProofreadDialog(
+            self,
+            workspace=self.workspace,
+            llm_client=self.llm_client,
+            config=self.config or {},
+        )
         dialog.exec()
 
     def closeEvent(self, event: QCloseEvent):

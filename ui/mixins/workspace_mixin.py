@@ -7,10 +7,13 @@ import os
 import uuid
 import re
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
+from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import QUrl
 
+from core.llm_client import LLMClient
 from core.workspace_manager import WorkspaceManager
 from ui.import_text_dialog import ImportTextWorkspaceDialog
 from ui.workers import ImportTextWorkspaceThread
@@ -22,7 +25,36 @@ if TYPE_CHECKING:
 class WorkspaceMixin:
     """处理工作区的新建 / 加载 / 重载操作。"""
 
-    def _get_prompt_template(self, template_name: str, default_content: str = "") -> str:
+    def open_workspace_folder(self: Any):
+        """在系统文件管理器中打开当前工作区目录。"""
+        if not self.workspace:
+            QMessageBox.information(
+                self, "提示", "当前未打开任何工作区。"  # type: ignore[arg-type]
+            )
+            return
+
+        workspace_path = self.workspace.workspace_path
+        ok = QDesktopServices.openUrl(QUrl.fromLocalFile(workspace_path))
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "打开失败",
+                f"无法打开工作区目录：\n{workspace_path}",  # type: ignore[arg-type]
+            )
+
+    def on_workspace_nsfw_toggled(self: Any, checked: bool):
+        """切换工作区 NSFW 状态，并立即切换生效的文本模型配置。"""
+        if not self.workspace:
+            return
+        self.workspace.set_is_nsfw(bool(checked))
+        self._workspace_is_nsfw = bool(checked)
+        self.config = self._load_config()
+        self.llm_client = LLMClient(self.config) if self.config else None
+        self._apply_workspace_instruction_profile()
+        mode_name = "NSFW" if checked else "普通"
+        self.log_console.append(f"已切换工作区模式：{mode_name}（文本模型配置已重载）")
+
+    def _get_prompt_template(self: Any, template_name: str, default_content: str = "") -> str:
         """获取prompt模板"""
         prompt_path = os.path.join("data", "prompts", template_name)
         if os.path.exists(prompt_path):
@@ -33,7 +65,7 @@ class WorkspaceMixin:
                 pass
         return default_content
 
-    def new_workspace_from_text(self: "NovelCreatorWindow"):
+    def new_workspace_from_text(self: Any):
         """从文本新建工作区"""
         dialog = ImportTextWorkspaceDialog(self)
         if dialog.exec() != ImportTextWorkspaceDialog.DialogCode.Accepted:
@@ -70,12 +102,16 @@ class WorkspaceMixin:
         
         worker.start()
     
-    def _on_import_success(self, workspace_path):
+    def _on_import_success(self: Any, workspace_path):
         """导入成功回调"""
         self._load_workspace_by_path(workspace_path)
         self.log_console.append("<font color='green'>工作区创建成功！</font>")
+        self._send_system_notification(
+            "导入完成",
+            "从文本创建工作区任务已完成。",
+        )
     
-    def _process_text_files_with_llm(self, selected_files, word_count, workspace):
+    def _process_text_files_with_llm(self: Any, selected_files, word_count, workspace):
         """使用LLM智能处理文本文件并转换为小说大纲结构"""
         outline_tree_data = {
             "project_name": os.path.basename(workspace.workspace_path),
@@ -117,7 +153,12 @@ class WorkspaceMixin:
                 )
                 
                 try:
-                    response = self.llm_client.generate_text(prompt)
+                    response = self.llm_client.generate_text(
+                        prompt,
+                        progress_callback=lambda msg: self.log_console.append(
+                            f"<font color='gray'>[LLM进度] {msg}</font>"
+                        ),
+                    )
                     json_match = re.search(r'\{[\s\S]*\}', response)
                     
                     if json_match:
@@ -240,7 +281,7 @@ class WorkspaceMixin:
         
         return outline_tree_data
     
-    def _split_text_into_segments(self, content, target_word_count):
+    def _split_text_into_segments(self: Any, content, target_word_count):
         """将文本分割成合适大小的片段，在换行处分割"""
         segments = []
         lines = content.split('\n')
@@ -264,7 +305,7 @@ class WorkspaceMixin:
         
         return segments
     
-    def _create_chapter_node(self, title, summary):
+    def _create_chapter_node(self: Any, title, summary):
         """创建章节节点"""
         return {
             "id": str(uuid.uuid4()),
@@ -274,7 +315,7 @@ class WorkspaceMixin:
             "_status": "ok"
         }
     
-    def _create_section_node(self, title, summary):
+    def _create_section_node(self: Any, title, summary):
         """创建节节点"""
         return {
             "id": str(uuid.uuid4()),
@@ -284,7 +325,7 @@ class WorkspaceMixin:
             "_status": "ok"
         }
     
-    def _create_scene_node(self, title, summary, content, workspace):
+    def _create_scene_node(self: Any, title, summary, content, workspace):
         """创建场景节点"""
         file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
         initial_content = f"# {title}\n\n{content}"
@@ -300,7 +341,7 @@ class WorkspaceMixin:
             "_status": "ok"
         }
     
-    def _append_to_scene_node(self, scene_node, content, workspace):
+    def _append_to_scene_node(self: Any, scene_node, content, workspace):
         """追加内容到现有场景节点"""
         file_path = scene_node.get("file_path")
         if file_path:
@@ -313,7 +354,7 @@ class WorkspaceMixin:
                 new_md5 = workspace.save_markdown_file(file_path, new_content)
                 scene_node["md5"] = new_md5
     
-    def _process_text_files_simple(self, selected_files, word_count, workspace):
+    def _process_text_files_simple(self: Any, selected_files, word_count, workspace):
         """简单模式处理文本文件（无LLM）"""
         nodes = []
         chapter_counter = 1
@@ -396,7 +437,7 @@ class WorkspaceMixin:
         
         return outline_tree_data
     
-    def _split_into_sections(self, content):
+    def _split_into_sections(self: Any, content):
         """根据标题或章节标记将内容分割成节"""
         sections = []
         pattern = r'^#{1,6}\s+.*$|^第[一二三四五六七八九十百千\d]+[章节卷篇].*$'
@@ -420,7 +461,7 @@ class WorkspaceMixin:
         
         return sections
     
-    def _split_content_by_word_count(self, content, target_word_count):
+    def _split_content_by_word_count(self: Any, content, target_word_count):
         """按字数分割内容成多个场景"""
         scenes = []
         paragraphs = content.split('\n\n')
@@ -444,7 +485,7 @@ class WorkspaceMixin:
         
         return scenes
     
-    def _extract_settings_from_text(self, selected_files, workspace):
+    def _extract_settings_from_text(self: Any, selected_files, workspace):
         """使用LLM从文本中提取设定（人物、场景等）"""
         self.log_console.append("正在使用LLM提取设定...")
         
@@ -483,7 +524,12 @@ class WorkspaceMixin:
 只返回JSON，不要其他文字。"""
         
         try:
-            response = self.llm_client.generate_text(prompt)
+            response = self.llm_client.generate_text(
+                prompt,
+                progress_callback=lambda msg: self.log_console.append(
+                    f"<font color='gray'>[LLM进度] {msg}</font>"
+                ),
+            )
             import json
             
             json_match = re.search(r'\{[\s\S]*\}', response)
@@ -532,7 +578,7 @@ class WorkspaceMixin:
         except Exception as e:
             self.log_console.append(f"<font color='red'>设定提取失败: {e}</font>")
     
-    def _save_setting_to_workspace(self, workspace, category, name, data):
+    def _save_setting_to_workspace(self: Any, workspace, category, name, data):
         """保存单个设定到工作区"""
         import json
         import uuid
@@ -546,7 +592,7 @@ class WorkspaceMixin:
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
 
-    def new_workspace(self: "NovelCreatorWindow"):
+    def new_workspace(self: Any):
         folder_path = QFileDialog.getExistingDirectory(
             self, "选择空文件夹创建新工作区"  # type: ignore[arg-type]
         )
@@ -568,17 +614,27 @@ class WorkspaceMixin:
                     self, "错误", f"初始化新工作区失败:\n{str(e)}"  # type: ignore[arg-type]
                 )
 
-    def load_workspace(self: "NovelCreatorWindow"):
+    def load_workspace(self: Any):
         folder_path = QFileDialog.getExistingDirectory(
             self, "选择已有的工作区目录"  # type: ignore[arg-type]
         )
         if folder_path:
             self._load_workspace_by_path(folder_path)
 
-    def _load_workspace_by_path(self: "NovelCreatorWindow", folder_path: str):
+    def _load_workspace_by_path(self: Any, folder_path: str):
         try:
             self.workspace = WorkspaceManager(folder_path)
             self._save_sys_state(folder_path)
+            if hasattr(self, "btn_open_workspace"):
+                self.btn_open_workspace.setEnabled(True)
+            self._workspace_is_nsfw = self.workspace.get_is_nsfw()
+            if hasattr(self, "cb_workspace_nsfw"):
+                self.cb_workspace_nsfw.blockSignals(True)
+                self.cb_workspace_nsfw.setEnabled(True)
+                self.cb_workspace_nsfw.setChecked(self._workspace_is_nsfw)
+                self.cb_workspace_nsfw.blockSignals(False)
+            self.config = self._load_config()
+            self.llm_client = LLMClient(self.config) if self.config else None
 
             self.log_console.append(f"成功加载工作区: {folder_path}")
             self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
@@ -591,7 +647,7 @@ class WorkspaceMixin:
             )
             self.log_console.append(f"<font color='red'>工作区加载失败: {e}</font>")
 
-    def reload_workspace(self: "NovelCreatorWindow"):
+    def reload_workspace(self: Any):
         if not self.workspace:
             QMessageBox.information(
                 self, "提示", "当前未打开任何工作区，无法重载。"  # type: ignore[arg-type]

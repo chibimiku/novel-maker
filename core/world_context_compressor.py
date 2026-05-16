@@ -95,7 +95,14 @@ class WorldContextCompressor:
         ratio = min(0.65, ratio)
         budget_tokens = int(self.model_context_size * ratio)
         # 粗略估算：中文上下文按 1 token ~= 1.2~1.6 字符，取 1.4 作为中间值
-        return max(1200, int(budget_tokens * 1.4))
+        estimated_chars = max(1200, int(budget_tokens * 1.4))
+        # 即使模型标称上下文极大，也限制“世界观块”的硬上限，避免提示词成本飙升。
+        hard_caps = {
+            "conservative": 22000,
+            "balanced": 16000,
+            "aggressive": 11000,
+        }
+        return min(estimated_chars, hard_caps.get(self.compression_profile, 16000))
 
     def _allocate_node_char_budgets(
         self, nodes: list[WorldSettingNode], total_budget: int

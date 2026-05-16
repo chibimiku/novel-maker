@@ -6,24 +6,38 @@ from __future__ import annotations
 import json
 import os
 import uuid
+import copy
+import time
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
-import os
 from ui.summary_sync_worker import SummarySyncWorker
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
+    QHBoxLayout,
     QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QTextEdit,
     QTreeWidgetItem,
+    QVBoxLayout,
 )
 
 from ui.theme import NODE_ADD_BTN, NODE_ERROR, NODE_MISSING, NODE_NORMAL
+from ui.diff_merge_dialog import DiffMergeDialog
 from ui.dialogs import IdeaInputDialog, RenameNodeDialog
-from ui.utils import find_duplicate_paths, get_item_level, find_item_by_data
+from ui.utils import clean_json_string, find_duplicate_paths, get_item_level, find_item_by_data
 from ui.workers import OutlineBuildingThread, GenerateTaskThread
 from core.context_builder import ContextBuilder
 
@@ -34,23 +48,275 @@ if TYPE_CHECKING:
 class NovelTreeMixin:
     """小说大纲树的渲染、节点交互与大纲自动生成。"""
 
-    def _trace_add_btn(self: "NovelCreatorWindow", msg: str):
-        """统一输出“+新增...”相关调试日志。"""
-        if not getattr(self, "_debug_add_button", False):
+    _NODE_CLIPBOARD_MAGIC = "novel_node_clipboard"
+    _NODE_CLIPBOARD_VERSION = 1
+    _MAX_TREE_LEVEL = 3
+
+    def _get_node_subtree_depth(self: "NovelCreatorWindow", node: dict) -> int:
+        """返回节点子树深度（自身为 1 层）。"""
+        children = node.get("children", [])
+        if not children:
+            return 1
+        return 1 + max(self._get_node_subtree_depth(child) for child in children)
+
+    def _iter_node_ids(self: "NovelCreatorWindow", node: dict) -> set[str]:
+        """收集子树中所有节点 id，用于剪切后粘贴的合法性判断。"""
+        ids = set()
+        node_id = node.get("id")
+        if node_id:
+            ids.add(node_id)
+        for child in node.get("children", []):
+            ids.update(self._iter_node_ids(child))
+        return ids
+
+    def _build_node_clipboard_payload(
+        self: "NovelCreatorWindow", node: dict, mode: str
+    ) -> dict:
+        data = copy.deepcopy(node)
+        return {
+            "magic": self._NODE_CLIPBOARD_MAGIC,
+            "version": self._NODE_CLIPBOARD_VERSION,
+            "mode": mode,
+            "node": data,
+            "subtree_depth": self._get_node_subtree_depth(data),
+        }
+
+    def _set_node_clipboard_payload(self: "NovelCreatorWindow", payload: dict):
+        """同时写入应用内缓存和系统剪贴板。"""
+        self._novel_node_clipboard = payload
+        try:
+            QApplication.clipboard().setText(
+                json.dumps(payload, ensure_ascii=False, indent=2)
+            )
+        except Exception:
+            # 系统剪贴板写失败时，仍保留应用内缓存
+            pass
+
+    def _get_valid_node_clipboard_payload(self: "NovelCreatorWindow") -> dict | None:
+        """读取并校验节点剪贴板内容（优先系统剪贴板）。"""
+        text = ""
+        try:
+            text = QApplication.clipboard().text() or ""
+        except Exception:
+            text = ""
+        if text.strip():
+            try:
+                payload = json.loads(text)
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("magic") == self._NODE_CLIPBOARD_MAGIC
+                    and payload.get("version") == self._NODE_CLIPBOARD_VERSION
+                    and payload.get("mode") in ("cut", "copy")
+                    and isinstance(payload.get("node"), dict)
+                ):
+                    self._novel_node_clipboard = payload
+                    return payload
+            except Exception:
+                pass
+
+        payload = getattr(self, "_novel_node_clipboard", None)
+        if (
+            isinstance(payload, dict)
+            and payload.get("magic") == self._NODE_CLIPBOARD_MAGIC
+            and payload.get("version") == self._NODE_CLIPBOARD_VERSION
+            and payload.get("mode") in ("cut", "copy")
+            and isinstance(payload.get("node"), dict)
+        ):
+            return payload
+        return None
+
+    def _find_node_and_parent_list_by_id(
+        self: "NovelCreatorWindow", node_id: str
+    ) -> tuple[dict | None, list | None, int]:
+        """在 outline_tree_data 里定位节点以及它所在列表索引。"""
+        if not self.outline_tree_data:
+            return None, None, -1
+
+        def walk(nodes: list):
+            for idx, node in enumerate(nodes):
+                if node.get("id") == node_id:
+                    return node, nodes, idx
+                child_nodes = node.get("children", [])
+                found = walk(child_nodes)
+                if found[0] is not None:
+                    return found
+            return None, None, -1
+
+        return walk(self.outline_tree_data.get("nodes", []))
+
+    def _regenerate_ids_and_files_for_copy(self: "NovelCreatorWindow", node: dict):
+        """复制粘贴时为整棵子树生成新 id，并复制正文文件。"""
+        node["id"] = str(uuid.uuid4())
+        if "children" not in node or not isinstance(node["children"], list):
+            node["children"] = []
+
+        rel_path = node.get("file_path")
+        if rel_path and self.workspace:
+            full_path = os.path.join(self.workspace.text_path, rel_path)
+            old_content = ""
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        old_content = f.read()
+                except Exception:
+                    old_content = ""
+            if not old_content:
+                old_content = f"# {node.get('title', '未命名节点')}\n\n"
+
+            new_file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+            new_md5 = self.workspace.save_markdown_file(new_file_name, old_content)
+            node["file_path"] = new_file_name
+            node["md5"] = new_md5
+
+        for child in node["children"]:
+            if isinstance(child, dict):
+                self._regenerate_ids_and_files_for_copy(child)
+
+    def _can_paste_to_item(
+        self: "NovelCreatorWindow", target_item, payload: dict | None
+    ) -> tuple[bool, str]:
+        """判断目标节点是否允许粘贴。"""
+        if not payload:
+            return False, "剪贴板中没有可粘贴的节点数据。"
+        if not target_item or target_item.text(0).startswith("+"):
+            return False, "请选择一个实际节点作为粘贴目标。"
+
+        target_level = get_item_level(target_item)
+        subtree_depth = int(payload.get("subtree_depth") or 0)
+        if subtree_depth <= 0:
+            subtree_depth = self._get_node_subtree_depth(payload.get("node", {}))
+
+        # 粘贴后子树最深层 = 目标节点层级 + 粘贴子树深度
+        if target_level + subtree_depth > self._MAX_TREE_LEVEL:
+            return False, "目标节点的下级层级空间不足，粘贴后会超过 3 层限制。"
+
+        mode = payload.get("mode")
+        source_id = payload.get("node", {}).get("id")
+        if mode == "cut" and source_id:
+            target_id = target_item.data(0, Qt.ItemDataRole.UserRole)
+            source_node, _, _ = self._find_node_and_parent_list_by_id(source_id)
+            if not source_node:
+                return False, "剪切来源节点不存在，可能已被删除或刷新。"
+            source_ids = self._iter_node_ids(source_node)
+            if target_id in source_ids:
+                return False, "不能将节点粘贴到它自身或其后代节点下。"
+
+        return True, ""
+
+    def copy_current_node_to_clipboard(self: "NovelCreatorWindow", item):
+        if not item or item.text(0).startswith("+"):
             return
-        text = f"[AddBtnDebug] {msg}"
+        node_id = item.data(0, Qt.ItemDataRole.UserRole)
+        node = self.node_map.get(node_id) if node_id else None
+        if not node:
+            return
+        payload = self._build_node_clipboard_payload(node, "copy")
+        self._set_node_clipboard_payload(payload)
+        self.log_console.append(f"已复制节点到剪贴板：{node.get('title', '未命名节点')}")
+
+    def cut_current_node_to_clipboard(self: "NovelCreatorWindow", item):
+        if not item or item.text(0).startswith("+"):
+            return
+        node_id = item.data(0, Qt.ItemDataRole.UserRole)
+        node = self.node_map.get(node_id) if node_id else None
+        if not node:
+            return
+        payload = self._build_node_clipboard_payload(node, "cut")
+        self._set_node_clipboard_payload(payload)
+        self.log_console.append(
+            f"已剪切节点到剪贴板（待粘贴）：{node.get('title', '未命名节点')}"
+        )
+
+    def paste_node_from_clipboard(self: "NovelCreatorWindow", target_item):
+        if not self.workspace or not self.outline_tree_data:
+            return
+        payload = self._get_valid_node_clipboard_payload()
+        can_paste, reason = self._can_paste_to_item(target_item, payload)
+        if not can_paste:
+            QMessageBox.warning(self, "无法粘贴", reason)  # type: ignore[arg-type]
+            return
+
+        target_id = target_item.data(0, Qt.ItemDataRole.UserRole)
+        target_node = self.node_map.get(target_id) if target_id else None
+        if not target_node:
+            QMessageBox.warning(self, "无法粘贴", "未找到粘贴目标节点。")  # type: ignore[arg-type]
+            return
+
+        target_children = target_node.setdefault("children", [])
+        mode = payload.get("mode")
+        source_node = payload.get("node", {})
+
+        inserted_node = None
+        if mode == "cut":
+            source_id = source_node.get("id")
+            found_node, parent_list, idx = self._find_node_and_parent_list_by_id(source_id)
+            if found_node is None or parent_list is None or idx < 0:
+                QMessageBox.warning(
+                    self, "无法粘贴", "剪切来源节点不存在，可能已被删除。"
+                )  # type: ignore[arg-type]
+                return
+            inserted_node = parent_list.pop(idx)
+            target_children.append(inserted_node)
+            self._novel_node_clipboard = None
+        else:
+            inserted_node = copy.deepcopy(source_node)
+            self._regenerate_ids_and_files_for_copy(inserted_node)
+            target_children.append(inserted_node)
+
+        self.workspace.save_outline_tree(self.outline_tree_data)
+        self._auto_export_html_if_enabled("粘贴节点")
+        self.refresh_ui_from_workspace()
+
+        if inserted_node and inserted_node.get("id"):
+            new_item = find_item_by_data(
+                self.novel_tree.invisibleRootItem(), inserted_node["id"]
+            )
+            if new_item:
+                parent = new_item.parent()
+                while parent:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                self.novel_tree.setCurrentItem(new_item)
+                self.novel_tree.scrollToItem(new_item)
+
+        action_text = "移动" if mode == "cut" else "复制"
+        self.log_console.append(
+            f"已{action_text}节点到【{target_node.get('title', '未命名节点')}】下。"
+        )
+
+    def _trace_add_btn(self: "NovelCreatorWindow", msg: str):
+        """统一输出调试日志（当前主要覆盖 +新增 按钮相关链路）。"""
+        debug_enabled = bool(
+            getattr(
+                self,
+                "_debug_log_enabled",
+                getattr(self, "_debug_add_button", False),
+            )
+        )
+        if not debug_enabled:
+            return
+        text = f"[DebugLog][AddBtn] {msg}"
         if hasattr(self, "log_console") and self.log_console:
             self.log_console.append(f"<font color='#9AA0A6'>{text}</font>")
         else:
             print(text)
 
-    def set_add_button_debug_enabled(self: "NovelCreatorWindow", enabled: bool):
-        """设置“+新增...”调试日志开关并持久化。"""
-        self._debug_add_button = bool(enabled)
-        self._save_debug_add_button_enabled(self._debug_add_button)
+    def set_debug_log_enabled(self: "NovelCreatorWindow", enabled: bool):
+        """设置统一 Debug Log 开关并持久化。"""
+        enabled = bool(enabled)
+        self._debug_log_enabled = enabled
+        # 兼容旧属性名，避免其它分支逻辑读取失败
+        self._debug_add_button = enabled
+        self._save_debug_log_enabled(enabled)
+        # 校对模块 debug 开关（独立模块也可读）
+        os.environ["PROOFREAD_DEBUG_LOG"] = "1" if enabled else "0"
         if hasattr(self, "log_console") and self.log_console:
-            status = "已开启" if self._debug_add_button else "已关闭"
-            self.log_console.append(f"AddBtn 调试日志{status}。")
+            status = "已开启" if enabled else "已关闭"
+            self.log_console.append(f"Debug Log {status}。")
+
+    def set_add_button_debug_enabled(self: "NovelCreatorWindow", enabled: bool):
+        """兼容旧方法名：重定向到统一 Debug Log 开关。"""
+        self.set_debug_log_enabled(enabled)
 
     def _get_item_path(self: "NovelCreatorWindow", item) -> str:
         """返回节点路径，便于调试定位。"""
@@ -68,7 +334,14 @@ class NovelTreeMixin:
 
     def _scan_add_button_health(self: "NovelCreatorWindow", stage: str):
         """扫描整棵树每个可添加子节点的父节点，输出按钮完整性。"""
-        if not getattr(self, "_debug_add_button", False):
+        debug_enabled = bool(
+            getattr(
+                self,
+                "_debug_log_enabled",
+                getattr(self, "_debug_add_button", False),
+            )
+        )
+        if not debug_enabled:
             return
         root = self.novel_tree.invisibleRootItem()
         checked = 0
@@ -429,7 +702,6 @@ class NovelTreeMixin:
                 if file_path:
                     full_path = os.path.join(self.workspace.text_path, file_path)
                     if os.path.exists(full_path):
-                        import time
                         mtime = os.path.getmtime(full_path)
                         # 格式化时间为 YYYY-MM-DD HH:MM
                         formatted_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
@@ -565,6 +837,7 @@ class NovelTreeMixin:
 
         self.outline_tree_data["nodes"] = new_nodes
         self.workspace.save_outline_tree(self.outline_tree_data)
+        self._auto_export_html_if_enabled("拖拽调整结构")
         
         if hasattr(self, '_pre_drag_tree_snapshot'):
             self._pre_drag_tree_snapshot = None
@@ -875,6 +1148,7 @@ class NovelTreeMixin:
             try:
                 self.workspace.save_outline_tree(self.outline_tree_data)
                 self.log_console.append(f"成功添加{node_type}: {title}")
+                self._auto_export_html_if_enabled(f"新增{node_type}")
                 self.refresh_ui_from_workspace()
 
                 root = self.novel_tree.invisibleRootItem()
@@ -915,6 +1189,7 @@ class NovelTreeMixin:
 
                 if self.workspace and self.outline_tree_data:
                     self.workspace.save_outline_tree(self.outline_tree_data)
+                    self._auto_export_html_if_enabled("重命名节点")
                     self.log_console.append(
                         f"\U0001f504 节点已重命名: 【{old_title}】 -> 【{clean_title}】"
                         " (已自动保存大纲)"
@@ -944,6 +1219,26 @@ class NovelTreeMixin:
         if item.childCount() > 0:
             item.setExpanded(False)
 
+    def _collect_checked_novel_nodes(self: "NovelCreatorWindow"):
+        """收集所有打钩节点（按树上的显示顺序）。"""
+        checked_nodes = []
+        root = self.novel_tree.invisibleRootItem()
+
+        def collect_checked_items(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if child.text(0).startswith("+"):
+                    continue
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    node_id = child.data(0, Qt.ItemDataRole.UserRole)
+                    node = self.node_map.get(node_id) if node_id else None
+                    if node:
+                        checked_nodes.append((child, node))
+                collect_checked_items(child)
+
+        collect_checked_items(root)
+        return checked_nodes
+
     def show_novel_context_menu(self: "NovelCreatorWindow", position):
         if not self.workspace:
             return
@@ -958,25 +1253,26 @@ class NovelTreeMixin:
         has_pending = False
         
         # 检查是否有被勾选的节点
-        checked_nodes = []
-        root = self.novel_tree.invisibleRootItem()
-        
-        def collect_checked_items(parent):
-            for i in range(parent.childCount()):
-                child = parent.child(i)
-                if not child.text(0).startswith("+"):
-                    if child.checkState(0) == Qt.CheckState.Checked:
-                        n_id = child.data(0, Qt.ItemDataRole.UserRole)
-                        if n_id and n_id in self.node_map:
-                            checked_nodes.append((child, self.node_map[n_id]))
-                    collect_checked_items(child)
-        
-        collect_checked_items(root)
+        checked_nodes = self._collect_checked_novel_nodes()
+        checked_level3_nodes = [
+            (checked_item, checked_node)
+            for checked_item, checked_node in checked_nodes
+            if get_item_level(checked_item) == 3
+        ]
         
         # 如果有被勾选的节点，添加批量修改选项
         if checked_nodes:
             batch_modify_action = menu.addAction("📝 批量修改勾选节点")
             batch_modify_action.triggered.connect(lambda: self.open_batch_modify_request_dialog(checked_nodes))
+            if checked_level3_nodes:
+                batch_generate_action = menu.addAction("🚀 依次生成勾选节点正文")
+                batch_generate_action.triggered.connect(
+                    lambda: self.start_batch_generate_checked_nodes(checked_nodes)
+                )
+                batch_summary_regen_action = menu.addAction("🩺 依次校验勾选节点概要")
+                batch_summary_regen_action.triggered.connect(
+                    lambda: self.start_batch_regenerate_summaries_checked_nodes(checked_nodes)
+                )
             menu.addSeparator()
         
         if item and not item.text(0).startswith("+"):
@@ -1014,9 +1310,32 @@ class NovelTreeMixin:
                     )
                     add_children_action.triggered.connect(lambda: self.open_add_children_dialog(real_node, level))
                     menu.addSeparator()
+
+                cut_action = menu.addAction("✂️ 剪切节点")
+                cut_action.triggered.connect(
+                    lambda checked=False, target=item: self.cut_current_node_to_clipboard(target)
+                )
+                copy_action = menu.addAction("📋 复制节点")
+                copy_action.triggered.connect(
+                    lambda checked=False, target=item: self.copy_current_node_to_clipboard(target)
+                )
+                paste_action = menu.addAction("📥 粘贴为子节点")
+                paste_action.triggered.connect(
+                    lambda checked=False, target=item: self.paste_node_from_clipboard(target)
+                )
+                can_paste, _ = self._can_paste_to_item(
+                    item, self._get_valid_node_clipboard_payload()
+                )
+                paste_action.setEnabled(can_paste)
+                menu.addSeparator()
                 
                 # 只对3级节点添加修改内容的选项
                 if level == 3:
+                    regen_summary_action = menu.addAction("🧪 校验并修正概要（基于当前正文）")
+                    regen_summary_action.triggered.connect(
+                        lambda checked=False, target=item: self.regenerate_summary_for_tree_item(target)
+                    )
+                    menu.addSeparator()
                     if has_pending:
                         # 有待合并修改时，"修改内容"变灰，"进行合并"可用
                         modify_action = menu.addAction("✏️ 修改内容")
@@ -1028,9 +1347,17 @@ class NovelTreeMixin:
                         discard_action = menu.addAction("❌ 丢弃修改")
                         discard_action.triggered.connect(lambda: self.discard_pending_modify(node_id))
                     else:
-                        # 无待合并修改时，"修改内容"可用
+                        # 无待合并修改时，保持单节点“修改内容”行为不变
                         modify_action = menu.addAction("✏️ 修改内容")
-                        modify_action.triggered.connect(lambda: self.open_modify_request_dialog(real_node, node_id))
+                        modify_action.triggered.connect(
+                            lambda: self.open_modify_request_dialog(real_node, node_id)
+                        )
+                    split_action = menu.addAction("🧩 按转折点拆分节点")
+                    split_action.triggered.connect(
+                        lambda: self.open_split_scene_dialog(real_node, node_id)
+                    )
+                    if has_pending:
+                        split_action.setEnabled(False)
                     
                     menu.addSeparator()
 
@@ -1051,8 +1378,6 @@ class NovelTreeMixin:
             QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。") # type: ignore[arg-type]
             return
             
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QCheckBox, QPushButton, QHBoxLayout
-        
         # 构建一个自定义的确认对话框
         dialog = QDialog(self)
         dialog.setWindowTitle("确认执行校验同步")
@@ -1144,6 +1469,10 @@ class NovelTreeMixin:
         )
         
         QMessageBox.information(self, "处理完成", msg) # type: ignore[arg-type]
+        self._send_system_notification(
+            "概要校验完成",
+            "概要校验与同步任务已完成。",
+        )
 
     def on_summary_sync_error(self: "NovelCreatorWindow", error_msg: str):
         self.btn_save.setEnabled(True)
@@ -1233,7 +1562,12 @@ class NovelTreeMixin:
                 "\U0001f389 大纲生成完毕！已追加到目录树末尾。"
                 "</font></b>"
             )
+            self._auto_export_html_if_enabled("自动生成大纲")
             self.refresh_ui_from_workspace()
+            self._send_system_notification(
+                "大纲生成完成",
+                "大纲生成任务已完成。",
+            )
         except Exception as e:
             QMessageBox.critical(
                 self, "错误", f"保存大纲 JSON 失败:\n{e}"  # type: ignore[arg-type]
@@ -1248,8 +1582,6 @@ class NovelTreeMixin:
                 self, "未配置", "请先在设置中配置大模型 API。"  # type: ignore[arg-type]
             )
             return
-
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QLineEdit, QPushButton, QHBoxLayout
 
         class AddChildrenDialog(QDialog):
             def __init__(self, parent):
@@ -1425,6 +1757,9 @@ class NovelTreeMixin:
             
             # 发送请求
             self.generate_thread = GenerateTaskThread(self.llm_client, prompt)
+            self.generate_thread.progress_signal.connect(
+                lambda msg: self._on_llm_progress(msg)
+            )
             self.generate_thread.success_signal.connect(lambda result: self.on_children_generate_success(result, target_node))
             self.generate_thread.error_signal.connect(self.on_children_generate_error)
             self.generate_thread.start()
@@ -1442,7 +1777,6 @@ class NovelTreeMixin:
     def on_children_generate_success(self: "NovelCreatorWindow", result: str, target_node: dict):
         """处理子节点生成成功的回调"""
         try:
-            import json
             data = json.loads(result)
             
             # 更新当前节点的概要（如果有）
@@ -1465,7 +1799,6 @@ class NovelTreeMixin:
                         if len(target_node.get("children", [])) + len(data["children"]) <= 3:
                             if target_node.get("children", []) and len(target_node["children"]) == 2:
                                 # 第三个子节点，应该是场景
-                                import uuid
                                 file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
                                 new_child["file_path"] = file_name
                         children.append(new_child)
@@ -1473,6 +1806,7 @@ class NovelTreeMixin:
             # 保存大纲
             self.workspace.save_outline_tree(self.outline_tree_data)
             self.log_console.append("子节点生成成功！")
+            self._auto_export_html_if_enabled("生成子节点")
             
             # 在状态栏显示信息
             statusbar = self.statusBar()
@@ -1481,6 +1815,11 @@ class NovelTreeMixin:
             
             # 刷新 UI
             self.refresh_ui_from_workspace()
+            target_title = target_node.get("title", "当前节点")
+            self._send_system_notification(
+                "子节点生成完成",
+                f"《{target_title}》子节点生成任务已完成。",
+            )
         except Exception as e:
             self.log_console.append(f"<font color='red'>处理生成结果失败: {e}</font>")
             # 在状态栏显示错误信息
@@ -1489,6 +1828,7 @@ class NovelTreeMixin:
                 statusbar.showMessage(f"处理生成结果失败: {e[:50]}...", 3000)
         finally:
             self.btn_save.setEnabled(True)
+            self.generate_thread = None
 
     def on_children_generate_error(self: "NovelCreatorWindow", error_msg: str):
         """处理子节点生成错误的回调"""
@@ -1501,6 +1841,7 @@ class NovelTreeMixin:
             statusbar.showMessage(f"子节点生成失败: {error_msg[:50]}...", 3000)
         # 恢复按钮状态
         self.btn_save.setEnabled(True)
+        self.generate_thread = None
 
     def on_outline_building_error(self: "NovelCreatorWindow", err_msg: str):
         self.log_console.append(
@@ -1511,12 +1852,292 @@ class NovelTreeMixin:
         )
         self.btn_save.setEnabled(True)
 
+    # ================= 场景按转折点拆分 ================= #
+
+    def open_split_scene_dialog(
+        self: "NovelCreatorWindow", real_node: dict, node_id: str
+    ):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+        if not real_node or not node_id:
+            QMessageBox.warning(self, "提示", "未找到可拆分的节点。")
+            return
+        if self.workspace.has_pending_modify(node_id):
+            QMessageBox.warning(self, "提示", "该节点已有待合并修改，请先处理后再拆分。")
+            return
+
+        class SplitSceneDialog(QDialog):
+            def __init__(self, parent, node_title: str):
+                super().__init__(parent)
+                self.setWindowTitle(f"拆分节点 - {node_title}")
+                self.setMinimumWidth(560)
+
+                layout = QVBoxLayout()
+                layout.addWidget(QLabel("目标转折点数量（X）："))
+
+                self.turning_points_spin = QSpinBox()
+                self.turning_points_spin.setRange(1, 20)
+                self.turning_points_spin.setValue(3)
+                self.turning_points_spin.setSuffix(" 个")
+                layout.addWidget(self.turning_points_spin)
+
+                layout.addWidget(
+                    QLabel(
+                        "补充要求（可选）：\n"
+                        "例如：优先按冲突升级节点拆分；保留原文风格与对白节奏。"
+                    )
+                )
+                self.requirement_edit = QTextEdit()
+                self.requirement_edit.setPlaceholderText("可留空")
+                self.requirement_edit.setMinimumHeight(110)
+                layout.addWidget(self.requirement_edit)
+
+                btn_layout = QHBoxLayout()
+                btn_layout.addStretch()
+                cancel_btn = QPushButton("取消")
+                ok_btn = QPushButton("开始拆分")
+                ok_btn.setStyleSheet(
+                    "background-color: #2196F3; color: white; font-weight: bold;"
+                )
+                cancel_btn.clicked.connect(self.reject)
+                ok_btn.clicked.connect(self.accept)
+                btn_layout.addWidget(cancel_btn)
+                btn_layout.addWidget(ok_btn)
+                layout.addLayout(btn_layout)
+                self.setLayout(layout)
+
+            def get_turning_points(self) -> int:
+                return int(self.turning_points_spin.value())
+
+            def get_requirement(self) -> str:
+                return self.requirement_edit.toPlainText().strip()
+
+        dialog = SplitSceneDialog(self, real_node.get("title", "未知节点"))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            turning_points = dialog.get_turning_points()
+            requirement = dialog.get_requirement()
+            self.start_split_scene_node(real_node, node_id, turning_points, requirement)
+
+    def start_split_scene_node(
+        self: "NovelCreatorWindow",
+        real_node: dict,
+        node_id: str,
+        turning_points: int,
+        requirement: str = "",
+    ):
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+        if turning_points <= 0:
+            QMessageBox.warning(self, "输入错误", "转折点数量必须大于 0。")
+            return
+
+        if not hasattr(self, "splitting_nodes"):
+            self.splitting_nodes = set()
+        if node_id in self.splitting_nodes:
+            QMessageBox.warning(self, "提示", "该节点正在拆分中，请稍候。")
+            return
+        if self.workspace.has_pending_modify(node_id):
+            QMessageBox.warning(self, "提示", "该节点已有待合并修改，请先处理。")
+            return
+
+        rel_path = real_node.get("file_path")
+        original_text = ""
+        if rel_path:
+            full_path = os.path.join(self.workspace.text_path, rel_path)
+            if os.path.exists(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    original_text = f.read()
+        if not original_text.strip():
+            QMessageBox.warning(self, "提示", "该节点正文为空，无法拆分。")
+            return
+
+        node_title = real_node.get("title", "未命名场景")
+        node_summary = real_node.get("summary", "")
+        self.splitting_nodes.add(node_id)
+        self.btn_save.setEnabled(False)
+        self.log_console.append(
+            f"<font color='cyan'>开始拆分节点【{node_title}】，目标转折点：{turning_points}...</font>"
+        )
+
+        requirement_block = requirement.strip() or "（无额外要求）"
+        prompt = f"""你是资深小说结构编辑。请把下面“单个场景正文”按剧情转折点拆分为多个连贯片段，用于创建同级场景节点。
+
+### 拆分目标
+1. 目标转折点数量 X = {turning_points}（尽量接近，可在内容不足时略微调整，但至少拆成 2 段）
+2. 优先在“事件目标变化 / 冲突升级 / 场景切换 / 时间明显跳跃 / 关系状态变化”处切分
+3. 每段必须是原文连续片段，不得改写事实，不得凭空补剧情
+4. 各段拼接后应与原文信息等价，避免遗漏关键内容
+
+### 额外要求
+{requirement_block}
+
+### 原节点信息
+- 标题：{node_title}
+- 概要：{node_summary or "(无概要)"}
+
+### 原正文
+{original_text}
+
+### 输出格式（仅 JSON，不要 Markdown，不要解释）
+{{
+  "segments": [
+    {{
+      "title": "场景标题1",
+      "summary": "该段概要",
+      "content": "该段正文（markdown）"
+    }}
+  ]
+}}
+"""
+
+        self.split_scene_thread = GenerateTaskThread(self.llm_client, prompt)
+        self.split_scene_thread.progress_signal.connect(
+            lambda msg: self._on_llm_progress(msg)
+        )
+        self.split_scene_thread.success_signal.connect(
+            lambda result: self.on_split_scene_success(
+                result, real_node, node_id, original_text, turning_points
+            )
+        )
+        self.split_scene_thread.error_signal.connect(
+            lambda error: self.on_split_scene_error(error, node_id)
+        )
+        self.split_scene_thread.start()
+
+    def _normalize_scene_markdown(
+        self: "NovelCreatorWindow", title: str, content: str
+    ) -> str:
+        body = (content or "").strip()
+        if not body:
+            body = "（该拆分段为空，建议手动补充）"
+        if body.startswith("#"):
+            return body
+        return f"# {title}\n\n{body}\n"
+
+    def _build_split_nodes_from_segments(
+        self: "NovelCreatorWindow",
+        real_node: dict,
+        segments: list,
+    ) -> list[dict]:
+        split_nodes: list[dict] = []
+        old_title = real_node.get("title", "未命名场景")
+        old_rel_path = real_node.get("file_path")
+
+        for idx, seg in enumerate(segments):
+            title = str(seg.get("title") or "").strip() or f"{old_title}-片段{idx + 1}"
+            summary = str(seg.get("summary") or "").strip()
+            content = self._normalize_scene_markdown(title, str(seg.get("content") or ""))
+
+            if idx == 0:
+                node = real_node
+                target_file = old_rel_path or f"场景_{uuid.uuid4().hex[:8]}.md"
+                new_md5 = self.workspace.save_markdown_file(target_file, content)
+                node["title"] = title
+                node["summary"] = summary
+                node["file_path"] = target_file
+                node["md5"] = new_md5
+                node["children"] = []
+                node["_status"] = "ok"
+                split_nodes.append(node)
+                continue
+
+            file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
+            md5 = self.workspace.save_markdown_file(file_name, content)
+            split_nodes.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "title": title,
+                    "summary": summary,
+                    "children": [],
+                    "_status": "ok",
+                    "file_path": file_name,
+                    "md5": md5,
+                }
+            )
+
+        return split_nodes
+
+    def on_split_scene_success(
+        self: "NovelCreatorWindow",
+        result: str,
+        real_node: dict,
+        node_id: str,
+        original_text: str,
+        turning_points: int,
+    ):
+        if hasattr(self, "splitting_nodes") and node_id in self.splitting_nodes:
+            self.splitting_nodes.remove(node_id)
+        try:
+            data = json.loads(clean_json_string(result))
+            segments = data.get("segments", []) if isinstance(data, dict) else []
+            if not isinstance(segments, list):
+                raise ValueError("返回格式不正确：segments 不是数组。")
+            valid_segments = [
+                seg
+                for seg in segments
+                if isinstance(seg, dict) and str(seg.get("content") or "").strip()
+            ]
+            if len(valid_segments) < 2:
+                raise ValueError("拆分结果不足 2 段，无法执行节点拆分。")
+
+            found_node, parent_list, idx = self._find_node_and_parent_list_by_id(node_id)
+            if found_node is None or parent_list is None or idx < 0:
+                raise ValueError("未在当前大纲中定位到目标节点，可能已被刷新。")
+
+            split_nodes = self._build_split_nodes_from_segments(real_node, valid_segments)
+            parent_list[idx : idx + 1] = split_nodes
+            self.workspace.save_outline_tree(self.outline_tree_data)
+            self._auto_export_html_if_enabled("拆分场景")
+            self.refresh_ui_from_workspace()
+
+            first_id = split_nodes[0].get("id")
+            if first_id:
+                item = find_item_by_data(self.novel_tree.invisibleRootItem(), first_id)
+                if item:
+                    parent = item.parent()
+                    while parent:
+                        parent.setExpanded(True)
+                        parent = parent.parent()
+                    self.novel_tree.setCurrentItem(item)
+                    self.novel_tree.scrollToItem(item)
+                    self.on_novel_node_clicked(item, 0)
+
+            self.log_console.append(
+                "<font color='green'>✅ 节点拆分完成："
+                f"按目标 {turning_points} 个转折点，已生成 {len(split_nodes)} 个同级场景节点。</font>"
+            )
+            self._send_system_notification(
+                "节点拆分完成",
+                f"《{real_node.get('title', '场景')}》已拆分为 {len(split_nodes)} 个同级场景节点。",
+            )
+        except Exception as e:
+            self.log_console.append(f"<font color='red'>场景拆分失败: {e}</font>")
+            QMessageBox.critical(self, "错误", f"场景拆分失败:\n{e}")
+            # 失败时尽量恢复原文，避免部分写入导致正文异常
+            try:
+                rel_path = real_node.get("file_path")
+                if rel_path:
+                    self.workspace.save_markdown_file(rel_path, original_text)
+            except Exception:
+                pass
+        finally:
+            self.btn_save.setEnabled(True)
+            self.split_scene_thread = None
+
+    def on_split_scene_error(self: "NovelCreatorWindow", error_msg: str, node_id: str):
+        if hasattr(self, "splitting_nodes") and node_id in self.splitting_nodes:
+            self.splitting_nodes.remove(node_id)
+        self.log_console.append(f"<font color='red'>场景拆分失败: {error_msg}</font>")
+        QMessageBox.critical(self, "错误", f"场景拆分过程中发生异常:\n{error_msg}")
+        self.btn_save.setEnabled(True)
+        self.split_scene_thread = None
+
     # ================= 修改内容暂存与合并功能 ================= #
 
     def open_modify_request_dialog(self: "NovelCreatorWindow", real_node: dict, node_id: str):
         """打开修改请求对话框"""
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
-
         class ModifyRequestDialog(QDialog):
             def __init__(self, parent, node_title, append_writing_style_default: bool):
                 super().__init__(parent)
@@ -1572,6 +2193,50 @@ class NovelTreeMixin:
                 self.start_modify_content(
                     real_node, node_id, requirement, append_writing_style
                 )
+
+    def _is_llm_refusal_or_no_change(self: "NovelCreatorWindow", result: str, original_text: str) -> tuple[bool, str]:
+        if not result or not result.strip():
+            return True, "LLM 返回了空内容"
+
+        result_stripped = result.strip()
+        original_stripped = original_text.strip()
+
+        refusal_patterns = [
+            "抱歉，我无法", "对不起，我无法", "抱歉，我不能", "我很抱歉",
+            "我无法修改", "我无法进行", "我不能修改", "我不能这样做",
+            "我做不到", "我不能这么做", "我无法这样做",
+            "作为AI", "作为人工智能", "作为一个AI",
+            "无法完成", "无法执行", "不能完成",
+            "请提供更多", "请告诉我", "请说明",
+            "这不适合", "这不符合", "违反",
+            "无法满足", "不能满足", "不能提供",
+            "I'm sorry", "I cannot", "I can't", "I'm unable",
+            "As an AI", "As a language model",
+        ]
+        for pattern in refusal_patterns:
+            if pattern in result_stripped:
+                return True, f"LLM 返回了拒绝修改的回复（检测到关键词: \"{pattern}\"）"
+
+        if len(original_stripped) > 50:
+            matcher = SequenceMatcher(None, result_stripped, original_stripped)
+            similarity = matcher.ratio()
+            if similarity > 0.95:
+                return True, f"LLM 返回内容与原文几乎一致（相似度 {similarity:.1%}），可能未实际修改"
+
+        if len(original_stripped) > 200:
+            ratio = len(result_stripped) / len(original_stripped)
+            if ratio < 0.01:
+                short_refusal_patterns = [
+                    "不能修改", "无法修改", "不能这样做", "不能这么做",
+                    "无法进行", "我做不到", "不支持", "不提供",
+                    "cannot", "can't", "unable",
+                ]
+                for pattern in short_refusal_patterns:
+                    if pattern.lower() in result_stripped.lower():
+                        return True, f"LLM 返回了极短拒绝回复（仅为原文的 {ratio:.1%}，检测到关键词: \"{pattern}\"）"
+                return True, f"LLM 返回内容过短（仅为原文的 {ratio:.1%}），可能是错误/拒绝消息"
+
+        return False, ""
 
     def _build_modify_system_instruction(
         self: "NovelCreatorWindow", append_writing_style: bool
@@ -1637,6 +2302,23 @@ class NovelTreeMixin:
         self.btn_save.setEnabled(False)
         self.modifying_nodes.add(node_id)
 
+        checked_paths = self.get_checked_settings()
+        settings_text = ""
+        if checked_paths:
+            try:
+                builder = self._create_context_builder()
+                settings_text = builder._build_settings_text(checked_paths).strip()
+            except Exception as e:
+                self.log_console.append(
+                    f"<font color='orange'>构建背景设定上下文失败，已降级为仅使用原文修改：{e}</font>"
+                )
+
+        settings_context_block = (
+            f"\n\n### 背景设定参考（来自左侧勾选设定）：\n{settings_text}"
+            if settings_text
+            else ""
+        )
+
         # 构建提示词
         prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
 
@@ -1645,6 +2327,7 @@ class NovelTreeMixin:
 
 ### 原文内容：
 {original_text}
+{settings_context_block}
 
 ### 输出要求：
 1. 只输出修改后的完整文本
@@ -1662,9 +2345,11 @@ class NovelTreeMixin:
         )
 
         # 发送请求
-        from ui.workers import GenerateTaskThread
         self.modify_thread = GenerateTaskThread(
             self.llm_client, prompt, modify_system_instruction
+        )
+        self.modify_thread.progress_signal.connect(
+            lambda msg: self._on_llm_progress(msg)
         )
         self.modify_thread.success_signal.connect(lambda result: self.on_modify_success(result, real_node, node_id, original_text, requirement))
         self.modify_thread.error_signal.connect(lambda error: self.on_modify_error(error, node_id))
@@ -1675,14 +2360,24 @@ class NovelTreeMixin:
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
         try:
-            # 保存待合并修改
+            is_refusal, reason = self._is_llm_refusal_or_no_change(result, original_text)
+            if is_refusal:
+                node_title = real_node.get("title", "当前节点")
+                self.log_console.append(f"<font color='orange'>⚠️ 节点【{node_title}】修改被跳过：{reason}</font>")
+                self.log_console.append(f"<font color='gray'>LLM 原始返回（前200字）：{result[:200]}...</font>")
+                return
+
             self.workspace.save_pending_modify(node_id, original_text, result, requirement)
-            
+
             self.log_console.append(f"<font color='green'>✅ 修改内容生成完成！节点标题已变红，请右键选择【进行合并】来查看差异并合并。</font>")
-            
-            # 刷新树UI，显示红色标题
+            node_title = real_node.get("title", "当前节点")
+            self._send_system_notification(
+                "修改任务完成",
+                f"《{node_title}》修改内容已生成完成。",
+            )
+
             self._refresh_novel_tree()
-            
+
         except Exception as e:
             self.log_console.append(f"<font color='red'>保存待合并修改失败: {e}</font>")
             QMessageBox.critical(self, "错误", f"保存待合并修改失败:\n{e}")
@@ -1699,20 +2394,19 @@ class NovelTreeMixin:
 
     def open_merge_dialog(self: "NovelCreatorWindow", node_id: str, real_node: dict):
         """打开合并对话框"""
-        from ui.diff_merge_dialog import DiffMergeDialog
-
         pending_data = self.workspace.get_pending_modify(node_id)
         if not pending_data:
             QMessageBox.warning(self, "提示", "没有找到待合并的修改。")
             return
 
-        dialog = DiffMergeDialog(
-            self,
-            node_id,
-            pending_data["original_text"],
-            pending_data["modified_text"],
-            real_node.get("title", "未知节点")
-        )
+        with self.loading_ui("正在准备差异对比..."):
+            dialog = DiffMergeDialog(
+                self,
+                node_id,
+                pending_data["original_text"],
+                pending_data["modified_text"],
+                real_node.get("title", "未知节点")
+            )
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             result_text = dialog.get_result()
@@ -1721,25 +2415,22 @@ class NovelTreeMixin:
     def apply_merge_result(self: "NovelCreatorWindow", node_id: str, real_node: dict, result_text: str):
         """应用合并结果"""
         try:
-            # 保存到文件
-            rel_path = real_node.get("file_path")
-            if rel_path:
-                full_path = os.path.join(self.workspace.text_path, rel_path)
-                with open(full_path, "w", encoding="utf-8") as f:
-                    f.write(result_text)
-                
-                # 更新md5
-                new_md5 = self.workspace.calculate_md5(full_path)
-                real_node["md5"] = new_md5
+            with self.loading_ui("正在应用合并结果..."):
+                # 保存到文件
+                rel_path = real_node.get("file_path")
+                if rel_path:
+                    new_md5 = self.workspace.save_markdown_file(rel_path, result_text)
+                    real_node["md5"] = new_md5
 
-            # 删除待合并修改
-            self.workspace.delete_pending_modify(node_id)
+                # 删除待合并修改
+                self.workspace.delete_pending_modify(node_id)
 
-            # 保存大纲树
-            self.workspace.save_outline_tree(self.outline_tree_data)
+                # 保存大纲树
+                self.workspace.save_outline_tree(self.outline_tree_data)
+                self._auto_export_html_if_enabled("合并修改内容")
 
-            # 刷新UI
-            self._refresh_novel_tree()
+                # 刷新UI
+                self._refresh_novel_tree()
             
             # 重新查找并设置当前编辑的节点（刷新树后旧item已无效）
             if self.current_editing_node and self.current_editing_node.get("id") == node_id:
@@ -1750,16 +2441,11 @@ class NovelTreeMixin:
                 # 更新当前编辑的节点为新的节点对象
                 if node_id in self.node_map:
                     self.current_editing_node = self.node_map[node_id]
-                # 刷新编辑器内容
-                if rel_path:
-                    full_path = os.path.join(self.workspace.text_path, rel_path)
-                    if os.path.exists(full_path):
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            content = f.read()
-                            self.content_editor.setText(content)
-                            # 更新原始内容比较基准
-                            self.current_node_original_content = content
-                            self.current_node_original_summary = self.summary_editor.toPlainText()
+                # 刷新编辑器内容（避免再次从磁盘读取）
+                self.content_editor.setText(result_text)
+                # 更新原始内容比较基准
+                self.current_node_original_content = result_text
+                self.current_node_original_summary = self.summary_editor.toPlainText()
             
             self.log_console.append(f"<font color='green'>✅ 合并成功！节点内容已更新。</font>")
 
@@ -1782,10 +2468,189 @@ class NovelTreeMixin:
             self._refresh_novel_tree()
             self.log_console.append(f"<font color='yellow'>已丢弃待合并的修改。</font>")
     
+    def _get_batch_modify_prompt_history(self: "NovelCreatorWindow") -> list[str]:
+        state = self._load_sys_state()
+        history = state.get("batch_modify_prompt_history", [])
+        if not isinstance(history, list):
+            return []
+        return [item for item in history if isinstance(item, str) and item.strip()]
+
+    def _add_batch_modify_prompt_to_history(self: "NovelCreatorWindow", prompt: str):
+        prompt = prompt.strip()
+        if not prompt:
+            return
+        state = self._load_sys_state()
+        history = state.get("batch_modify_prompt_history", [])
+        if not isinstance(history, list):
+            history = []
+        if prompt in history:
+            history.remove(prompt)
+        history.insert(0, prompt)
+        max_history = 50
+        if len(history) > max_history:
+            history = history[:max_history]
+        state["batch_modify_prompt_history"] = history
+        self._write_sys_state(state)
+
+    def _remove_batch_modify_prompt_from_history(self: "NovelCreatorWindow", index: int):
+        state = self._load_sys_state()
+        history = state.get("batch_modify_prompt_history", [])
+        if not isinstance(history, list):
+            return
+        if 0 <= index < len(history):
+            history.pop(index)
+            state["batch_modify_prompt_history"] = history
+            self._write_sys_state(state)
+
+    def _clear_batch_modify_prompt_history(self: "NovelCreatorWindow"):
+        state = self._load_sys_state()
+        state["batch_modify_prompt_history"] = []
+        self._write_sys_state(state)
+
+
+    class BatchModifyPromptHistoryDialog(QDialog):
+        def __init__(self, parent, batch_modify_dialog=None):
+            super().__init__(parent)
+            self._parent_window = parent
+            self._batch_modify_dialog = batch_modify_dialog
+            self.setWindowTitle("管理历史Prompt")
+            self.setMinimumWidth(550)
+            self.setMinimumHeight(400)
+
+            layout = QVBoxLayout()
+
+            layout.addWidget(QLabel("历史使用的批量修改Prompt（点击可编辑内容，选中后可删除）："))
+
+            self.prompt_list = QListWidget()
+            self.prompt_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+            self._refresh_list()
+            self.prompt_list.currentRowChanged.connect(self._on_selection_changed)
+            layout.addWidget(self.prompt_list)
+
+            detail_layout = QVBoxLayout()
+            detail_layout.addWidget(QLabel("Prompt 内容："))
+            self.detail_edit = QTextEdit()
+            self.detail_edit.setPlaceholderText("选中左侧条目可查看和编辑内容...")
+            self.detail_edit.setMinimumHeight(100)
+            self.detail_edit.setReadOnly(True)
+            detail_layout.addWidget(self.detail_edit)
+            layout.addLayout(detail_layout)
+
+            btn_layout = QHBoxLayout()
+            self.edit_save_btn = QPushButton("编辑")
+            self.edit_save_btn.setEnabled(False)
+            self.edit_save_btn.clicked.connect(self._toggle_edit_save)
+            btn_layout.addWidget(self.edit_save_btn)
+
+            self.delete_btn = QPushButton("删除选中")
+            self.delete_btn.setEnabled(False)
+            self.delete_btn.clicked.connect(self._delete_selected)
+            btn_layout.addWidget(self.delete_btn)
+
+            btn_layout.addStretch()
+
+            self.clear_all_btn = QPushButton("清空全部")
+            self.clear_all_btn.clicked.connect(self._clear_all)
+            btn_layout.addWidget(self.clear_all_btn)
+
+            close_btn = QPushButton("关闭")
+            close_btn.clicked.connect(self.accept)
+            btn_layout.addWidget(close_btn)
+
+            layout.addLayout(btn_layout)
+            self.setLayout(layout)
+
+            self._is_editing = False
+            self._current_index = -1
+
+        def _refresh_list(self):
+            self.prompt_list.blockSignals(True)
+            self.prompt_list.clear()
+            prompts = self._parent_window._get_batch_modify_prompt_history()
+            for p in prompts:
+                display = p[:80] + "..." if len(p) > 80 else p
+                self.prompt_list.addItem(QListWidgetItem(display))
+            self.prompt_list.blockSignals(False)
+
+        def _on_selection_changed(self, row):
+            self._current_index = row
+            if row >= 0:
+                prompts = self._parent_window._get_batch_modify_prompt_history()
+                if row < len(prompts):
+                    self.detail_edit.setPlainText(prompts[row])
+                    self.detail_edit.setReadOnly(True)
+                    self.edit_save_btn.setText("编辑")
+                    self.edit_save_btn.setEnabled(True)
+                    self.delete_btn.setEnabled(True)
+                    self._is_editing = False
+                else:
+                    self.detail_edit.clear()
+                    self.edit_save_btn.setEnabled(False)
+                    self.delete_btn.setEnabled(False)
+            else:
+                self.detail_edit.clear()
+                self.edit_save_btn.setEnabled(False)
+                self.delete_btn.setEnabled(False)
+
+        def _toggle_edit_save(self):
+            if self._is_editing:
+                new_text = self.detail_edit.toPlainText().strip()
+                if new_text and self._current_index >= 0:
+                    self._parent_window._remove_batch_modify_prompt_from_history(self._current_index)
+                    self._parent_window._add_batch_modify_prompt_to_history(new_text)
+                    self._refresh_list()
+                    self.prompt_list.setCurrentRow(0)
+                    if self._batch_modify_dialog:
+                        self._batch_modify_dialog._refresh_prompt_history_combo()
+                self.detail_edit.setReadOnly(True)
+                self.edit_save_btn.setText("编辑")
+                self._is_editing = False
+            else:
+                if self._current_index >= 0:
+                    self.detail_edit.setReadOnly(False)
+                    self.detail_edit.setFocus()
+                    self.edit_save_btn.setText("保存")
+                    self._is_editing = True
+
+        def _delete_selected(self):
+            if self._current_index >= 0:
+                reply = QMessageBox.question(
+                    self, "确认删除",
+                    "确定要删除这条历史Prompt吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._parent_window._remove_batch_modify_prompt_from_history(self._current_index)
+                    self._refresh_list()
+                    self.detail_edit.clear()
+                    self.edit_save_btn.setEnabled(False)
+                    self.delete_btn.setEnabled(False)
+                    self._is_editing = False
+                    self.edit_save_btn.setText("编辑")
+                    if self._batch_modify_dialog:
+                        self._batch_modify_dialog._refresh_prompt_history_combo()
+
+        def _clear_all(self):
+            reply = QMessageBox.question(
+                self, "确认清空",
+                "确定要清空全部历史Prompt吗？此操作不可撤销！",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._parent_window._clear_batch_modify_prompt_history()
+                self._refresh_list()
+                self.detail_edit.clear()
+                self.edit_save_btn.setEnabled(False)
+                self.delete_btn.setEnabled(False)
+                self._is_editing = False
+                self.edit_save_btn.setText("编辑")
+                if self._batch_modify_dialog:
+                    self._batch_modify_dialog._refresh_prompt_history_combo()
+
     def open_batch_modify_request_dialog(self: "NovelCreatorWindow", checked_nodes):
         """打开批量修改请求对话框"""
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout, QListWidget, QListWidgetItem
-        
         # 过滤节点：只保留3级且没有待合并修改的节点
         valid_nodes = []
         skipped_info = []
@@ -1835,11 +2700,18 @@ class NovelTreeMixin:
             return
         
         class BatchModifyRequestDialog(QDialog):
-            def __init__(self, parent, valid_nodes_info, skipped_info_list):
+            def __init__(
+                self,
+                parent,
+                valid_nodes_info,
+                skipped_info_list,
+                default_thread_count: int,
+                default_smart_select: bool = False,
+            ):
                 super().__init__(parent)
                 self.setWindowTitle("批量修改内容")
                 self.setMinimumWidth(600)
-                self.setMinimumHeight(500)
+                self.setMinimumHeight(550)
                 self.result_text = ""
                 
                 layout = QVBoxLayout()
@@ -1859,12 +2731,59 @@ class NovelTreeMixin:
                         skipped_list.addItem(QListWidgetItem(f"⚠️ {info}"))
                     layout.addWidget(skipped_list)
                 
+                # 历史 Prompt 选择
+                history_layout = QHBoxLayout()
+                history_layout.addWidget(QLabel("历史Prompt："))
+                self.prompt_history_combo = QComboBox()
+                self.prompt_history_combo.setEditable(False)
+                self.prompt_history_combo.setMinimumWidth(200)
+                self.prompt_history_combo.addItem("-- 选择历史Prompt --", "")
+                prompts = parent._get_batch_modify_prompt_history()
+                for p in prompts:
+                    display = p[:60] + "..." if len(p) > 60 else p
+                    self.prompt_history_combo.addItem(display, p)
+                self.prompt_history_combo.currentIndexChanged.connect(self._on_history_selected)
+                history_layout.addWidget(self.prompt_history_combo, 1)
+                self.manage_history_btn = QPushButton("管理")
+                self.manage_history_btn.setToolTip("管理历史使用的Prompt")
+                self.manage_history_btn.clicked.connect(self._open_manage_history_dialog)
+                history_layout.addWidget(self.manage_history_btn)
+                layout.addLayout(history_layout)
+
                 # 输入修改要求
-                layout.addWidget(QLabel("\n请输入修改要求（将应用于所有选中节点）："))
+                layout.addWidget(QLabel("请输入修改要求（将应用于所有选中节点）："))
                 self.requirement_edit = QTextEdit()
                 self.requirement_edit.setPlaceholderText("例如：将这段内容的语气改得更加轻松幽默，或者增加一些环境描写...")
                 self.requirement_edit.setMinimumHeight(120)
                 layout.addWidget(self.requirement_edit)
+
+                # 请求线程数
+                thread_layout = QHBoxLayout()
+                thread_layout.addWidget(QLabel("请求线程数："))
+                self.thread_count_spin = QSpinBox()
+                self.thread_count_spin.setRange(1, 20)
+                self.thread_count_spin.setValue(max(1, min(20, int(default_thread_count))))
+                self.thread_count_spin.setSuffix(" 线程")
+                thread_layout.addWidget(self.thread_count_spin)
+                thread_layout.addStretch()
+                layout.addLayout(thread_layout)
+
+                # 智能选择设定集选项
+                self.smart_select_cb = QCheckBox("智能选择设定集（基于节点概要自动筛选相关设定）")
+                self.smart_select_cb.setChecked(default_smart_select)
+                self.smart_select_cb.setToolTip(
+                    "勾选后，每个节点修改前会先本地计算设定相关性，"
+                    "再请求LLM一次来形成最终的设定勾选结果。"
+                )
+                layout.addWidget(self.smart_select_cb)
+
+                self.use_cache_cb = QCheckBox("使用缓存（跳过已计算的相关性）")
+                self.use_cache_cb.setChecked(True)
+                self.use_cache_cb.setToolTip(
+                    "勾选后，如果 .cache 目录中已有该节点的设定相关性缓存，"
+                    "则直接复用，不再重新计算和请求LLM。"
+                )
+                layout.addWidget(self.use_cache_cb)
                 
                 # 按钮
                 btn_layout = QHBoxLayout()
@@ -1881,17 +2800,95 @@ class NovelTreeMixin:
                 
                 layout.addLayout(btn_layout)
                 self.setLayout(layout)
-            
+
+            def _on_history_selected(self, index):
+                if index <= 0:
+                    return
+                prompt_text = self.prompt_history_combo.currentData()
+                if prompt_text:
+                    self.requirement_edit.setPlainText(prompt_text)
+
+            def _open_manage_history_dialog(self):
+                self._manage_dialog = BatchModifyPromptHistoryDialog(self.parent(), self)
+                self._manage_dialog.exec()
+                self._refresh_prompt_history_combo()
+
+            def _refresh_prompt_history_combo(self):
+                self.prompt_history_combo.blockSignals(True)
+                self.prompt_history_combo.clear()
+                self.prompt_history_combo.addItem("-- 选择历史Prompt --", "")
+                prompts = self.parent()._get_batch_modify_prompt_history()
+                for p in prompts:
+                    display = p[:60] + "..." if len(p) > 60 else p
+                    self.prompt_history_combo.addItem(display, p)
+                self.prompt_history_combo.setCurrentIndex(0)
+                self.prompt_history_combo.blockSignals(False)
+
             def get_requirement(self):
                 return self.requirement_edit.toPlainText().strip()
+            
+            def get_thread_count(self):
+                return self.thread_count_spin.value()
+
+            def get_smart_select(self):
+                return self.smart_select_cb.isChecked()
+
+            def get_use_cache(self):
+                return self.use_cache_cb.isChecked()
         
-        dialog = BatchModifyRequestDialog(self, valid_nodes, skipped_info)
+        dialog = BatchModifyRequestDialog(
+            self,
+            valid_nodes,
+            skipped_info,
+            getattr(self, "_batch_modify_thread_count", 3),
+            default_smart_select=bool(
+                getattr(self, "_smart_setting_selection_enabled", False)
+            ),
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             requirement = dialog.get_requirement()
             if requirement:
-                self.start_batch_modify_content(valid_nodes, requirement)
+                thread_count = dialog.get_thread_count()
+                use_smart_select = dialog.get_smart_select()
+                use_cache = dialog.get_use_cache()
+                self._batch_modify_thread_count = thread_count
+                self._save_batch_modify_thread_count(thread_count)
+                self._add_batch_modify_prompt_to_history(requirement)
+                self.start_batch_modify_content(
+                    valid_nodes, requirement, thread_count,
+                    use_smart_select=use_smart_select,
+                    use_cache=use_cache,
+                )
     
-    def start_batch_modify_content(self: "NovelCreatorWindow", valid_nodes, requirement):
+    def _batch_modify_log(
+        self: "NovelCreatorWindow", stage: str, detail: str = "",
+    ):
+        queue_n = len(getattr(self, "batch_modify_queue", []))
+        inflight = int(getattr(self, "batch_modify_inflight", 0))
+        threads_n = len(getattr(self, "batch_modify_threads", {}))
+        thread_ids = sorted(
+            f"0x{id(t):x}"
+            for t in getattr(self, "batch_modify_threads", {}).values()
+        ) if hasattr(self, "batch_modify_threads") else []
+        alive_ids = sorted(
+            tid for tid in thread_ids
+            if any(
+                f"0x{id(t):x}" == tid
+                and t.isRunning()
+                for t in getattr(self, "batch_modify_threads", {}).values()
+            )
+        )
+        self.log_console.append(
+            f"<font color='#888' size='2'>[批修] {stage}"
+            f" | queue={queue_n} inflight={inflight} threads={threads_n}"
+            f" | tids={thread_ids} alive={alive_ids}"
+            f"{' | ' + detail if detail else ''}</font>"
+        )
+
+    def start_batch_modify_content(
+        self: "NovelCreatorWindow", valid_nodes, requirement, thread_count: int = 3,
+        use_smart_select: bool = False, use_cache: bool = True,
+    ):
         """开始批量修改内容"""
         if not self.llm_client:
             QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
@@ -1910,66 +2907,153 @@ class NovelTreeMixin:
         self.batch_modify_queue = valid_nodes.copy()
         self.is_batch_modifying = True
         self.batch_modify_requirement = requirement
+
+        self._batch_modify_node_settings: dict[str, str] = {}
+
+        if use_smart_select:
+            previous_smart_flag = getattr(self, "_smart_setting_selection_enabled", False)
+            self._smart_setting_selection_enabled = True
+            self._batch_modify_log("SMART_SEL_START", f"nodes={len(valid_nodes)} use_cache={use_cache}")
+            try:
+                all_candidate_paths = self.get_checked_settings()
+                if not all_candidate_paths:
+                    all_candidates = self._collect_setting_candidates_for_smart_select()
+                    all_candidate_paths = [item["path"] for item in all_candidates]
+
+                if all_candidate_paths:
+                    builder = self._create_context_builder()
+                    for _item, node in valid_nodes:
+                        node_id = node.get("id", "")
+                        if not node_id:
+                            continue
+                        try:
+                            selected_paths = self._resolve_checked_settings_for_task(
+                                "批量修改",
+                                node,
+                                node.get("summary", ""),
+                                use_cache=use_cache,
+                            )
+                            if selected_paths and selected_paths != all_candidate_paths:
+                                settings_text = builder._build_settings_text(
+                                    selected_paths
+                                ).strip()
+                                if settings_text:
+                                    self._batch_modify_node_settings[node_id] = settings_text
+                        except Exception as e:
+                            self.log_console.append(
+                                f"<font color='orange'>节点【{node.get('title', '未知')}】"
+                                f"设定智能筛选失败：{e}</font>"
+                            )
+                    self._batch_modify_log(
+                        "SMART_SEL_DONE",
+                        f"matched={len(self._batch_modify_node_settings)}/{len(valid_nodes)}",
+                    )
+            finally:
+                self._smart_setting_selection_enabled = previous_smart_flag
+
+        if not self._batch_modify_node_settings:
+            checked_paths = self.get_checked_settings()
+            self.batch_modify_settings_text = ""
+            if checked_paths:
+                try:
+                    builder = self._create_context_builder()
+                    self.batch_modify_settings_text = builder._build_settings_text(
+                        checked_paths
+                    ).strip()
+                    self._batch_modify_log("GLOBAL_SETTINGS", f"path_count={len(checked_paths)}")
+                except Exception as e:
+                    self.log_console.append(
+                        f"<font color='orange'>构建批量修改背景设定上下文失败，已降级为仅使用原文修改：{e}</font>"
+                    )
+
         self.batch_modify_success_count = 0
         self.batch_modify_fail_count = 0
-        
-        self.log_console.append(f"<font color='cyan'>🚀 开始批量修改，共 {len(self.batch_modify_queue)} 个节点...</font>")
+        self.batch_modify_max_workers = max(1, min(20, int(thread_count)))
+        self.batch_modify_inflight = 0
+        self.batch_modify_threads = {}
+
+        self.log_console.append(
+            f"<font color='cyan'>🚀 开始批量修改，共 {len(self.batch_modify_queue)} 个节点，"
+            f"并发 {self.batch_modify_max_workers} 线程...</font>"
+        )
+        self._batch_modify_log(
+            "START",
+            f"total={len(self.batch_modify_queue)} max_workers={self.batch_modify_max_workers}",
+        )
         self.btn_save.setEnabled(False)
-        
+
         self._process_next_batch_modify_node()
     
     def _process_next_batch_modify_node(self: "NovelCreatorWindow"):
-        """处理下一个批量修改节点"""
+        """按并发上限持续分发批量修改任务"""
         if not self.is_batch_modifying:
+            self._batch_modify_log("DISPATCH_SKIP", "is_batch_modifying=False")
             return
-        
-        if not self.batch_modify_queue:
-            self.is_batch_modifying = False
-            self.btn_save.setEnabled(True)
-            self.log_console.append(f"<b><font color='green'>🎉 批量修改完成！成功：{self.batch_modify_success_count} 个，失败：{self.batch_modify_fail_count} 个</font></b>")
-            QMessageBox.information(
-                self, 
-                "批量修改完成", 
-                f"批量修改已结束！\n成功：{self.batch_modify_success_count} 个\n失败：{self.batch_modify_fail_count} 个\n\n节点已变红，请右键选择【进行合并】查看差异并合并。"
+
+        while (
+            self.batch_modify_queue
+            and self.batch_modify_inflight < self.batch_modify_max_workers
+        ):
+            next_item, next_node = self.batch_modify_queue.pop(0)
+            node_title = next_node.get('title', '未知节点')
+            node_id = next_node.get('id')
+
+            self.log_console.append(
+                f"<hr><b>⏳ 正在处理节点: {node_title} "
+                f"(队列剩余 {len(self.batch_modify_queue)} 个)</b>"
             )
-            self._refresh_novel_tree()
-            return
-        
-        next_item, next_node = self.batch_modify_queue.pop(0)
-        node_title = next_node.get('title', '未知节点')
-        node_id = next_node.get('id')
-        
-        self.log_console.append(f"<hr><b>⏳ 正在处理节点: {node_title} (队列剩余 {len(self.batch_modify_queue)} 个)</b>")
-        
-        if not hasattr(self, 'modifying_nodes'):
-            self.modifying_nodes = set()
-        self.modifying_nodes.add(node_id)
-        
-        # 读取原文
-        original_text = ""
-        rel_path = next_node.get("file_path")
-        if rel_path:
-            full_path = os.path.join(self.workspace.text_path, rel_path)
-            if os.path.exists(full_path):
-                with open(full_path, "r", encoding="utf-8") as f:
-                    original_text = f.read()
-        
-        if not original_text:
-            if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
-                self.modifying_nodes.remove(node_id)
-            self.log_console.append(f"<font color='orange'>跳过【{node_title}】：无正文内容</font>")
-            self.batch_modify_fail_count += 1
-            self._process_next_batch_modify_node()
-            return
-        
-        # 构建提示词
-        prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
+            self._batch_modify_log(
+                "DISPATCH",
+                f"node={node_title} id={node_id} inflight_before={self.batch_modify_inflight}",
+            )
+
+            if not hasattr(self, 'modifying_nodes'):
+                self.modifying_nodes = set()
+            self.modifying_nodes.add(node_id)
+
+            # 读取原文
+            original_text = ""
+            rel_path = next_node.get("file_path")
+            if rel_path:
+                full_path = os.path.join(self.workspace.text_path, rel_path)
+                if os.path.exists(full_path):
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        original_text = f.read()
+
+            if not original_text:
+                if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
+                    self.modifying_nodes.remove(node_id)
+                self.log_console.append(
+                    f"<font color='orange'>跳过【{node_title}】：无正文内容</font>"
+                )
+                self._batch_modify_log("DISPATCH_SKIP", f"node={node_title} reason=no_content")
+                self.batch_modify_fail_count += 1
+                continue
+
+            # 构建提示词
+            node_settings_text = (
+                getattr(self, "_batch_modify_node_settings", {}).get(node_id, "")
+                or ""
+            ).strip()
+            global_settings_text = (getattr(self, "batch_modify_settings_text", "") or "").strip()
+            settings_text = node_settings_text or global_settings_text
+            settings_context_block = (
+                f"\n\n### 背景设定参考（来自智能筛选设定）：\n{settings_text}"
+                if node_settings_text
+                else (
+                    f"\n\n### 背景设定参考（来自左侧勾选设定）：\n{settings_text}"
+                    if settings_text
+                    else ""
+                )
+            )
+            prompt = f"""你是一个专业的小说编辑助手。请根据用户的修改要求，对提供的小说正文进行修改。
 
 ### 修改要求：
 {self.batch_modify_requirement}
 
 ### 原文内容：
 {original_text}
+{settings_context_block}
 
 ### 输出要求：
 1. 只输出修改后的完整文本
@@ -1978,39 +3062,128 @@ class NovelTreeMixin:
 4. 如果原文有标题（# 开头），请保留
 """
         
-        # 发送请求
-        from ui.workers import GenerateTaskThread
-        self.batch_modify_thread = GenerateTaskThread(self.llm_client, prompt)
-        self.batch_modify_thread.success_signal.connect(
-            lambda result: self.on_batch_modify_success(result, next_node, node_id, original_text)
+            # 发送请求
+            thread = GenerateTaskThread(self.llm_client, prompt)
+            thread.progress_signal.connect(lambda msg: self._on_llm_progress(msg))
+            thread.success_signal.connect(
+                lambda result, n=next_node, nid=node_id, o=original_text: self.on_batch_modify_success(result, n, nid, o)
+            )
+            thread.error_signal.connect(
+                lambda error, t=node_title, nid=node_id: self.on_batch_modify_error(error, t, nid)
+            )
+            self.batch_modify_threads[node_id] = thread
+            self.batch_modify_inflight += 1
+            thread.start()
+            thread_id_hex = f"0x{id(thread):x}"
+            self._batch_modify_log(
+                "THREAD_START",
+                f"node={node_title} tid={thread_id_hex}"
+                f" isRunning={thread.isRunning()}"
+            )
+
+        self._finalize_batch_modify_if_done()
+
+    def _finalize_batch_modify_if_done(self: "NovelCreatorWindow"):
+        if not self.is_batch_modifying:
+            return
+        if self.batch_modify_queue or self.batch_modify_inflight > 0:
+            self._batch_modify_log(
+                "FINALIZE_PENDING",
+                f"queue={len(self.batch_modify_queue)} inflight={self.batch_modify_inflight}",
+            )
+            return
+
+        self._batch_modify_log(
+            "FINALIZE_DONE",
+            f"success={self.batch_modify_success_count} fail={self.batch_modify_fail_count}",
         )
-        self.batch_modify_thread.error_signal.connect(
-            lambda error: self.on_batch_modify_error(error, node_title, node_id)
+        self.is_batch_modifying = False
+        self.btn_save.setEnabled(True)
+        self.log_console.append(
+            f"<b><font color='green'>🎉 批量修改完成！成功：{self.batch_modify_success_count} 个，"
+            f"失败：{self.batch_modify_fail_count} 个</font></b>"
         )
-        self.batch_modify_thread.start()
+        QMessageBox.information(
+            self,
+            "批量修改完成",
+            f"批量修改已结束！\n成功：{self.batch_modify_success_count} 个\n失败：{self.batch_modify_fail_count} 个\n\n节点已变红，请右键选择【进行合并】查看差异并合并。"
+        )
+        self._send_system_notification(
+            "批量修改完成",
+            f"批量修改任务已结束：成功 {self.batch_modify_success_count}，失败 {self.batch_modify_fail_count}。",
+        )
+        self._refresh_novel_tree()
+
+    def _on_llm_progress(self: "NovelCreatorWindow", message: str):
+        if not message:
+            return
+        self.log_console.append(f"<font color='gray'>[LLM进度] {message}</font>")
+        statusbar = self.statusBar()
+        if statusbar:
+            statusbar.showMessage(message, 2500)
     
+    def _pop_batch_thread(self: "NovelCreatorWindow", node_id: str):
+        """安全清理批量修改线程引用——先等待线程结束再释放 Python 引用。"""
+        thread = None
+        was_running = False
+        if hasattr(self, "batch_modify_threads"):
+            thread = self.batch_modify_threads.pop(node_id, None)
+        if thread is not None:
+            was_running = thread.isRunning()
+            if was_running:
+                self._batch_modify_log(
+                    "POP_WAIT",
+                    f"node_id={node_id} tid=0x{id(thread):x}",
+                )
+                thread.wait(5000)
+                self._batch_modify_log(
+                    "POP_WAIT_DONE",
+                    f"node_id={node_id} isRunning_after={thread.isRunning()}",
+                )
+            else:
+                self._batch_modify_log(
+                    "POP_NO_WAIT",
+                    f"node_id={node_id} tid=0x{id(thread):x} already_stopped",
+                )
+        else:
+            self._batch_modify_log("POP_MISSING", f"node_id={node_id} thread_not_found")
+        if hasattr(self, "batch_modify_inflight"):
+            self.batch_modify_inflight = max(0, self.batch_modify_inflight - 1)
+
     def on_batch_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str):
         """批量修改单个节点成功回调"""
+        node_title = real_node.get('title', '未知节点')
+        self._batch_modify_log("CALLBACK_SUCCESS", f"node={node_title} id={node_id}")
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
+        self._pop_batch_thread(node_id)
         try:
-            # 保存待合并修改
+            is_refusal, reason = self._is_llm_refusal_or_no_change(result, original_text)
+            if is_refusal:
+                self.batch_modify_fail_count += 1
+                self._batch_modify_log("CALLBACK_REFUSAL", f"node={node_title} reason={reason}")
+                self.log_console.append(f"<font color='orange'>⚠️ 节点【{node_title}】修改被跳过：{reason}</font>")
+                self.log_console.append(f"<font color='gray'>LLM 原始返回（前200字）：{result[:200]}...</font>")
+                return
+
             self.workspace.save_pending_modify(node_id, original_text, result, self.batch_modify_requirement)
-            
+
             self.batch_modify_success_count += 1
-            node_title = real_node.get('title', '未知节点')
             self.log_console.append(f"<font color='green'>✅ 节点【{node_title}】修改成功！</font>")
-            
+
         except Exception as e:
             self.batch_modify_fail_count += 1
+            self._batch_modify_log("CALLBACK_SAVE_ERR", f"node={node_title} error={e}")
             self.log_console.append(f"<font color='red'>保存待合并修改失败: {e}</font>")
         finally:
             self._process_next_batch_modify_node()
     
     def on_batch_modify_error(self: "NovelCreatorWindow", error_msg: str, node_title: str, node_id: str):
         """批量修改单个节点失败回调"""
+        self._batch_modify_log("CALLBACK_ERROR", f"node={node_title} id={node_id} error={error_msg[:100]}")
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
+        self._pop_batch_thread(node_id)
         self.batch_modify_fail_count += 1
         self.log_console.append(f"<font color='red'>❌ 节点【{node_title}】修改失败: {error_msg}</font>")
         self._process_next_batch_modify_node()

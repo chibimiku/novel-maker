@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING
+import copy
+from typing import Any
 
 from PyQt6.QtWidgets import QDialog, QInputDialog
 from PyQt6.QtCore import QByteArray, QRect
@@ -13,32 +14,294 @@ from PyQt6.QtCore import QByteArray, QRect
 from core.llm_client import LLMClient
 from ui.settings_dialog import SettingsDialog
 
-if TYPE_CHECKING:
-    from ui.main_window import NovelCreatorWindow
-
-
 class ConfigMixin:
     """管理 setting.json / sys_state.json / prompt 模板等配置读写。"""
 
     # ---- 以下方法中 self 实际为 NovelCreatorWindow 实例 ----
 
-    def _get_default_writing_instruction(self: "NovelCreatorWindow") -> str:
+    def _get_default_writing_instruction(self: Any) -> str:
         return (
             "你是一个专业的AI小说家。你的输出必须纯粹是小说情节文本，"
             "严禁包含任何前言、后语、剧情解释或'已为您生成'之类的助手客套话。"
         )
 
-    def _get_default_summary_instruction(self: "NovelCreatorWindow") -> str:
+    def _get_default_summary_instruction(self: Any) -> str:
         return "你是一个专业的小说编辑，擅长为小说节点生成精炼、准确的概要。"
 
-    def _get_default_modify_instruction(self: "NovelCreatorWindow") -> str:
+    def _get_default_modify_instruction(self: Any) -> str:
         return (
             "你是一个专业的小说改写编辑。你必须严格遵循用户的修改要求，"
             "对原文进行高质量改写。只输出修改后的完整正文，不要附加解释。"
         )
 
+    def _get_default_text_api_profile(self: Any) -> dict:
+        return {
+            "type": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "",
+            "model": "gpt-4o",
+            "timeout": 120,
+            "instructions": self._get_default_writing_instruction(),
+            "instructions_history": [
+                {
+                    "name": "默认写作Instruction",
+                    "content": self._get_default_writing_instruction(),
+                }
+            ],
+            "summary_instructions": self._get_default_summary_instruction(),
+            "summary_instructions_history": [
+                {
+                    "name": "默认概要Instruction",
+                    "content": self._get_default_summary_instruction(),
+                }
+            ],
+            "modify_instructions": self._get_default_modify_instruction(),
+            "modify_instructions_history": [
+                {
+                    "name": "默认编辑Instruction",
+                    "content": self._get_default_modify_instruction(),
+                }
+            ],
+            "model_capabilities": [],
+            "model_context_size": 8192,
+            "world_context_compression_profile": "balanced",
+            "children_summary_compress_trigger_ratio": 0.27,
+            "children_summary_group_budget_ratio": 0.24,
+            "auto_continue_on_incomplete": True,
+            "auto_continue_max_rounds": 3,
+            "model_meta_catalog": {},
+        }
+
+    def _normalize_text_api_profile(
+        self: Any, raw_profile: dict | None
+    ) -> dict:
+        default_profile = self._get_default_text_api_profile()
+        text_cfg = copy.deepcopy(default_profile)
+        if isinstance(raw_profile, dict):
+            text_cfg.update(raw_profile)
+
+        default_writing = self._get_default_writing_instruction()
+        if not text_cfg.get("instructions"):
+            text_cfg["instructions"] = default_writing
+        raw_writing_history = text_cfg.get("instructions_history", [])
+        normalized_writing_history = []
+        for item in raw_writing_history:
+            if isinstance(item, str):
+                normalized_writing_history.append({"name": "", "content": item})
+            elif isinstance(item, dict):
+                normalized_writing_history.append(
+                    {
+                        "name": str(item.get("name", "")),
+                        "content": str(item.get("content", "")),
+                    }
+                )
+        if not any(
+            (it.get("name") or "").strip() == "默认写作Instruction"
+            and (it.get("content") or "").strip()
+            == (text_cfg["instructions"] or "").strip()
+            for it in normalized_writing_history
+        ):
+            normalized_writing_history.insert(
+                0,
+                {
+                    "name": "默认写作Instruction",
+                    "content": text_cfg["instructions"],
+                },
+            )
+        text_cfg["instructions_history"] = normalized_writing_history
+
+        default_summary = self._get_default_summary_instruction()
+        if not text_cfg.get("summary_instructions"):
+            text_cfg["summary_instructions"] = default_summary
+        raw_summary_history = text_cfg.get("summary_instructions_history", [])
+        normalized_summary_history = []
+        for item in raw_summary_history:
+            if isinstance(item, str):
+                normalized_summary_history.append({"name": "", "content": item})
+            elif isinstance(item, dict):
+                normalized_summary_history.append(
+                    {
+                        "name": str(item.get("name", "")),
+                        "content": str(item.get("content", "")),
+                    }
+                )
+        if not any(
+            (it.get("name") or "").strip() == "默认概要Instruction"
+            and (it.get("content") or "").strip()
+            == (text_cfg["summary_instructions"] or "").strip()
+            for it in normalized_summary_history
+        ):
+            normalized_summary_history.insert(
+                0,
+                {
+                    "name": "默认概要Instruction",
+                    "content": text_cfg["summary_instructions"],
+                },
+            )
+        text_cfg["summary_instructions_history"] = normalized_summary_history
+
+        default_modify = self._get_default_modify_instruction()
+        if not text_cfg.get("modify_instructions"):
+            text_cfg["modify_instructions"] = default_modify
+
+        raw_modify_history = text_cfg.get("modify_instructions_history", [])
+        normalized_modify_history = []
+        for item in raw_modify_history:
+            if isinstance(item, str):
+                normalized_modify_history.append({"name": "", "content": item})
+            elif isinstance(item, dict):
+                normalized_modify_history.append(
+                    {
+                        "name": str(item.get("name", "")),
+                        "content": str(item.get("content", "")),
+                    }
+                )
+        if not any(
+            (it.get("name") or "").strip() == "默认编辑Instruction"
+            and (it.get("content") or "").strip()
+            == (text_cfg["modify_instructions"] or "").strip()
+            for it in normalized_modify_history
+        ):
+            normalized_modify_history.insert(
+                0,
+                {
+                    "name": "默认编辑Instruction",
+                    "content": text_cfg["modify_instructions"],
+                },
+            )
+        text_cfg["modify_instructions_history"] = normalized_modify_history
+
+        raw_caps = text_cfg.get("model_capabilities", [])
+        if isinstance(raw_caps, str):
+            caps = [
+                item.strip()
+                for item in raw_caps.replace(";", ",").split(",")
+                if item.strip()
+            ]
+        elif isinstance(raw_caps, list):
+            caps = [str(item).strip() for item in raw_caps if str(item).strip()]
+        else:
+            caps = []
+        text_cfg["model_capabilities"] = caps
+
+        raw_context_size = text_cfg.get("model_context_size", 8192)
+        try:
+            context_size = int(raw_context_size)
+        except Exception:
+            context_size = 8192
+        if context_size <= 0:
+            context_size = 8192
+        text_cfg["model_context_size"] = context_size
+
+        raw_catalog = text_cfg.get("model_meta_catalog", {})
+        normalized_catalog = {}
+        if isinstance(raw_catalog, dict):
+            for model_name, meta in raw_catalog.items():
+                model_key = str(model_name).strip()
+                if not model_key:
+                    continue
+                meta_dict = meta if isinstance(meta, dict) else {}
+                model_caps = meta_dict.get("capabilities", [])
+                if isinstance(model_caps, str):
+                    model_caps = [
+                        item.strip()
+                        for item in model_caps.replace(";", ",").split(",")
+                        if item.strip()
+                    ]
+                elif isinstance(model_caps, list):
+                    model_caps = [
+                        str(item).strip()
+                        for item in model_caps
+                        if str(item).strip()
+                    ]
+                else:
+                    model_caps = []
+                model_ctx = meta_dict.get("context_size", context_size)
+                try:
+                    model_ctx = int(model_ctx)
+                except Exception:
+                    model_ctx = context_size
+                if model_ctx <= 0:
+                    model_ctx = context_size
+                normalized_catalog[model_key] = {
+                    "capabilities": model_caps,
+                    "context_size": model_ctx,
+                }
+        text_cfg["model_meta_catalog"] = normalized_catalog
+        current_model = str(text_cfg.get("model", "")).strip()
+        if current_model and current_model not in normalized_catalog:
+            text_cfg["model_meta_catalog"][current_model] = {
+                "capabilities": caps,
+                "context_size": context_size,
+            }
+        compression_profile = str(
+            text_cfg.get("world_context_compression_profile", "balanced")
+        ).strip().lower()
+        if compression_profile not in {"conservative", "balanced", "aggressive"}:
+            compression_profile = "balanced"
+        text_cfg["world_context_compression_profile"] = compression_profile
+
+        def _normalize_ratio(raw_value, default_value, min_value, max_value):
+            try:
+                value = float(raw_value)
+            except Exception:
+                value = default_value
+            if value > 1:
+                value = value / 100.0
+            if value <= 0:
+                value = default_value
+            return max(min_value, min(max_value, value))
+
+        text_cfg["children_summary_compress_trigger_ratio"] = _normalize_ratio(
+            text_cfg.get("children_summary_compress_trigger_ratio", 0.27),
+            default_value=0.27,
+            min_value=0.05,
+            max_value=0.8,
+        )
+        text_cfg["children_summary_group_budget_ratio"] = _normalize_ratio(
+            text_cfg.get("children_summary_group_budget_ratio", 0.24),
+            default_value=0.24,
+            min_value=0.04,
+            max_value=0.6,
+        )
+
+        text_cfg["auto_continue_on_incomplete"] = bool(
+            text_cfg.get("auto_continue_on_incomplete", True)
+        )
+        try:
+            rounds = int(text_cfg.get("auto_continue_max_rounds", 3))
+        except Exception:
+            rounds = 3
+        text_cfg["auto_continue_max_rounds"] = max(0, min(10, rounds))
+        return text_cfg
+
+    def _build_text_api_profiles(self: Any, cfg: dict) -> dict:
+        raw_profiles = cfg.get("text_api_profiles", {})
+        if isinstance(raw_profiles, dict):
+            raw_normal = raw_profiles.get("normal")
+            raw_nsfw = raw_profiles.get("nsfw")
+        else:
+            raw_normal = None
+            raw_nsfw = None
+
+        # 兼容旧配置：只有 text_api 时，默认复制为 normal / nsfw 两套。
+        legacy_text_api = cfg.get("text_api", {}) if isinstance(cfg.get("text_api"), dict) else {}
+        if raw_normal is None:
+            raw_normal = legacy_text_api
+        if raw_nsfw is None:
+            raw_nsfw = copy.deepcopy(raw_normal if isinstance(raw_normal, dict) else legacy_text_api)
+
+        return {
+            "normal": self._normalize_text_api_profile(
+                raw_normal if isinstance(raw_normal, dict) else {}
+            ),
+            "nsfw": self._normalize_text_api_profile(
+                raw_nsfw if isinstance(raw_nsfw, dict) else {}
+            ),
+        }
+
     def _get_instruction_history(
-        self: "NovelCreatorWindow", history_key: str
+        self: Any, history_key: str
     ) -> list[dict]:
         text_cfg = (self.config or {}).get("text_api", {})
         raw_history = text_cfg.get(history_key, [])
@@ -56,7 +319,7 @@ class ConfigMixin:
         return history
 
     def _find_instruction_content_by_name(
-        self: "NovelCreatorWindow", history_key: str, template_name: str
+        self: Any, history_key: str, template_name: str
     ) -> str | None:
         if not template_name:
             return None
@@ -68,7 +331,7 @@ class ConfigMixin:
         return None
 
     def _resolve_instruction_name_from_content(
-        self: "NovelCreatorWindow",
+        self: Any,
         history_key: str,
         content: str,
         fallback_name: str,
@@ -84,7 +347,7 @@ class ConfigMixin:
         return fallback_name
 
     def _ensure_named_instruction_in_config(
-        self: "NovelCreatorWindow",
+        self: Any,
         history_key: str,
         content_key: str,
         fallback_name: str,
@@ -117,7 +380,7 @@ class ConfigMixin:
             )
         text_cfg[history_key] = normalized_history
 
-    def _get_current_instruction_profile(self: "NovelCreatorWindow") -> dict:
+    def _get_current_instruction_profile(self: Any) -> dict:
         text_cfg = (self.config or {}).get("text_api", {})
         writing_content = text_cfg.get(
             "instructions", self._get_default_writing_instruction()
@@ -141,7 +404,7 @@ class ConfigMixin:
             ),
         }
 
-    def _save_workspace_instruction_profile(self: "NovelCreatorWindow"):
+    def _save_workspace_instruction_profile(self: Any):
         if not getattr(self, "workspace", None):
             return
         try:
@@ -165,7 +428,7 @@ class ConfigMixin:
                 f"<font color='orange'>保存工作区 Instruction 绑定失败: {e}</font>"
             )
 
-    def _apply_workspace_instruction_profile(self: "NovelCreatorWindow"):
+    def _apply_workspace_instruction_profile(self: Any):
         if not getattr(self, "workspace", None):
             return
 
@@ -227,7 +490,7 @@ class ConfigMixin:
             self.log_console.append(f"<font color='orange'>{msg}</font>")
             QMessageBox.warning(self, "Instruction 绑定告警", msg)  # type: ignore[arg-type]
 
-    def _load_config(self: "NovelCreatorWindow") -> dict:
+    def _load_config(self: Any) -> dict:
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         config_path = os.path.join(base_dir, "conf", "setting.json")
 
@@ -235,165 +498,34 @@ class ConfigMixin:
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
-                text_cfg = cfg.setdefault("text_api", {})
-                default_writing = self._get_default_writing_instruction()
-                if not text_cfg.get("instructions"):
-                    text_cfg["instructions"] = default_writing
-                raw_writing_history = text_cfg.get("instructions_history", [])
-                normalized_writing_history = []
-                for item in raw_writing_history:
-                    if isinstance(item, str):
-                        normalized_writing_history.append({"name": "", "content": item})
-                    elif isinstance(item, dict):
-                        normalized_writing_history.append(
-                            {
-                                "name": str(item.get("name", "")),
-                                "content": str(item.get("content", "")),
-                            }
-                        )
-                if not any(
-                    (it.get("name") or "").strip() == "默认写作Instruction"
-                    and (it.get("content") or "").strip()
-                    == (text_cfg["instructions"] or "").strip()
-                    for it in normalized_writing_history
-                ):
-                    normalized_writing_history.insert(
-                        0,
-                        {
-                            "name": "默认写作Instruction",
-                            "content": text_cfg["instructions"],
-                        },
-                    )
-                text_cfg["instructions_history"] = normalized_writing_history
-
-                default_modify = self._get_default_modify_instruction()
-                if not text_cfg.get("modify_instructions"):
-                    text_cfg["modify_instructions"] = default_modify
-
-                raw_modify_history = text_cfg.get("modify_instructions_history", [])
-                normalized_history = []
-                for item in raw_modify_history:
-                    if isinstance(item, str):
-                        normalized_history.append({"name": "", "content": item})
-                    elif isinstance(item, dict):
-                        normalized_history.append(
-                            {
-                                "name": str(item.get("name", "")),
-                                "content": str(item.get("content", "")),
-                            }
-                        )
-                if not any(
-                    (it.get("name") or "").strip() == "默认编辑Instruction"
-                    and (it.get("content") or "").strip()
-                    == (text_cfg["modify_instructions"] or "").strip()
-                    for it in normalized_history
-                ):
-                    normalized_history.insert(
-                        0,
-                        {
-                            "name": "默认编辑Instruction",
-                            "content": text_cfg["modify_instructions"],
-                        },
-                    )
-                text_cfg["modify_instructions_history"] = normalized_history
-
-                raw_caps = text_cfg.get("model_capabilities", [])
-                if isinstance(raw_caps, str):
-                    caps = [
-                        item.strip()
-                        for item in raw_caps.replace(";", ",").split(",")
-                        if item.strip()
-                    ]
-                elif isinstance(raw_caps, list):
-                    caps = [str(item).strip() for item in raw_caps if str(item).strip()]
-                else:
-                    caps = []
-                text_cfg["model_capabilities"] = caps
-
-                raw_context_size = text_cfg.get("model_context_size", 8192)
-                try:
-                    context_size = int(raw_context_size)
-                except Exception:
-                    context_size = 8192
-                if context_size <= 0:
-                    context_size = 8192
-                text_cfg["model_context_size"] = context_size
-
-                raw_catalog = text_cfg.get("model_meta_catalog", {})
-                normalized_catalog = {}
-                if isinstance(raw_catalog, dict):
-                    for model_name, meta in raw_catalog.items():
-                        model_key = str(model_name).strip()
-                        if not model_key:
-                            continue
-                        meta_dict = meta if isinstance(meta, dict) else {}
-                        model_caps = meta_dict.get("capabilities", [])
-                        if isinstance(model_caps, str):
-                            model_caps = [
-                                item.strip()
-                                for item in model_caps.replace(";", ",").split(",")
-                                if item.strip()
-                            ]
-                        elif isinstance(model_caps, list):
-                            model_caps = [
-                                str(item).strip()
-                                for item in model_caps
-                                if str(item).strip()
-                            ]
-                        else:
-                            model_caps = []
-                        model_ctx = meta_dict.get("context_size", context_size)
-                        try:
-                            model_ctx = int(model_ctx)
-                        except Exception:
-                            model_ctx = context_size
-                        if model_ctx <= 0:
-                            model_ctx = context_size
-                        normalized_catalog[model_key] = {
-                            "capabilities": model_caps,
-                            "context_size": model_ctx,
-                        }
-                text_cfg["model_meta_catalog"] = normalized_catalog
-                current_model = str(text_cfg.get("model", "")).strip()
-                if current_model and current_model not in normalized_catalog:
-                    text_cfg["model_meta_catalog"][current_model] = {
-                        "capabilities": caps,
-                        "context_size": context_size,
-                    }
-                raw_profile = str(
-                    text_cfg.get("world_context_compression_profile", "balanced")
-                ).strip().lower()
-                if raw_profile not in {"conservative", "balanced", "aggressive"}:
-                    raw_profile = "balanced"
-                text_cfg["world_context_compression_profile"] = raw_profile
+                profiles = self._build_text_api_profiles(cfg)
+                active_key = "nsfw" if bool(getattr(self, "_workspace_is_nsfw", False)) else "normal"
+                cfg["text_api_profiles"] = profiles
+                cfg["text_api_active_profile"] = active_key
+                cfg["text_api"] = copy.deepcopy(profiles.get(active_key, profiles["normal"]))
+                cfg["text_generation_mode"] = active_key
+                cfg["text_api"]["text_generation_mode"] = active_key
+                cfg["task_completion_notification_enabled"] = bool(
+                    cfg.get("task_completion_notification_enabled", True)
+                )
                 return cfg
             except Exception as e:
                 print(f"读取配置文件失败: {e}")
+        default_profiles = {
+            "normal": self._get_default_text_api_profile(),
+            "nsfw": self._get_default_text_api_profile(),
+        }
+        active_key = "nsfw" if bool(getattr(self, "_workspace_is_nsfw", False)) else "normal"
         return {
-            "text_api": {
-                "instructions": self._get_default_writing_instruction(),
-                "instructions_history": [
-                    {
-                        "name": "默认写作Instruction",
-                        "content": self._get_default_writing_instruction(),
-                    }
-                ],
-                "modify_instructions": self._get_default_modify_instruction(),
-                "modify_instructions_history": [
-                    {
-                        "name": "默认编辑Instruction",
-                        "content": self._get_default_modify_instruction(),
-                    }
-                ],
-                "model_capabilities": [],
-                "model_context_size": 8192,
-                "world_context_compression_profile": "balanced",
-                "model_meta_catalog": {},
-            }
+            "text_api_profiles": default_profiles,
+            "text_api_active_profile": active_key,
+            "text_api": copy.deepcopy(default_profiles[active_key]),
+            "text_generation_mode": active_key,
+            "task_completion_notification_enabled": True,
         }
 
     def _get_or_create_prompt_template(
-        self: "NovelCreatorWindow",
+        self: Any,
         template_name: str,
         default_text: str,
         desc: str,
@@ -424,11 +556,11 @@ class ConfigMixin:
 
         return final_text
 
-    def _get_sys_state_path(self: "NovelCreatorWindow") -> str:
+    def _get_sys_state_path(self: Any) -> str:
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         return os.path.join(base_dir, "conf", "sys_state.json")
 
-    def _load_sys_state(self: "NovelCreatorWindow") -> dict:
+    def _load_sys_state(self: Any) -> dict:
         path = self._get_sys_state_path()
         if os.path.exists(path):
             try:
@@ -438,7 +570,7 @@ class ConfigMixin:
                 pass
         return {"recent_workspaces": []}
 
-    def _write_sys_state(self: "NovelCreatorWindow", state: dict):
+    def _write_sys_state(self: Any, state: dict):
         path = self._get_sys_state_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -447,7 +579,7 @@ class ConfigMixin:
         except Exception as e:
             print(f"保存系统状态失败: {e}")
 
-    def _save_sys_state(self: "NovelCreatorWindow", workspace_path: str):
+    def _save_sys_state(self: Any, workspace_path: str):
         state = self._load_sys_state()
         recents = state.get("recent_workspaces", [])
         if workspace_path in recents:
@@ -456,7 +588,7 @@ class ConfigMixin:
         state["recent_workspaces"] = recents[:10]
         self._write_sys_state(state)
 
-    def _save_window_ui_state(self: "NovelCreatorWindow"):
+    def _save_window_ui_state(self: Any):
         """保存主窗口尺寸/状态与分栏位置。"""
         state = self._load_sys_state()
         ui_state = state.get("ui_state", {})
@@ -482,7 +614,7 @@ class ConfigMixin:
         state["ui_state"] = ui_state
         self._write_sys_state(state)
 
-    def _restore_window_ui_state(self: "NovelCreatorWindow"):
+    def _restore_window_ui_state(self: Any):
         """恢复主窗口尺寸/状态与分栏位置。"""
         state = self._load_sys_state()
         ui_state = state.get("ui_state", {})
@@ -530,25 +662,77 @@ class ConfigMixin:
         if bool(ui_state.get("is_maximized", False)):
             self.showMaximized()
 
-    def _get_debug_add_button_enabled(self: "NovelCreatorWindow") -> bool:
+    def _get_debug_log_enabled(self: Any) -> bool:
         state = self._load_sys_state()
-        return bool(state.get("debug_add_button_enabled", False))
+        # 兼容旧字段 debug_add_button_enabled
+        return bool(
+            state.get(
+                "debug_log_enabled",
+                state.get("debug_add_button_enabled", False),
+            )
+        )
 
-    def _save_debug_add_button_enabled(self: "NovelCreatorWindow", enabled: bool):
+    def _save_debug_log_enabled(self: Any, enabled: bool):
         state = self._load_sys_state()
+        state["debug_log_enabled"] = bool(enabled)
+        # 兼容旧字段，避免历史版本读不到
         state["debug_add_button_enabled"] = bool(enabled)
         self._write_sys_state(state)
 
-    def _get_modify_style_option(self: "NovelCreatorWindow") -> bool:
+    # 兼容旧调用名
+    def _get_debug_add_button_enabled(self: Any) -> bool:
+        return self._get_debug_log_enabled()
+
+    # 兼容旧调用名
+    def _save_debug_add_button_enabled(self: Any, enabled: bool):
+        self._save_debug_log_enabled(enabled)
+
+    def _get_modify_style_option(self: Any) -> bool:
         state = self._load_sys_state()
         return bool(state.get("append_writing_style_on_modify", False))
 
-    def _save_modify_style_option(self: "NovelCreatorWindow", enabled: bool):
+    def _save_modify_style_option(self: Any, enabled: bool):
         state = self._load_sys_state()
         state["append_writing_style_on_modify"] = bool(enabled)
         self._write_sys_state(state)
 
-    def open_settings_dialog(self: "NovelCreatorWindow"):
+    def _get_batch_modify_thread_count(self: Any) -> int:
+        state = self._load_sys_state()
+        value = state.get("batch_modify_thread_count", 3)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(20, value))
+
+    def _save_batch_modify_thread_count(self: Any, count: int):
+        state = self._load_sys_state()
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            value = 3
+        state["batch_modify_thread_count"] = max(1, min(20, value))
+        self._write_sys_state(state)
+
+    def _get_auto_export_www_enabled(self: Any) -> bool:
+        state = self._load_sys_state()
+        return bool(state.get("auto_export_www_enabled", False))
+
+    def _save_auto_export_www_enabled(self: Any, enabled: bool):
+        state = self._load_sys_state()
+        state["auto_export_www_enabled"] = bool(enabled)
+        self._write_sys_state(state)
+
+    def _get_smart_setting_selection_enabled(self: Any) -> bool:
+        state = self._load_sys_state()
+        return bool(state.get("smart_setting_selection_enabled", False))
+
+    def _save_smart_setting_selection_enabled(self: Any, enabled: bool):
+        state = self._load_sys_state()
+        state["smart_setting_selection_enabled"] = bool(enabled)
+        self._write_sys_state(state)
+
+    def open_settings_dialog(self: Any):
         dialog = SettingsDialog(self)  # type: ignore[arg-type]
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.log_console.append("系统配置已更新，正在重新初始化模型客户端...")
