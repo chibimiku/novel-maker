@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import uuid
 import copy
 import time
@@ -12,7 +13,7 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 from ui.summary_sync_worker import SummarySyncWorker
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -38,7 +39,7 @@ from ui.theme import NODE_ADD_BTN, NODE_ERROR, NODE_MISSING, NODE_NORMAL
 from ui.diff_merge_dialog import DiffMergeDialog
 from ui.dialogs import IdeaInputDialog, RenameNodeDialog
 from ui.utils import clean_json_string, find_duplicate_paths, get_item_level, find_item_by_data
-from ui.workers import OutlineBuildingThread, GenerateTaskThread
+from ui.workers import OutlineBuildingThread, GenerateTaskThread, SettingSelectionThread
 from core.context_builder import ContextBuilder
 
 if TYPE_CHECKING:
@@ -1375,7 +1376,15 @@ class NovelTreeMixin:
                     )
                     if has_pending:
                         split_action.setEnabled(False)
-                    
+                
+                    open_file_action = menu.addAction("📁 在文件管理器中打开文件位置")
+                    open_file_action.triggered.connect(
+                        lambda: self._open_node_file_location(real_node)
+                    )
+                    rel_path = real_node.get("file_path")
+                    if not rel_path or not os.path.exists(os.path.join(self.workspace.text_path, rel_path)):
+                        open_file_action.setEnabled(False)
+                
                     menu.addSeparator()
 
         gen_outline_action = menu.addAction(
@@ -1389,6 +1398,18 @@ class NovelTreeMixin:
             sync_summary_action.triggered.connect(lambda: self.start_summary_sync(real_node, level))
 
         menu.exec(self.novel_tree.viewport().mapToGlobal(position))
+
+    def _open_node_file_location(self: "NovelCreatorWindow", node: dict):
+        rel_path = node.get("file_path")
+        if not rel_path:
+            return
+        full_path = os.path.abspath(os.path.join(self.workspace.text_path, rel_path))
+        if not os.path.exists(full_path):
+            return
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", full_path])
+        else:
+            subprocess.Popen(["open", os.path.dirname(full_path)])
 
     def start_summary_sync(self: "NovelCreatorWindow", target_node: dict, level: int):
         if not self.llm_client:
@@ -2386,9 +2407,17 @@ class NovelTreeMixin:
                 node_title = real_node.get("title", "当前节点")
                 self.log_console.append(f"<font color='orange'>⚠️ 节点【{node_title}】修改被跳过：{reason}</font>")
                 self.log_console.append(f"<font color='gray'>LLM 原始返回（前200字）：{result[:200]}...</font>")
+                getattr(self, '_issue_submitting_map', {}).pop(node_id, None)
+                if hasattr(self, '_issue_submit_queue') and self._issue_submit_queue:
+                    self._process_next_issue_submit()
                 return
 
             self.workspace.save_pending_modify(node_id, original_text, result, requirement)
+
+            issue_id = getattr(self, '_issue_submitting_map', {}).pop(node_id, None)
+            if issue_id and self.workspace:
+                self.workspace.delete_mobile_issue(issue_id)
+                self._refresh_issue_panel()
 
             self.log_console.append(f"<font color='green'>✅ 修改内容生成完成！节点标题已变红，请右键选择【进行合并】来查看差异并合并。</font>")
             node_title = real_node.get("title", "当前节点")
@@ -2398,6 +2427,9 @@ class NovelTreeMixin:
             )
 
             self._refresh_novel_tree()
+
+            if hasattr(self, '_issue_submit_queue') and self._issue_submit_queue:
+                self._process_next_issue_submit()
 
         except Exception as e:
             self.log_console.append(f"<font color='red'>保存待合并修改失败: {e}</font>")
@@ -2409,9 +2441,12 @@ class NovelTreeMixin:
         """修改失败回调"""
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
+        getattr(self, '_issue_submitting_map', {}).pop(node_id, None)
         self.log_console.append(f"<font color='red'>修改内容失败: {error_msg}</font>")
         QMessageBox.critical(self, "错误", f"修改内容过程中发生异常:\n{error_msg}")
         self.btn_save.setEnabled(True)
+        if hasattr(self, '_issue_submit_queue') and self._issue_submit_queue:
+            self._process_next_issue_submit()
 
     def open_merge_dialog(self: "NovelCreatorWindow", node_id: str, real_node: dict):
         """打开合并对话框"""
@@ -2912,11 +2947,14 @@ class NovelTreeMixin:
                 layout.addWidget(self.smart_select_cb)
 
                 self.use_cache_cb = QCheckBox("使用缓存（跳过已计算的相关性）")
-                self.use_cache_cb.setChecked(True)
+                self.use_cache_cb.setChecked(default_smart_select)
+                self.use_cache_cb.setEnabled(default_smart_select)
                 self.use_cache_cb.setToolTip(
                     "勾选后，如果 .cache 目录中已有该节点的设定相关性缓存，"
                     "则直接复用，不再重新计算和请求LLM。"
                 )
+                self.smart_select_cb.toggled.connect(self.use_cache_cb.setEnabled)
+                self.smart_select_cb.toggled.connect(self.use_cache_cb.setChecked)
                 layout.addWidget(self.use_cache_cb)
                 
                 # 按钮
@@ -3041,6 +3079,7 @@ class NovelTreeMixin:
         self.batch_modify_queue = valid_nodes.copy()
         self.is_batch_modifying = True
         self.batch_modify_requirement = requirement
+        self.batch_modify_max_workers_raw = thread_count
 
         self._batch_modify_node_settings: dict[str, str] = {}
 
@@ -3048,42 +3087,31 @@ class NovelTreeMixin:
             previous_smart_flag = getattr(self, "_smart_setting_selection_enabled", False)
             self._smart_setting_selection_enabled = True
             self._batch_modify_log("SMART_SEL_START", f"nodes={len(valid_nodes)} use_cache={use_cache}")
-            try:
-                all_candidate_paths = self.get_checked_settings()
-                if not all_candidate_paths:
-                    all_candidates = self._collect_setting_candidates_for_smart_select()
-                    all_candidate_paths = [item["path"] for item in all_candidates]
 
-                if all_candidate_paths:
-                    builder = self._create_context_builder()
-                    for _item, node in valid_nodes:
-                        node_id = node.get("id", "")
-                        if not node_id:
-                            continue
-                        try:
-                            selected_paths = self._resolve_checked_settings_for_task(
-                                "批量修改",
-                                node,
-                                node.get("summary", ""),
-                                use_cache=use_cache,
-                            )
-                            if selected_paths and selected_paths != all_candidate_paths:
-                                settings_text = builder._build_settings_text(
-                                    selected_paths
-                                ).strip()
-                                if settings_text:
-                                    self._batch_modify_node_settings[node_id] = settings_text
-                        except Exception as e:
-                            self.log_console.append(
-                                f"<font color='orange'>节点【{node.get('title', '未知')}】"
-                                f"设定智能筛选失败：{e}</font>"
-                            )
-                    self._batch_modify_log(
-                        "SMART_SEL_DONE",
-                        f"matched={len(self._batch_modify_node_settings)}/{len(valid_nodes)}",
-                    )
-            finally:
+            all_candidate_paths = self.get_checked_settings()
+            if not all_candidate_paths:
+                all_candidates = self._collect_setting_candidates_for_smart_select()
+                all_candidate_paths = [item["path"] for item in all_candidates]
+
+            if not all_candidate_paths:
                 self._smart_setting_selection_enabled = previous_smart_flag
+                self._batch_modify_log("SMART_SEL_DONE", "no_candidates")
+            else:
+                nodes_to_process = []
+                for _item, node in valid_nodes:
+                    node_id = node.get("id", "")
+                    if node_id:
+                        nodes_to_process.append((_item, node))
+
+                self._batch_modify_smart_sel_prev_flag = previous_smart_flag
+                self._batch_modify_smart_sel_queue = nodes_to_process
+                self._batch_modify_smart_sel_candidates = all_candidate_paths
+                self._batch_modify_smart_sel_use_cache = use_cache
+                self._batch_modify_log(
+                    "SMART_SEL_BATCH_START", f"total={len(nodes_to_process)}"
+                )
+                self._process_next_batch_modify_smart_sel()
+                return
 
         if not self._batch_modify_node_settings:
             checked_paths = self.get_checked_settings()
@@ -3117,7 +3145,160 @@ class NovelTreeMixin:
         self.btn_save.setEnabled(False)
 
         self._process_next_batch_modify_node()
-    
+
+    def _process_next_batch_modify_smart_sel(self: "NovelCreatorWindow"):
+        if not hasattr(self, "_batch_modify_smart_sel_queue"):
+            self._batch_modify_log("SMART_SEL_ERR", "queue_missing")
+            self._finalize_batch_modify_smart_sel()
+            return
+        if not self._batch_modify_smart_sel_queue:
+            self._finish_batch_modify_smart_sel()
+            return
+
+        _item, node = self._batch_modify_smart_sel_queue[0]
+        candidate_paths = getattr(self, "_batch_modify_smart_sel_candidates", [])
+        use_cache = getattr(self, "_batch_modify_smart_sel_use_cache", True)
+
+        if not self.workspace:
+            self._batch_modify_smart_sel_queue.pop(0)
+            self._process_next_batch_modify_smart_sel()
+            return
+
+        self._batch_modify_log(
+            "SMART_SEL_NODE",
+            f"node={node.get('title', '?')} id={node.get('id', '?')}"
+        )
+
+        self._batch_modify_sel_thread = SettingSelectionThread(
+            self.llm_client,
+            self.workspace.workspace_path,
+            "批量修改",
+            node,
+            node.get("summary", ""),
+            use_cache,
+            self.get_checked_settings(),
+            candidate_paths,
+        )
+        self._batch_modify_sel_thread.progress_signal.connect(
+            self._on_batch_modify_smart_sel_progress
+        )
+        self._batch_modify_sel_thread.success_signal.connect(
+            self._on_batch_modify_smart_sel_resolved
+        )
+        self._batch_modify_sel_thread.error_signal.connect(
+            self._on_batch_modify_smart_sel_error
+        )
+        self._batch_modify_sel_thread.start()
+
+    def _on_batch_modify_smart_sel_error(
+        self: "NovelCreatorWindow", error_msg_or_paths
+    ):
+        if isinstance(error_msg_or_paths, list):
+            self.log_console.append(
+                "<font color='red'>❌ 批量修改设定筛选异常，已回退手动勾选设定</font>"
+            )
+            self._on_batch_modify_smart_sel_resolved(error_msg_or_paths)
+        else:
+            self.log_console.append(
+                f"<font color='red'>❌ 批量修改设定筛选异常：{error_msg_or_paths}</font>"
+            )
+            QTimer.singleShot(0, self._process_next_batch_modify_smart_sel)
+
+    def _on_batch_modify_smart_sel_progress(
+        self: "NovelCreatorWindow", message: str
+    ):
+        self.log_console.append(
+            f"<font color='gray'>[批修-LLM] {message}</font>"
+        )
+
+    def _on_batch_modify_smart_sel_resolved(
+        self: "NovelCreatorWindow", selected_paths: list
+    ):
+        if not hasattr(self, "_batch_modify_smart_sel_queue"):
+            self._batch_modify_log("SMART_SEL_ERR", "queue_lost_on_resolve")
+            self._finalize_batch_modify_smart_sel()
+            return
+        if not self._batch_modify_smart_sel_queue:
+            self._finish_batch_modify_smart_sel()
+            return
+
+        _item, node = self._batch_modify_smart_sel_queue.pop(0)
+        node_id = node.get("id", "")
+        candidate_paths = getattr(self, "_batch_modify_smart_sel_candidates", [])
+
+        try:
+            if selected_paths and selected_paths != candidate_paths:
+                builder = self._create_context_builder()
+                settings_text = builder._build_settings_text(
+                    selected_paths
+                ).strip()
+                if settings_text and node_id:
+                    self._batch_modify_node_settings[node_id] = settings_text
+        except Exception as e:
+            self.log_console.append(
+                f"<font color='orange'>节点【{node.get('title', '未知')}】"
+                f"设定智能筛选失败：{e}</font>"
+            )
+
+        QTimer.singleShot(0, self._process_next_batch_modify_smart_sel)
+
+    def _finish_batch_modify_smart_sel(self: "NovelCreatorWindow"):
+        previous_smart_flag = getattr(
+            self, "_batch_modify_smart_sel_prev_flag", False
+        )
+        self._smart_setting_selection_enabled = previous_smart_flag
+
+        matched = len(self._batch_modify_node_settings)
+        total = matched + len(getattr(self, "batch_modify_queue", []))
+        self._batch_modify_log(
+            "SMART_SEL_DONE",
+            f"matched={matched}/{total}",
+        )
+
+        self._batch_modify_smart_sel_queue = None
+        self._batch_modify_smart_sel_candidates = None
+        self._batch_modify_smart_sel_use_cache = None
+        self._batch_modify_smart_sel_prev_flag = None
+
+        self._finalize_batch_modify_smart_sel()
+
+    def _finalize_batch_modify_smart_sel(self: "NovelCreatorWindow"):
+        if not self._batch_modify_node_settings:
+            checked_paths = self.get_checked_settings()
+            self.batch_modify_settings_text = ""
+            if checked_paths:
+                try:
+                    builder = self._create_context_builder()
+                    self.batch_modify_settings_text = builder._build_settings_text(
+                        checked_paths
+                    ).strip()
+                    self._batch_modify_log(
+                        "GLOBAL_SETTINGS", f"path_count={len(checked_paths)}"
+                    )
+                except Exception as e:
+                    self.log_console.append(
+                        f"<font color='orange'>构建批量修改背景设定上下文失败，已降级为仅使用原文修改：{e}</font>"
+                    )
+
+        self.batch_modify_success_count = 0
+        self.batch_modify_fail_count = 0
+        thread_count = getattr(self, "batch_modify_max_workers_raw", 3)
+        self.batch_modify_max_workers = max(1, min(20, int(thread_count)))
+        self.batch_modify_inflight = 0
+        self.batch_modify_threads = {}
+
+        self.log_console.append(
+            f"<font color='cyan'>🚀 开始批量修改，共 {len(self.batch_modify_queue)} 个节点，"
+            f"并发 {self.batch_modify_max_workers} 线程...</font>"
+        )
+        self._batch_modify_log(
+            "START",
+            f"total={len(self.batch_modify_queue)} max_workers={self.batch_modify_max_workers}",
+        )
+        self.btn_save.setEnabled(False)
+
+        self._process_next_batch_modify_node()
+
     def _process_next_batch_modify_node(self: "NovelCreatorWindow"):
         """按并发上限持续分发批量修改任务"""
         if not self.is_batch_modifying:
@@ -3321,3 +3502,239 @@ class NovelTreeMixin:
         self.batch_modify_fail_count += 1
         self.log_console.append(f"<font color='red'>❌ 节点【{node_title}】修改失败: {error_msg}</font>")
         self._process_next_batch_modify_node()
+
+    # ================= 📱 手机端 Issue 处理 ================= #
+
+    def _refresh_issue_panel(self: "NovelCreatorWindow"):
+        """刷新待处理 Issue 面板"""
+        if not self.workspace:
+            return
+
+        issues = self.workspace.load_mobile_issues()
+        self._loaded_mobile_issues = issues
+
+        count = len(issues)
+        self.issue_count_label.setText(f"📱 待处理 Issue ({count})")
+
+        if not issues:
+            self.issue_panel_frame.setVisible(False)
+            return
+
+        self.issue_panel_frame.setVisible(True)
+
+        while self.issue_list_layout.count() > 1:
+            item = self.issue_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for issue in issues:
+            card = self._build_issue_card(issue)
+            self.issue_list_layout.insertWidget(self.issue_list_layout.count() - 1, card)
+
+        if self.issue_scroll_area.isVisible():
+            rows = min(count, 6)
+            self.issue_panel_frame.setFixedHeight(40 + rows * 110 + 12)
+
+    def _build_issue_card(self: "NovelCreatorWindow", issue: dict) -> QFrame:
+        """构建单个 Issue 卡片"""
+        card = QFrame()
+        card.setFrameStyle(QFrame.Shape.StyledPanel)
+        card.setStyleSheet("QFrame { background: #2d2d2d; border: 1px solid #444; border-radius: 4px; padding: 4px; }")
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+
+        submitted_at = issue.get("submitted_at", "")[:16].replace("T", " ")
+        node_id = issue.get("node_id", "")
+        node_path = self._get_node_path_from_outline(node_id) or "(节点已删除)"
+
+        time_label = QLabel(f"🕐 {submitted_at}")
+        time_label.setStyleSheet("color: #7f8c8d; font-size: 10px; border: none; background: transparent;")
+        layout.addWidget(time_label)
+
+        path_label = QLabel(f"📍 {node_path}")
+        path_label.setStyleSheet("color: #e0c36a; font-weight: bold; font-size: 11px; border: none; background: transparent;")
+        path_label.setWordWrap(True)
+        layout.addWidget(path_label)
+
+        req_text = issue.get("requirement", "")
+        if len(req_text) > 60:
+            req_text = req_text[:60] + "..."
+        req_label = QLabel(f"📝 {req_text}")
+        req_label.setStyleSheet("color: #ccc; font-size: 11px; border: none; background: transparent;")
+        req_label.setWordWrap(True)
+        layout.addWidget(req_label)
+
+        quoted = issue.get("quoted_text", "")
+        if quoted:
+            if len(quoted) > 40:
+                quoted = quoted[:40] + "..."
+            quote_label = QLabel(f"📎 {quoted}")
+            quote_label.setStyleSheet("color: #95a5a6; font-size: 10px; border: none; background: transparent;")
+            quote_label.setWordWrap(True)
+            layout.addWidget(quote_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
+
+        edit_btn = QPushButton("✏️ 编辑")
+        edit_btn.setFixedHeight(22)
+        edit_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+        edit_btn.clicked.connect(lambda checked=False, iss=issue: self._on_issue_edit(iss))
+        btn_layout.addWidget(edit_btn)
+
+        submit_btn = QPushButton("🚀 提交修改")
+        submit_btn.setFixedHeight(22)
+        submit_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; background: #2196F3; color: white; }")
+        submit_btn.clicked.connect(lambda checked=False, iss=issue: self._on_issue_submit(iss))
+        btn_layout.addWidget(submit_btn)
+
+        close_btn = QPushButton("✔ 关闭")
+        close_btn.setFixedHeight(22)
+        close_btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 8px; }")
+        close_btn.clicked.connect(lambda checked=False, iss=issue: self._on_issue_close(iss))
+        btn_layout.addWidget(close_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        return card
+
+    def _on_issue_edit(self: "NovelCreatorWindow", issue: dict):
+        """编辑 Issue 需求文本"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("编辑修改需求")
+        dialog.setMinimumWidth(450)
+        dialog.setMinimumHeight(300)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("修改需求："))
+
+        edit = QTextEdit()
+        edit.setPlainText(issue.get("requirement", ""))
+        layout.addWidget(edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_req = edit.toPlainText().strip()
+            if new_req and new_req != issue.get("requirement", ""):
+                self.workspace.update_mobile_issue(issue["issue_id"], {"requirement": new_req})
+                self._refresh_issue_panel()
+                self.log_console.append("已更新 Issue 需求文本。")
+
+    def _on_issue_close(self: "NovelCreatorWindow", issue: dict):
+        """关闭（删除）Issue"""
+        node_path = self._get_node_path_from_outline(issue.get("node_id", "")) or "(未知节点)"
+        reply = QMessageBox.question(
+            self,
+            "确认关闭",
+            f"确定要关闭此 Issue 吗？\n\n节点：{node_path}\n需求：{issue.get('requirement', '')[:60]}...",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.workspace.delete_mobile_issue(issue["issue_id"])
+            self._refresh_issue_panel()
+            self.log_console.append("<font color='yellow'>已关闭 Issue。</font>")
+
+    def _on_issue_submit(self: "NovelCreatorWindow", issue: dict):
+        """提交修改：取 issue.requirement → start_modify_content"""
+        node_id = issue.get("node_id", "")
+        real_node = self.node_map.get(node_id)
+        if not real_node:
+            QMessageBox.warning(self, "错误", "找不到对应节点，可能已被删除。")
+            return
+
+        if not self.llm_client:
+            QMessageBox.warning(self, "未配置", "请先在设置中配置大模型 API。")
+            return
+
+        requirement = issue.get("requirement", "")
+        quoted = issue.get("quoted_text", "")
+        if quoted:
+            requirement = f"{requirement}\n\n用户引用的原文片段：\n{quoted}"
+
+        if not hasattr(self, '_issue_submitting_map'):
+            self._issue_submitting_map = {}
+        self._issue_submitting_map[node_id] = issue["issue_id"]
+
+        self.start_modify_content(real_node, node_id, requirement)
+
+    def _on_issue_submit_all(self: "NovelCreatorWindow"):
+        """全部提交：遍历所有 Issue，逐个转入 LLM 修改流程"""
+        if not self.workspace:
+            return
+
+        issues = self._loaded_mobile_issues if hasattr(self, '_loaded_mobile_issues') else self.workspace.load_mobile_issues()
+        if not issues:
+            QMessageBox.information(self, "提示", "当前没有待处理的 Issue。")
+            return
+
+        valid_issues = []
+        for issue in issues:
+            node_id = issue.get("node_id", "")
+            real_node = self.node_map.get(node_id)
+            if not real_node:
+                self.log_console.append(f"<font color='orange'>跳过 Issue：找不到节点 {issue.get('node_id', '')}</font>")
+                continue
+            if self.workspace.has_pending_modify(node_id):
+                self.log_console.append(f"<font color='orange'>跳过 Issue：节点已有待合并修改</font>")
+                continue
+            valid_issues.append((issue, real_node, node_id))
+
+        if not valid_issues:
+            QMessageBox.information(self, "提示", "没有可提交的 Issue（节点缺失或已有待合并修改）。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认全部提交",
+            f"即将把 {len(valid_issues)} 个 Issue 全部转入 LLM 修改流程。\n\n确定要全部提交吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not hasattr(self, '_issue_submitting_map'):
+            self._issue_submitting_map = {}
+
+        self._issue_submit_queue = valid_issues
+        self.log_console.append(f"<font color='cyan'>开始逐个提交 {len(valid_issues)} 个 Issue...</font>")
+        self._process_next_issue_submit()
+
+    def _process_next_issue_submit(self: "NovelCreatorWindow"):
+        """从队列中取出下一个 Issue 并提交修改"""
+        if not hasattr(self, '_issue_submit_queue') or not self._issue_submit_queue:
+            if hasattr(self, '_issue_submit_queue'):
+                del self._issue_submit_queue
+            self.log_console.append("<font color='green'>✅ 所有 Issue 已提交完毕。</font>")
+            return
+
+        issue, real_node, node_id = self._issue_submit_queue.pop(0)
+
+        if node_id in getattr(self, 'modifying_nodes', set()):
+            self.log_console.append(f"<font color='orange'>跳过 Issue：节点正在修改中</font>")
+            self._process_next_issue_submit()
+            return
+
+        requirement = issue.get("requirement", "")
+        quoted = issue.get("quoted_text", "")
+        if quoted:
+            requirement = f"{requirement}\n\n用户引用的原文片段：\n{quoted}"
+
+        if not hasattr(self, '_issue_submitting_map'):
+            self._issue_submitting_map = {}
+        self._issue_submitting_map[node_id] = issue["issue_id"]
+
+        self.start_modify_content(real_node, node_id, requirement)

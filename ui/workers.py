@@ -230,6 +230,231 @@ class IndexGenerateThread(QThread):
             self.error_signal.emit(str(e))
 
 
+# ================= 智能设定筛选线程 =================
+class SettingSelectionThread(QThread):
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal(list)
+    error_signal = pyqtSignal(object)
+
+    def __init__(
+        self,
+        llm_client,
+        workspace_path: str,
+        task_name: str,
+        target_node: dict,
+        task_context_prompt: str,
+        use_cache: bool,
+        checked_paths: list,
+        candidate_paths: list,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.llm_client = llm_client
+        self.workspace_path = workspace_path
+        self.task_name = task_name
+        self.target_node = target_node
+        self.task_context_prompt = task_context_prompt
+        self.use_cache = use_cache
+        self.checked_paths = checked_paths
+        self.candidate_paths = candidate_paths
+
+    @staticmethod
+    def _parse_smart_setting_selection_ids(raw_text: str) -> list:
+        if not raw_text:
+            return []
+        cleaned = raw_text.strip()
+        parsed = None
+        for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+            match = re.search(pattern, cleaned)
+            if not match:
+                continue
+            try:
+                parsed = json.loads(match.group(0))
+                break
+            except Exception:
+                continue
+        if parsed is None:
+            try:
+                parsed = json.loads(cleaned)
+            except Exception:
+                return []
+
+        raw_ids = []
+        if isinstance(parsed, dict):
+            for key in ("selected_ids", "selected_indexes", "ids", "indexes"):
+                if isinstance(parsed.get(key), list):
+                    raw_ids = parsed.get(key) or []
+                    break
+        elif isinstance(parsed, list):
+            raw_ids = parsed
+
+        result = []
+        for value in raw_ids:
+            try:
+                idx = int(value)
+            except Exception:
+                continue
+            if idx > 0:
+                result.append(idx)
+        return list(dict.fromkeys(result))
+
+    def run(self):
+        try:
+            self._run_impl()
+        except Exception as e:
+            self.progress_signal.emit(
+                f"<font color='red'>❌ 智能设定筛选异常，已回退手动勾选设定：{e}</font>"
+            )
+            self.success_signal.emit(self.checked_paths)
+
+    def _run_impl(self):
+        from core.setting_relevance import compute_local_relevance
+        from core.setting_relevance_cache import SettingRelevanceCache
+
+        MAX_LLM_CANDIDATES = 30
+        node_id = self.target_node.get("id", "")
+        node_title = self.target_node.get("title", "未知节点")
+        node_summary = self.target_node.get("summary", "")
+        candidate_paths = self.candidate_paths
+
+        if not candidate_paths:
+            self.success_signal.emit(self.checked_paths)
+            return
+
+        cache = SettingRelevanceCache(self.workspace_path)
+        relevance_scores = []
+
+        if self.use_cache:
+            cached_scores = cache.load(node_id, node_summary, candidate_paths)
+            if cached_scores is not None:
+                relevance_scores = cached_scores
+                self.progress_signal.emit("📦 已从缓存加载设定相关性评分")
+
+        if not relevance_scores:
+            total_candidates = len(candidate_paths)
+            self.progress_signal.emit(
+                f"🔍 正在本地计算设定相关性（共 {total_candidates} 个候选设定）..."
+            )
+            last_logged_pct = -1
+
+            def relevance_progress(current: int, total_count: int):
+                nonlocal last_logged_pct
+                pct = (current * 100) // total_count if total_count else 100
+                if current == total_count:
+                    self.progress_signal.emit(
+                        f"✅ 设定相关性计算完成，共处理 {total_count} 个候选"
+                    )
+                    return
+                if pct // 10 != last_logged_pct // 10:
+                    last_logged_pct = pct
+                    self.progress_signal.emit(
+                        f"   相关性计算进度: {current}/{total_count} ({pct}%)"
+                    )
+
+            relevance_scores = compute_local_relevance(
+                node_summary, node_title, candidate_paths,
+                progress_callback=relevance_progress,
+            )
+            cache.save(node_id, node_summary, candidate_paths, relevance_scores)
+
+        top_candidates = relevance_scores[:MAX_LLM_CANDIDATES]
+        top_paths = [p for p, _ in top_candidates]
+
+        if self.use_cache:
+            cached_selection = cache.load_selection(
+                node_id, node_summary, candidate_paths
+            )
+            if cached_selection is not None:
+                valid = [p for p in cached_selection if p in top_paths]
+                if valid:
+                    selected_names = [os.path.basename(p) for p in valid[:8]]
+                    self.progress_signal.emit(
+                        "📦 从缓存加载LLM勾选结果，已选设定："
+                        + "、".join(selected_names)
+                        + ("..." if len(valid) > 8 else "")
+                    )
+                    self.success_signal.emit(valid)
+                    return
+                self.progress_signal.emit(
+                    "📦 缓存勾选结果已失效，将重新请求LLM"
+                )
+
+        display_rows = []
+        path_map = {}
+        for i, (path, score) in enumerate(top_candidates, start=1):
+            cat = os.path.basename(os.path.dirname(path))
+            name = os.path.basename(path)
+            display_rows.append(
+                f"{i}. [{cat}] {name} (本地相关性: {score:.2f})"
+            )
+            path_map[i] = path
+
+        context_preview = (self.task_context_prompt or "").strip()
+        if len(context_preview) > 3500:
+            context_preview = context_preview[:3500] + "\n...(已截断)..."
+
+        selector_prompt = f"""你是小说创作设定筛选助手。请基于任务上下文和本地相关性评分，从候选设定文件中选出最相关的条目编号。
+
+任务类型：{self.task_name}
+目标节点：{self.target_node.get("title", "未知节点")}
+
+候选设定文件（编号列表，含本地相关性评分，仅供参考）：
+{chr(10).join(display_rows)}
+
+任务上下文（节选）：
+{context_preview if context_preview else "（无）"}
+
+输出要求（必须严格遵守）：
+1. 仅输出 JSON。
+2. JSON 格式必须是：{{"selected_ids":[1,2,3]}}
+3. selected_ids 只填上方候选编号，按相关性从高到低排序。
+4. 如果都不相关，返回空数组。
+5. 本地相关性评分仅供参考，请结合任务上下文独立判断。
+"""
+        selector_sys = (
+            "你是严谨的 JSON 输出助手。"
+            "你只能输出 JSON，不要输出任何解释文字。"
+        )
+
+        try:
+            self.progress_signal.emit(
+                f"已启用设定集智能勾选：正在为【{self.task_name}】请求LLM筛选设定文件..."
+            )
+            selected_raw = self.llm_client.generate_text(
+                selector_prompt.strip(),
+                override_system_instruction=selector_sys,
+                progress_callback=self.progress_signal.emit,
+            )
+            selected_ids = self._parse_smart_setting_selection_ids(selected_raw)
+            selected_paths = [
+                path_map[idx] for idx in selected_ids if idx in path_map
+            ]
+            if not selected_paths:
+                self.progress_signal.emit(
+                    "智能勾选结果为空：将回退为当前手动勾选设定。"
+                )
+                self.success_signal.emit(self.checked_paths)
+                return
+
+            cache.save_selection(
+                node_id, node_summary, candidate_paths,
+                selected_paths, relevance_scores,
+            )
+
+            selected_names = [os.path.basename(p) for p in selected_paths[:8]]
+            self.progress_signal.emit(
+                "智能勾选完成，已选设定："
+                + "、".join(selected_names)
+                + ("..." if len(selected_paths) > 8 else "")
+            )
+            self.success_signal.emit(selected_paths)
+        except Exception as e:
+            self.progress_signal.emit(
+                f"<font color='orange'>智能勾选失败，已回退手动勾选设定：{e}</font>"
+            )
+            self.success_signal.emit(self.checked_paths)
+
+
 # ================= 通用文本生成线程 =================
 class GenerateTaskThread(QThread):
     # 定义两个信号，用于向主线程传递成功的结果或失败的错误信息

@@ -27,7 +27,7 @@ from core.context_builder import ContextBuilder
 from core.setting_relevance import compute_local_relevance
 from core.setting_relevance_cache import SettingRelevanceCache
 from ui.utils import find_item_by_data, get_item_level, get_missing_level3_nodes
-from ui.workers import GenerateTaskThread
+from ui.workers import GenerateTaskThread, SettingSelectionThread
 
 if TYPE_CHECKING:
     from ui.main_window import NovelCreatorWindow
@@ -250,12 +250,37 @@ class GenerationMixin:
                 )
 
         if not relevance_scores:
+            total_candidates = len(candidate_paths)
             self.log_console.append(
-                "🔍 正在本地计算设定相关性..."
+                f"🔍 正在本地计算设定相关性（共 {total_candidates} 个候选设定）..."
             )
-            relevance_scores = compute_local_relevance(
-                node_summary, node_title, candidate_paths
-            )
+            statusbar = self.statusBar()
+            last_logged_pct = -1
+
+            def relevance_progress(current: int, total_count: int):
+                nonlocal last_logged_pct
+                QApplication.processEvents()
+                pct = (current * 100) // total_count if total_count else 100
+                if statusbar:
+                    statusbar.showMessage(
+                        f"正在计算设定相关性 {current}/{total_count} ({pct}%)..."
+                    )
+                if current == total_count:
+                    self.log_console.append(
+                        f"✅ 设定相关性计算完成，共处理 {total_count} 个候选"
+                    )
+                    return
+                if pct // 10 != last_logged_pct // 10:
+                    last_logged_pct = pct
+                    self.log_console.append(
+                        f"   相关性计算进度: {current}/{total_count} ({pct}%)"
+                    )
+
+            with self.loading_ui("正在计算设定相关性..."):
+                relevance_scores = compute_local_relevance(
+                    node_summary, node_title, candidate_paths,
+                    progress_callback=relevance_progress,
+                )
             if cache is not None:
                 cache.save(node_id, node_summary, candidate_paths, relevance_scores)
 
@@ -371,7 +396,6 @@ class GenerationMixin:
             )
             return
 
-        # 保存当前内容到回退缓冲区
         current_content = self.content_editor.toPlainText()
         self._save_to_undo_stack('content', current_content)
 
@@ -379,8 +403,7 @@ class GenerationMixin:
 
         node_title = current_node.get("title", "未知节点")
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
-        
-        # 在状态栏显示信息
+
         statusbar = self.statusBar()
         if statusbar:
             statusbar.showMessage("正在构建上下文并发送请求到LLM...")
@@ -398,13 +421,80 @@ class GenerationMixin:
             word_count=self.spin_word_count.value(),
             include_next=self.cb_include_next.isChecked(),
         )
-        checked_paths = self._resolve_checked_settings_for_task(
+
+        smart_enabled = getattr(self, "_smart_setting_selection_enabled", False)
+        if not smart_enabled:
+            checked_paths = self.get_checked_settings()
+            self._finalize_generation_with_settings(
+                current_node, builder, checked_paths
+            )
+            return
+
+        if not self.workspace:
+            self._finalize_generation_with_settings(
+                current_node, builder, []
+            )
+            return
+
+        checked_paths = self.get_checked_settings()
+        candidate_paths = checked_paths
+        if not candidate_paths:
+            all_candidates = self._collect_setting_candidates_for_smart_select()
+            candidate_paths = [item["path"] for item in all_candidates]
+        if not candidate_paths:
+            self._finalize_generation_with_settings(
+                current_node, builder, checked_paths
+            )
+            return
+
+        self._gen_pending_node = current_node
+        self._gen_pending_builder = builder
+        use_cache = getattr(self, "_batch_gen_use_cache", True)
+
+        self._setting_sel_thread = SettingSelectionThread(
+            self.llm_client,
+            self.workspace.workspace_path,
             "生成正文",
             current_node,
             preview_messages[-1]["content"],
-            use_cache=getattr(self, "_batch_gen_use_cache", True),
+            use_cache,
+            checked_paths,
+            candidate_paths,
         )
+        self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
+        self._setting_sel_thread.success_signal.connect(
+            self._on_gen_settings_resolved
+        )
+        self._setting_sel_thread.error_signal.connect(
+            self._on_setting_sel_error
+        )
+        self._setting_sel_thread.start()
 
+    def _on_setting_sel_error(self: "NovelCreatorWindow", error_msg_or_paths):
+        if isinstance(error_msg_or_paths, list):
+            self.log_console.append(
+                "<font color='red'>❌ 设定筛选后台线程异常，已回退手动勾选设定</font>"
+            )
+            if getattr(self, "_summary_pending_node", None) is not None:
+                self._on_summary_settings_resolved(error_msg_or_paths)
+            elif getattr(self, "_rewrite_pending_node", None) is not None:
+                self._on_rewrite_settings_resolved(error_msg_or_paths)
+            elif getattr(self, "_gen_pending_node", None) is not None:
+                self._on_gen_settings_resolved(error_msg_or_paths)
+            else:
+                self._restore_generate_ui_state()
+        else:
+            self.log_console.append(
+                f"<font color='red'>❌ 设定筛选后台线程异常：{error_msg_or_paths}</font>"
+            )
+            self._restore_generate_ui_state()
+
+    def _finalize_generation_with_settings(
+        self: "NovelCreatorWindow",
+        current_node: dict,
+        builder: object,
+        checked_paths: list,
+    ):
         messages = builder.build_generation_prompt(
             current_node,
             self.outline_tree_data,
@@ -438,6 +528,17 @@ class GenerationMixin:
         self.generate_thread.success_signal.connect(self.on_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
         self.generate_thread.start()
+
+    def _on_gen_settings_resolved(self: "NovelCreatorWindow", checked_paths: list):
+        current_node = getattr(self, "_gen_pending_node", self.current_editing_node)
+        builder = getattr(self, "_gen_pending_builder", None)
+        if not builder:
+            builder = self._create_context_builder()
+        self._gen_pending_node = None
+        self._gen_pending_builder = None
+        self._finalize_generation_with_settings(
+            current_node, builder, checked_paths
+        )
 
     def rewrite_current_node(self: "NovelCreatorWindow"):
         current_node = self._get_current_node_from_tree() or self.current_editing_node
@@ -487,12 +588,62 @@ class GenerationMixin:
             [],
             target_word_count,
         )
-        checked_paths = self._resolve_checked_settings_for_task(
+
+        smart_enabled = getattr(self, "_smart_setting_selection_enabled", False)
+        if not smart_enabled:
+            checked_paths = self.get_checked_settings()
+            self._finalize_rewrite_with_settings(
+                current_node, builder, checked_paths, target_word_count
+            )
+            return
+
+        if not self.workspace:
+            self._finalize_rewrite_with_settings(
+                current_node, builder, [], target_word_count
+            )
+            return
+
+        checked_paths = self.get_checked_settings()
+        candidate_paths = checked_paths
+        if not candidate_paths:
+            all_candidates = self._collect_setting_candidates_for_smart_select()
+            candidate_paths = [item["path"] for item in all_candidates]
+        if not candidate_paths:
+            self._finalize_rewrite_with_settings(
+                current_node, builder, checked_paths, target_word_count
+            )
+            return
+
+        self._rewrite_pending_node = current_node
+        self._rewrite_pending_builder = builder
+        self._rewrite_pending_word_count = target_word_count
+
+        self._setting_sel_thread = SettingSelectionThread(
+            self.llm_client,
+            self.workspace.workspace_path,
             "重写正文",
             current_node,
             preview_messages[-1]["content"],
+            getattr(self, "_batch_gen_use_cache", True),
+            checked_paths,
+            candidate_paths,
         )
+        self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
+        self._setting_sel_thread.success_signal.connect(
+            self._on_rewrite_settings_resolved
+        )
+        self._setting_sel_thread.error_signal.connect(
+            self._on_setting_sel_error
+        )
+        self._setting_sel_thread.start()
 
+    def _finalize_rewrite_with_settings(
+        self: "NovelCreatorWindow",
+        current_node: dict,
+        builder: object,
+        checked_paths: list,
+        target_word_count: int,
+    ):
         messages = builder.build_rewrite_prompt(
             current_node,
             self.outline_tree_data,
@@ -513,6 +664,23 @@ class GenerationMixin:
         self.generate_thread.success_signal.connect(self.on_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
         self.generate_thread.start()
+
+    def _on_rewrite_settings_resolved(
+        self: "NovelCreatorWindow", checked_paths: list
+    ):
+        current_node = getattr(
+            self, "_rewrite_pending_node", self.current_editing_node
+        )
+        builder = getattr(self, "_rewrite_pending_builder", None)
+        if not builder:
+            builder = self._create_context_builder()
+        target_word_count = getattr(self, "_rewrite_pending_word_count", 5000)
+        self._rewrite_pending_node = None
+        self._rewrite_pending_builder = None
+        self._rewrite_pending_word_count = None
+        self._finalize_rewrite_with_settings(
+            current_node, builder, checked_paths, target_word_count
+        )
 
     def on_generate_success(self: "NovelCreatorWindow", result: str):
         node_title = (
@@ -611,12 +779,67 @@ class GenerationMixin:
             llm_client=None,
             progress_callback=None,
         )
-        checked_paths = self._resolve_checked_settings_for_task(
+
+        smart_enabled = getattr(self, "_smart_setting_selection_enabled", False)
+        if not smart_enabled:
+            checked_paths = self.get_checked_settings()
+            self._finalize_summary_with_settings(
+                current_node, builder, checked_paths,
+                request_id, target_node_id,
+            )
+            return
+
+        if not self.workspace:
+            self._finalize_summary_with_settings(
+                current_node, builder, [],
+                request_id, target_node_id,
+            )
+            return
+
+        checked_paths = self.get_checked_settings()
+        candidate_paths = checked_paths
+        if not candidate_paths:
+            all_candidates = self._collect_setting_candidates_for_smart_select()
+            candidate_paths = [item["path"] for item in all_candidates]
+        if not candidate_paths:
+            self._finalize_summary_with_settings(
+                current_node, builder, checked_paths,
+                request_id, target_node_id,
+            )
+            return
+
+        self._summary_pending_node = current_node
+        self._summary_pending_builder = builder
+        self._summary_pending_request_id = request_id
+        self._summary_pending_target_node_id = target_node_id
+
+        self._setting_sel_thread = SettingSelectionThread(
+            self.llm_client,
+            self.workspace.workspace_path,
             "生成概要",
             current_node,
             preview_messages[-1]["content"],
+            getattr(self, "_batch_gen_use_cache", True),
+            checked_paths,
+            candidate_paths,
         )
+        self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
+        self._setting_sel_thread.success_signal.connect(
+            self._on_summary_settings_resolved
+        )
+        self._setting_sel_thread.error_signal.connect(
+            self._on_setting_sel_error
+        )
+        self._setting_sel_thread.start()
 
+    def _finalize_summary_with_settings(
+        self: "NovelCreatorWindow",
+        current_node: dict,
+        builder: object,
+        checked_paths: list,
+        request_id: str,
+        target_node_id,
+    ):
         messages = builder.build_summary_prompt(
             current_node,
             self.outline_tree_data,
@@ -649,6 +872,26 @@ class GenerationMixin:
         self.generate_thread.success_signal.connect(self.on_summary_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
         self.generate_thread.start()
+
+    def _on_summary_settings_resolved(
+        self: "NovelCreatorWindow", checked_paths: list
+    ):
+        current_node = getattr(
+            self, "_summary_pending_node", self.current_editing_node
+        )
+        builder = getattr(self, "_summary_pending_builder", None)
+        if not builder:
+            builder = self._create_context_builder()
+        request_id = getattr(self, "_summary_pending_request_id", uuid.uuid4().hex)
+        target_node_id = getattr(self, "_summary_pending_target_node_id", None)
+        self._summary_pending_node = None
+        self._summary_pending_builder = None
+        self._summary_pending_request_id = None
+        self._summary_pending_target_node_id = None
+        self._finalize_summary_with_settings(
+            current_node, builder, checked_paths,
+            request_id, target_node_id,
+        )
 
     def start_batch_regenerate_summaries_checked_nodes(
         self: "NovelCreatorWindow", checked_nodes
@@ -1060,11 +1303,14 @@ class GenerationMixin:
         batch_layout.addWidget(self._batch_gen_smart_cb)
 
         self._batch_gen_cache_cb = QCheckBox("使用缓存（跳过已计算的相关性）")
-        self._batch_gen_cache_cb.setChecked(True)
+        self._batch_gen_cache_cb.setChecked(smart_select_enabled)
+        self._batch_gen_cache_cb.setEnabled(smart_select_enabled)
         self._batch_gen_cache_cb.setToolTip(
             "勾选后，如果 .cache 目录中已有该节点的设定相关性缓存，"
             "则直接复用，不再重新计算和请求LLM。"
         )
+        self._batch_gen_smart_cb.toggled.connect(self._batch_gen_cache_cb.setEnabled)
+        self._batch_gen_smart_cb.toggled.connect(self._batch_gen_cache_cb.setChecked)
         batch_layout.addWidget(self._batch_gen_cache_cb)
 
         batch_btn_layout = QHBoxLayout()
