@@ -270,3 +270,42 @@ class WorkspaceManager:
     def get_all_pending_node_ids(self) -> list:
         """获取所有有待合并修改的节点ID列表"""
         return list(self._pending_modify_cache.keys())
+
+    @property
+    def mobile_issues_dir(self) -> str:
+        return os.path.join(self.sys_data_path, "mobile_issues")
+
+    def load_mobile_issues(self) -> list[dict]:
+        """加载所有手机端提交的 Issue，按时间倒序"""
+        issues = []
+        if not os.path.exists(self.mobile_issues_dir):
+            return issues
+        for fname in os.listdir(self.mobile_issues_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(self.mobile_issues_dir, fname), 'r', encoding='utf-8') as f:
+                        issues.append(json.load(f))
+                except Exception:
+                    pass
+        issues.sort(key=lambda x: x.get("submitted_at", ""), reverse=True)
+        return issues
+
+    def delete_mobile_issue(self, issue_id: str) -> bool:
+        """关闭（删除）一个手机端 Issue"""
+        file_path = os.path.join(self.mobile_issues_dir, f"{issue_id}.json")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return True
+        return False
+
+    def update_mobile_issue(self, issue_id: str, updates: dict) -> bool:
+        """更新手机端 Issue 内容（如编辑需求文本）"""
+        file_path = os.path.join(self.mobile_issues_dir, f"{issue_id}.json")
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                issue = json.load(f)
+            issue.update(updates)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(issue, f, ensure_ascii=False, indent=2)
+            return True
+        return False

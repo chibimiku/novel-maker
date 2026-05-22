@@ -4,6 +4,7 @@ import json
 import os
 import re
 import hashlib
+from typing import Callable
 
 
 _CJK_PATTERN = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]{2,}")
@@ -66,6 +67,7 @@ def compute_local_relevance(
     node_summary: str,
     node_title: str,
     setting_paths: list[str],
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[tuple[str, float]]:
     if not setting_paths:
         return []
@@ -74,8 +76,12 @@ def compute_local_relevance(
     node_tokens = _tokenize(node_text)
     node_cjk = _extract_cjk_phrases(node_text)
 
+    total = len(setting_paths)
     results: list[tuple[str, float]] = []
-    for path in setting_paths:
+    for idx, path in enumerate(setting_paths):
+        if progress_callback:
+            progress_callback(idx, total)
+
         setting_text = _read_setting_content(path)
         if not setting_text:
             results.append((path, 0.0))
@@ -125,6 +131,9 @@ def compute_local_relevance(
 
         score = min(1.0, score)
         results.append((path, round(score, 4)))
+
+    if progress_callback:
+        progress_callback(total, total)
 
     results.sort(key=lambda x: x[1], reverse=True)
     return results

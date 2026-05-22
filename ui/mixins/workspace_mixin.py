@@ -640,6 +640,11 @@ class WorkspaceMixin:
             self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
             self._apply_workspace_instruction_profile()
 
+            self._loaded_mobile_issues = self.workspace.load_mobile_issues()
+            if self._loaded_mobile_issues:
+                self.issue_panel_frame.setVisible(True)
+            self._refresh_issue_panel()
+
             self.refresh_ui_from_workspace()
         except Exception as e:
             QMessageBox.critical(

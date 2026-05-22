@@ -107,6 +107,7 @@ credentials.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+*.lnk
 
 # 如果你使用 poetry / pipenv / pdm 等
 poetry.lock      # ← 如果你希望提交 lock 文件就删除这行

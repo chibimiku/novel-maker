@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QCheckBox, QSpinBox, QAbstractItemView,
-                             QProxyStyle, QStyle, QSizePolicy)
+                             QProxyStyle, QStyle, QSizePolicy, QScrollArea, QFrame,
+                             QToolButton)
 from PyQt6.QtGui import (
     QKeySequence,
     QAction,
@@ -577,6 +578,60 @@ class NovelCreatorWindow(
         editor_splitter.splitterMoved.connect(self._schedule_window_ui_state_save)
         main_layout.addWidget(splitter, stretch=4)
 
+        # ================= 📱 待处理 Issue 面板 =================
+        self.issue_panel_frame = QFrame()
+        self.issue_panel_frame.setFrameStyle(QFrame.Shape.StyledPanel)
+        self.issue_panel_frame.setVisible(False)
+
+        issue_panel_layout = QVBoxLayout(self.issue_panel_frame)
+        issue_panel_layout.setContentsMargins(0, 0, 0, 0)
+        issue_panel_layout.setSpacing(0)
+
+        self.issue_header_widget = QWidget()
+        self.issue_header_widget.setFixedHeight(32)
+        header_layout = QHBoxLayout(self.issue_header_widget)
+        header_layout.setContentsMargins(8, 2, 8, 2)
+
+        self.issue_toggle_btn = QToolButton()
+        self.issue_toggle_btn.setArrowType(Qt.ArrowType.DownArrow)
+        self.issue_toggle_btn.setToolTip("展开/折叠 Issue 面板")
+        self.issue_toggle_btn.setAutoRaise(True)
+        self.issue_toggle_btn.clicked.connect(self._toggle_issue_panel)
+        header_layout.addWidget(self.issue_toggle_btn)
+
+        self.issue_count_label = QLabel("📱 待处理 Issue (0)")
+        header_layout.addWidget(self.issue_count_label)
+
+        header_layout.addStretch()
+
+        self.issue_refresh_btn = QPushButton("刷新")
+        self.issue_refresh_btn.setFixedHeight(24)
+        self.issue_refresh_btn.clicked.connect(self._refresh_issue_panel)
+        header_layout.addWidget(self.issue_refresh_btn)
+
+        self.issue_submit_all_btn = QPushButton("全部提交")
+        self.issue_submit_all_btn.setFixedHeight(24)
+        self.issue_submit_all_btn.clicked.connect(self._on_issue_submit_all)
+        header_layout.addWidget(self.issue_submit_all_btn)
+
+        issue_panel_layout.addWidget(self.issue_header_widget)
+
+        self.issue_scroll_area = QScrollArea()
+        self.issue_scroll_area.setWidgetResizable(True)
+        self.issue_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.issue_scroll_area.setVisible(False)
+
+        self.issue_list_widget = QWidget()
+        self.issue_list_layout = QVBoxLayout(self.issue_list_widget)
+        self.issue_list_layout.setContentsMargins(8, 4, 8, 4)
+        self.issue_list_layout.setSpacing(4)
+        self.issue_list_layout.addStretch()
+        self.issue_scroll_area.setWidget(self.issue_list_widget)
+
+        issue_panel_layout.addWidget(self.issue_scroll_area)
+
+        main_layout.addWidget(self.issue_panel_frame, stretch=0)
+
         self.log_console = SafeLogBrowser()
         self.log_console.setFixedHeight(150)
         self.log_console.append("系统初始化完成。")
@@ -838,6 +893,20 @@ class NovelCreatorWindow(
     def _schedule_window_ui_state_save(self, *args):
         if hasattr(self, "_ui_state_save_timer"):
             self._ui_state_save_timer.start(350)
+
+    def _toggle_issue_panel(self):
+        """展开/折叠 Issue 面板"""
+        visible = self.issue_scroll_area.isVisible()
+        if visible:
+            self.issue_scroll_area.setVisible(False)
+            self.issue_panel_frame.setFixedHeight(40)
+            self.issue_toggle_btn.setArrowType(Qt.ArrowType.RightArrow)
+        else:
+            self.issue_scroll_area.setVisible(True)
+            count = len(self._loaded_mobile_issues) if hasattr(self, '_loaded_mobile_issues') else 0
+            rows = min(count, 6)
+            self.issue_panel_frame.setFixedHeight(40 + rows * 110 + 12)
+            self.issue_toggle_btn.setArrowType(Qt.ArrowType.DownArrow)
 
 
 if __name__ == '__main__':
