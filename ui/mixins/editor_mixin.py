@@ -11,10 +11,18 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import (
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from ui.theme import NODE_NORMAL
-from ui.workers import HtmlExportThread
+from ui.workers import HtmlExportThread, EpubExportThread
 
 if TYPE_CHECKING:
     from ui.main_window import NovelCreatorWindow
@@ -450,3 +458,163 @@ class EditorMixin:
             notify_success=True,
             auto_mode=False,
         )
+
+    def export_to_epub(self: "NovelCreatorWindow"):
+        if not self.workspace or not self.outline_tree_data:
+            QMessageBox.warning(
+                self, "操作失败", "请先加载或新建一个工作区！"
+            )
+            return
+
+        self.save_all()
+        password = self._show_epub_password_dialog()
+        self._start_epub_export_async(password)
+
+    def _show_epub_password_dialog(self: "NovelCreatorWindow") -> str:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("EPUB 加密设置")
+        dlg.setMinimumWidth(380)
+
+        layout = QVBoxLayout(dlg)
+
+        info_label = QLabel(
+            "EPUB 将用 AES-256 加密打包为 ZIP 文件。\n"
+            "留空则仅导出不加密的 EPUB。\n\n"
+            "手机解压工具（如 ZArchiver）支持 AES 加密 ZIP。"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        pw_label = QLabel("设置密码：")
+        layout.addWidget(pw_label)
+
+        pw_input = QLineEdit()
+        pw_input.setEchoMode(QLineEdit.EchoMode.Password)
+        pw_input.setPlaceholderText("留空则不加密")
+        layout.addWidget(pw_input)
+
+        confirm_label = QLabel("确认密码：")
+        layout.addWidget(confirm_label)
+
+        confirm_input = QLineEdit()
+        confirm_input.setEchoMode(QLineEdit.EchoMode.Password)
+        confirm_input.setPlaceholderText("再次输入密码")
+        layout.addWidget(confirm_input)
+
+        error_label = QLabel("")
+        error_label.setStyleSheet("color: #e74c3c; font-size: 0.9em;")
+        error_label.setWordWrap(True)
+        layout.addWidget(error_label)
+
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton("不加密")
+        ok_btn = QPushButton("加密导出")
+        ok_btn.setDefault(True)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        result = {"password": ""}
+
+        def on_ok():
+            p1 = pw_input.text()
+            p2 = confirm_input.text()
+            if not p1 and not p2:
+                result["password"] = ""
+                dlg.accept()
+                return
+            if p1 != p2:
+                error_label.setText("两次输入的密码不一致，请重试。")
+                return
+            if len(p1) < 4:
+                error_label.setText("密码至少需要 4 位，请重试。")
+                return
+            result["password"] = p1
+            dlg.accept()
+
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dlg.reject)
+        pw_input.returnPressed.connect(on_ok)
+        confirm_input.returnPressed.connect(on_ok)
+
+        dlg.exec()
+        return result["password"]
+
+    def _start_epub_export_async(self: "NovelCreatorWindow", password: str):
+        current_thread = getattr(self, "_epub_export_thread", None)
+        if current_thread and current_thread.isRunning():
+            self.log_console.append(
+                "<font color='gray'>EPUB 正在后台导出中，请稍候...</font>"
+            )
+            return
+
+        thread = EpubExportThread(self.workspace, password=password, parent=self)
+        self._epub_export_thread = thread
+        thread.success_signal.connect(self._on_epub_export_success)
+        thread.error_signal.connect(self._on_epub_export_error)
+
+        encrypt_tip = "（加密）" if password else ""
+        statusbar = self.statusBar()
+        if statusbar is not None:
+            statusbar.showMessage(f"正在后台导出 EPUB{encrypt_tip}...", 0)
+        self.log_console.append(
+            f"<font color='gray'>📖 已开始后台导出 EPUB{encrypt_tip}...</font>"
+        )
+
+        thread.start()
+
+    def _on_epub_export_success(self: "NovelCreatorWindow", output_file: str):
+        is_encrypted = output_file.endswith("_加密.zip")
+        if is_encrypted:
+            self.log_console.append(
+                "<b><font color='green'>"
+                f"\U0001f389 加密 EPUB 导出成功！文件已保存至: {output_file}"
+                "</font></b>"
+            )
+        else:
+            self.log_console.append(
+                "<b><font color='green'>"
+                f"\U0001f389 EPUB 导出成功！文件已保存至: {output_file}"
+                "</font></b>"
+            )
+
+        statusbar = self.statusBar()
+        if statusbar is not None:
+            statusbar.showMessage("EPUB 导出完成", 2000)
+
+        msg = f"文件位置: {output_file}"
+        if is_encrypted:
+            msg = (
+                f"已导出加密 ZIP 文件，解压密码为您刚刚设定的密码。\n\n"
+                f"文件位置: {output_file}"
+            )
+        else:
+            msg = f"已成功导出 EPUB 电子书。\n\n文件位置: {output_file}"
+
+        reply = QMessageBox.question(
+            self,
+            "导出成功",
+            f"{msg}\n\n是否打开文件所在文件夹？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            os.startfile(os.path.dirname(output_file))
+
+        self._epub_export_thread = None
+
+    def _on_epub_export_error(self: "NovelCreatorWindow", error_msg: str):
+        QMessageBox.critical(
+            self,
+            "导出错误",
+            f"导出 EPUB 失败:\n{error_msg}",
+        )
+        self.log_console.append(
+            f"<font color='red'>EPUB 导出异常: {error_msg}</font>"
+        )
+
+        statusbar = self.statusBar()
+        if statusbar is not None:
+            statusbar.showMessage("EPUB 导出失败", 3000)
+
+        self._epub_export_thread = None

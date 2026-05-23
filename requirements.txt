@@ -5,4 +5,5 @@ openai>=2.28.0,<3.0
 protobuf>=7.34.0,<8.0
 PyQt6>=6.10.0,<7.0
 pyqt6_sip>=13.10.2,<14.0
+pyzipper>=0.3,<1.0
 Requests>=2.32.0,<3.0

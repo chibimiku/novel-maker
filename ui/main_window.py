@@ -347,6 +347,10 @@ class NovelCreatorWindow(
         file_menu.addAction(export_html_action)
         export_html_action.setShortcut(QKeySequence("Ctrl+E"))
         export_html_action.triggered.connect(self.export_to_html)
+
+        export_epub_action = QAction('📖 导出为 EPUB 电子书', self)
+        file_menu.addAction(export_epub_action)
+        export_epub_action.triggered.connect(self.export_to_epub)
         
         setting_menu = QMenu('设置', self)
         menubar.addMenu(setting_menu)

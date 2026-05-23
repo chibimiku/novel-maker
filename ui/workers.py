@@ -11,6 +11,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.workspace_manager import WorkspaceManager
 from core.html_exporter import HtmlExporter
+from core.epub_exporter import EpubExporter
 from ui.utils import clean_json_string
 
 
@@ -1152,6 +1153,27 @@ class HtmlExportThread(QThread):
         try:
             exporter = HtmlExporter(self.workspace)
             output_file = exporter.export()
+            self.success_signal.emit(output_file)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+# ================= EPUB 导出线程 =================
+class EpubExportThread(QThread):
+    success_signal = pyqtSignal(str)  # output_file (加密 zip 路径或 epub 路径)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, workspace, password="", parent=None):
+        super().__init__(parent)
+        self.workspace = workspace
+        self.password = password
+
+    def run(self):
+        try:
+            exporter = EpubExporter(self.workspace)
+            output_file = exporter.export()
+            if self.password:
+                output_file = exporter.encrypt_to_zip(output_file, self.password)
             self.success_signal.emit(output_file)
         except Exception as e:
             self.error_signal.emit(str(e))
