@@ -56,4 +56,52 @@
 ├── 正文/                # 存放由 AI 生成或手动编写的 Markdown 场景正文  
 │   └── images/          # 小说插图目录  
 ├── 系统数据/  
-│   └── outline_tree.json # 核心大纲树配置文件  
+│   ├── outline_tree.json    # 核心大纲树配置文件  
+│   ├── pending_modifies/    # LLM 生成的待合并修改结果  
+│   └── mobile_issues/       # 手机端提交的修改建议（Issue）  
+├── www/                     # 导出的可阅读网页（静态，IIS 映射）  
+│   ├── index.html           # 小说网页版  
+│   └── images/              # 插图同步目录  
+├── www-php/                 # PHP 后端接口（IIS FastCGI 映射）  
+│   └── api/  
+│       └── issues.php       # 接收手机端提交的 Issue 建议  
+└── ...
+
+---
+
+## 📱 手机端提交修改建议（Mobile Issue）
+
+### 使用方式
+
+1. **导出网页**：在编辑器中点击 `文件 → 🌐 导出为可阅读网页`，这会在工作区 `www/` 目录生成网页版小说
+2. **IIS 部署**：将工作区目录映射为 IIS 网站（物理路径 = workspace 根目录），配置 PHP FastCGI 处理 `www-php/` 下的 `.php` 文件
+3. **手机浏览**：手机连接同一局域网，浏览器访问 `http://电脑IP:端口/www/index.html`
+4. **提交 Issue**：阅读时点击右下角 💡 浮动按钮，填写修改需求并提交
+5. **编辑器处理**：打开工作区后，在底部 "📱 待处理 Issue" 面板中逐条管理
+
+### 数据格式
+
+**`系统数据/mobile_issues/{issue_id}.json`**
+
+```json
+{
+  "issue_id": "a1b2c3d4e5f6...",
+  "node_id": "场景节点的UUID（对应 outline_tree.json 中的节点 id）",
+  "requirement": "用户填写的修改需求文本",
+  "quoted_text": "用户在手机端选中的原文引用片段（可为空）",
+  "submitted_at": "2026-05-17T14:30:00+08:00",
+  "status": "pending"
+}
+```
+
+### 编辑器处理流程
+
+```
+待处理 Issue 列表 (按时间倒序)
+  │
+  ├─ [✏️ 编辑] → 修改需求文本后保存
+  ├─ [🚀 提交修改] → 将需求文本送入 LLM 修改流程
+  │       └─ LLM 生成修改版 → 保存到 pending_modifies/ → 节点进入"待合并"状态
+  │       └─ 自动删除该 Issue
+  └─ [✔ 关闭] → 直接删除 Issue（放弃处理）
+```  

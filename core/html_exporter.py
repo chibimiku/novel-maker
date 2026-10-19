@@ -19,7 +19,32 @@ class HtmlExporter:
         self.www_path = os.path.join(self.workspace.workspace_path, "www")
         self.chapter_pages_dir = os.path.join(self.www_path, "chapters")
 
-    def export(self) -> str:
+    def _read_markdown_file(self, file_path: str) -> str:
+        encodings = ("utf-8", "utf-8-sig", "utf-16", "gb18030")
+        last_error = None
+
+        for encoding in encodings:
+            try:
+                with open(file_path, "r", encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError as exc:
+                last_error = exc
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError:
+            raise
+
+        if last_error is not None:
+            logger.warning(
+                "读取正文文件时存在无法解码的字节，已自动跳过异常字符: %s (%s)",
+                file_path,
+                last_error,
+            )
+        return content
+
+    def export(self, progress_callback=None) -> str:
         if markdown is None:
             raise ImportError("缺少 markdown 库。请在终端执行: pip install markdown")
 
@@ -45,7 +70,11 @@ class HtmlExporter:
             }
             chapter_entries.append(chapter_entry)
 
+        total_chapters = len(chapters)
         for chapter_index, chapter in enumerate(chapters, start=1):
+            chapter_title = chapter.get("title", f"第{chapter_index}章")
+            if progress_callback:
+                progress_callback(f"正在导出章节 ({chapter_index}/{total_chapters}): {chapter_title}")
             chapter_entry = chapter_entries[chapter_index - 1]
             chapter_html = self._render_chapter_page(
                 novel_title=novel_title,
@@ -62,6 +91,9 @@ class HtmlExporter:
         output_file = os.path.join(self.www_path, "index.html")
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(self._render_index_page(novel_title, chapter_entries))
+
+        if progress_callback:
+            progress_callback(f"网页导出完成，共 {total_chapters} 个章节")
 
         return output_file
 
@@ -151,10 +183,36 @@ class HtmlExporter:
             for section in current_sections:
                 section_title = html.escape(section.get("title", "未命名小节"))
                 section_id = f"sec_{section_counter}"
-                parts.append(
-                    f'<a class="nav-section" data-target="{section_id}" '
-                    f'onclick="showSection(\'{section_id}\'); return false;" href="#{section_id}">{section_title}</a>'
-                )
+                scenes = section.get("children", [])
+                valid_scenes = [s for s in scenes if s.get("file_path")]
+                scene_count = len(valid_scenes)
+
+                if scene_count <= 1:
+                    parts.append(
+                        f'<a class="nav-section" data-target="{section_id}" '
+                        f'onclick="showSection(\'{section_id}\'); return false;" href="#{section_id}">{section_title}</a>'
+                    )
+                else:
+                    parts.append(
+                        f'<div class="nav-section-group">'
+                        f'<a class="nav-section nav-section-parent" data-target="{section_id}" '
+                        f'onclick="showSection(\'{section_id}\'); return false;" href="#{section_id}">{section_title}</a>'
+                    )
+                    visible_scene_index = 0
+                    for scene in scenes:
+                        if not scene.get("file_path"):
+                            continue
+                        visible_scene_index += 1
+                        scene_title = html.escape(scene.get("title", f"场景{visible_scene_index}"))
+                        scene_anchor = f"scene_{section_id}_{visible_scene_index}"
+                        parts.append(
+                            f'<a class="nav-scene" data-target="{section_id}" '
+                            f'data-scene-anchor="{scene_anchor}" '
+                            f'onclick="scrollToScene(\'{section_id}\', \'{scene_anchor}\'); return false;" '
+                            f'href="#{scene_anchor}">{visible_scene_index}. {scene_title}</a>'
+                        )
+                    parts.append('</div>')
+
                 section_counter += 1
 
         return "\n".join(parts)
@@ -173,15 +231,26 @@ class HtmlExporter:
         for section_counter, section in enumerate(sections):
             section_title = section.get("title", "未命名小节")
             section_id = f"sec_{section_counter}"
+            scenes = section.get("children", [])
+            valid_scenes = [s for s in scenes if s.get("file_path")]
+            scene_total = len(valid_scenes)
+
             section_html = [
                 f'<article id="{section_id}" class="section-content">',
                 f'<h1 class="section-title">{html.escape(section_title)}</h1>',
             ]
 
             has_scene_content = False
-            for scene in section.get("children", []):
-                scene_html = self._build_scene_html(chapter_title, section_title, scene)
+            visible_scene_counter = 0
+            for scene in scenes:
+                scene_html = self._build_scene_html(
+                    chapter_title, section_title, scene,
+                    scene_index=visible_scene_counter + 1,
+                    scene_total=scene_total,
+                    section_id=section_id,
+                )
                 if scene_html:
+                    visible_scene_counter += 1
                     has_scene_content = True
                     section_html.append(scene_html)
 
@@ -193,25 +262,40 @@ class HtmlExporter:
 
         return "\n".join(content_parts)
 
-    def _build_scene_html(self, chapter_title: str, section_title: str, scene: dict) -> str:
+    def _build_scene_html(self, chapter_title: str, section_title: str, scene: dict,
+                          scene_index: int = 0, scene_total: int = 0, section_id: str = "") -> str:
         rel_path = scene.get("file_path")
         md_text = ""
         if rel_path:
             full_path = os.path.join(self.workspace.text_path, rel_path)
             if os.path.exists(full_path):
-                with open(full_path, "r", encoding="utf-8") as f:
-                    md_text = f.read()
+                md_text = self._read_markdown_file(full_path)
 
         if not md_text:
             return ""
 
         scene_id = html.escape(scene.get("id", ""))
         scene_title = scene.get("title", "")
+        esc_scene_title = html.escape(scene_title)
         node_path = html.escape(f"{chapter_title} > {section_title} > {scene_title}")
+        scene_anchor = f"scene_{section_id}_{scene_index}" if section_id else f"scene_{scene_index}"
         html_text = markdown.markdown(md_text, extensions=["extra"])
+
+        scene_header_html = ""
+        if scene_total > 1:
+            scene_header_html = (
+                f'<div class="scene-separator">'
+                f'<span class="scene-separator-index">场景 {scene_index}/{scene_total}</span>'
+                f'<span class="scene-separator-title">{esc_scene_title}</span>'
+                f'</div>'
+            )
+
         return (
-            f'<div class="scene-body" data-node-id="{scene_id}" data-node-path="{node_path}">'
-            f"{html_text}</div>"
+            f'<div id="{scene_anchor}" class="scene-body" '
+            f'data-node-id="{scene_id}" data-node-path="{node_path}" '
+            f'data-scene-index="{scene_index}" data-scene-total="{scene_total}" '
+            f'data-section-id="{section_id}" data-scene-title="{esc_scene_title}">'
+            f'{scene_header_html}{html_text}</div>'
         )
 
     def _render_index_page(self, novel_title: str, chapter_entries: list) -> str:
@@ -332,6 +416,20 @@ class HtmlExporter:
         .scene-body { font-size: 1.15em; line-height: 1.8; margin-bottom: 40px; text-align: justify; }
         .scene-body p { margin-bottom: 1.2em; }
         .scene-body img { max-width: 100%; height: auto; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin: 10px 0; }
+        /* Scene separator between merged scenes */
+        .scene-separator { display: flex; align-items: center; gap: 12px; margin: 24px 0 12px; padding: 10px 0; border-top: 1px dashed #dfe6e9; }
+        .scene-separator-index { background: var(--accent); color: #fff; font-size: 0.78em; font-weight: bold; padding: 3px 10px; border-radius: 12px; white-space: nowrap; }
+        .scene-separator-title { font-size: 0.88em; color: #7f8c8d; font-weight: 500; }
+        /* Scene indicator bar - sticky at top */
+        #scene-indicator { position: sticky; top: 0; z-index: 800; background: linear-gradient(180deg, #ffffff 0%, #f8f9fa 100%); border-bottom: 1px solid var(--border); padding: 10px 24px; text-align: center; font-size: 0.95em; color: #555; backdrop-filter: blur(8px); transition: all 0.3s ease; display: none; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+        #scene-indicator.visible { display: block; }
+        .scene-indicator-index { font-weight: bold; color: var(--accent); }
+        .scene-indicator-title { margin-left: 6px; color: #7f8c8d; }
+        /* Scene-level nav items in sidebar */
+        .nav-section-group { margin-bottom: 2px; }
+        .nav-scene { display: block; padding: 7px 15px 7px 50px; color: #7f8c8d; text-decoration: none; cursor: pointer; border-left: 3px solid transparent; font-size: 0.88em; transition: background 0.2s; }
+        .nav-scene:hover { background: #eef2f5; color: var(--text); }
+        .nav-scene.active { background: #eef2f5; border-left-color: var(--accent); color: var(--accent); font-weight: bold; }
         .empty-content { max-width: 820px; margin: 0 auto; padding: 36px 28px; border: 1px dashed var(--border); border-radius: 12px; color: #7f8c8d; background: #fff; text-align: center; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 999; backdrop-filter: blur(2px); }
@@ -390,6 +488,10 @@ class HtmlExporter:
             <a class="back-link" href="{index_href}" style="margin:0;">目录</a>
         </div>
         <div id="content-area">
+            <div id="scene-indicator">
+                <span class="scene-indicator-index" id="scene-indicator-index"></span>
+                <span class="scene-indicator-title" id="scene-indicator-title"></span>
+            </div>
             {content_html}
         </div>
     </div>
@@ -412,16 +514,22 @@ class HtmlExporter:
         </div>
     </div>
     <script>
+        var sceneObserver = null;
+        var currentActiveScene = null;
+
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('overlay').classList.toggle('show');
         }
 
-        function showSection(id) {
+        function showSection(id, sceneAnchor) {
             document.querySelectorAll('.section-content').forEach(function(el) {
                 el.classList.remove('active');
             });
             document.querySelectorAll('.nav-section').forEach(function(el) {
+                el.classList.remove('active');
+            });
+            document.querySelectorAll('.nav-scene').forEach(function(el) {
                 el.classList.remove('active');
             });
 
@@ -440,12 +548,102 @@ class HtmlExporter:
                 document.getElementById('overlay').classList.remove('show');
             }
 
-            document.getElementById('content-area').scrollTo(0, 0);
+            // Setup scene observer for the active section
+            setupSceneObserver(target);
+
+            // Scroll to specific scene if requested
+            if (sceneAnchor) {
+                var sceneEl = document.getElementById(sceneAnchor);
+                if (sceneEl) {
+                    sceneEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    updateSceneIndicator(sceneEl);
+                    highlightNavScene(sceneEl);
+                }
+            } else {
+                document.getElementById('content-area').scrollTo(0, 0);
+            }
+
             if (window.location.hash !== '#' + id) {
                 history.replaceState(null, '', '#' + id);
             }
             updateIssueContext();
         }
+
+        function scrollToScene(sectionId, sceneAnchor) {
+            showSection(sectionId, sceneAnchor);
+        }
+
+        function setupSceneObserver(sectionEl) {
+            // Destroy previous observer
+            if (sceneObserver) {
+                sceneObserver.disconnect();
+                sceneObserver = null;
+            }
+            currentActiveScene = null;
+            var indicator = document.getElementById('scene-indicator');
+            var sceneBodies = sectionEl ? sectionEl.querySelectorAll('.scene-body') : [];
+            var totalScenes = sceneBodies.length;
+
+            if (totalScenes <= 1) {
+                indicator.classList.remove('visible');
+                return;
+            }
+
+            // Show initial indicator
+            var firstScene = sceneBodies[0];
+            if (firstScene) {
+                updateSceneIndicator(firstScene);
+                highlightNavScene(firstScene);
+                indicator.classList.add('visible');
+            }
+
+            if (!('IntersectionObserver' in window)) {
+                return;
+            }
+
+            sceneObserver = new IntersectionObserver(function(entries) {
+                entries.forEach(function(entry) {
+                    if (entry.isIntersecting) {
+                        updateSceneIndicator(entry.target);
+                        highlightNavScene(entry.target);
+                    }
+                });
+            }, {
+                root: document.getElementById('content-area'),
+                rootMargin: '-60px 0px -60% 0px',
+                threshold: 0
+            });
+
+            sceneBodies.forEach(function(el) {
+                sceneObserver.observe(el);
+            });
+        }
+
+        function updateSceneIndicator(sceneEl) {
+            if (currentActiveScene === sceneEl) return;
+            currentActiveScene = sceneEl;
+            var idx = sceneEl.dataset.sceneIndex || '';
+            var total = sceneEl.dataset.sceneTotal || '';
+            var title = sceneEl.dataset.sceneTitle || '';
+            var indicator = document.getElementById('scene-indicator');
+            document.getElementById('scene-indicator-index').textContent =
+                '场景 ' + idx + '/' + total;
+            document.getElementById('scene-indicator-title').textContent =
+                title ? '· ' + title : '';
+            indicator.classList.add('visible');
+        }
+
+        function highlightNavScene(sceneEl) {
+            var sceneId = sceneEl.id;
+            document.querySelectorAll('.nav-scene').forEach(function(el) {
+                el.classList.remove('active');
+            });
+            var navScene = document.querySelector('.nav-scene[data-scene-anchor="' + sceneId + '"]');
+            if (navScene) {
+                navScene.classList.add('active');
+            }
+        }
+
 
         var currentIssueNodeId = null;
         var currentIssueNodePath = '';
@@ -503,7 +701,7 @@ class HtmlExporter:
                 currentIssueNodeId = null;
                 return;
             }
-            var sceneBody = activeSection.querySelector('.scene-body');
+            var sceneBody = currentActiveScene || activeSection.querySelector('.scene-body');
             if (sceneBody) {
                 currentIssueNodeId = sceneBody.dataset.nodeId || null;
                 currentIssueNodePath = sceneBody.dataset.nodePath || '';
@@ -569,6 +767,17 @@ class HtmlExporter:
 
         window.onload = function() {
             var hash = window.location.hash ? window.location.hash.slice(1) : '';
+
+            // Check if hash is a scene anchor (e.g., "scene_sec_0_2")
+            var sceneEl = hash ? document.getElementById(hash) : null;
+            if (sceneEl && sceneEl.classList.contains('scene-body')) {
+                var sectionId = sceneEl.dataset.sectionId;
+                if (sectionId) {
+                    showSection(sectionId, hash);
+                    return;
+                }
+            }
+
             var hashedNav = hash ? document.querySelector('.nav-section[data-target="' + hash + '"]') : null;
             if (hashedNav) {
                 showSection(hash);
@@ -584,6 +793,7 @@ class HtmlExporter:
             var firstContent = document.querySelector('.section-content');
             if (firstContent) {
                 firstContent.classList.add('active');
+                setupSceneObserver(firstContent);
             }
             updateIssueContext();
         };

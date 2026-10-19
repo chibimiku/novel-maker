@@ -31,6 +31,82 @@ if TYPE_CHECKING:
 class EditorMixin:
     """编辑器区域的保存、删除、导出以及字数统计。"""
 
+    def _check_file_conflict(self: "NovelCreatorWindow", file_path: str, file_label: str) -> bool:
+        """
+        检查文件是否被外部修改，如果冲突则弹出对话框询问用户。
+        返回 True 表示可以继续保存，False 表示取消保存。
+        用户选择"保留双方"时会将冲突文件另存到 conflicts/ 目录。
+        """
+        if not self.file_tracker.has_changed(file_path):
+            return True
+
+        msg = QMessageBox(self)  # type: ignore[arg-type]
+        msg.setWindowTitle("文件冲突警告")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText(
+            f"文件【{file_label}】在读取后被外部程序修改了！\n\n"
+            f"路径：{file_path}\n\n"
+            "请选择处理方式："
+        )
+        btn_overwrite = msg.addButton("覆盖保存", QMessageBox.ButtonRole.AcceptRole)
+        btn_keep_both = msg.addButton("保留双方", QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = msg.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(btn_cancel)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+
+        if clicked is btn_cancel:
+            self.log_console.append(
+                f"<font color='orange'>{chr(0x26a0)}\ufe0f 用户取消保存（检测到外部变更）: {file_label}</font>"
+            )
+            return False
+        elif clicked is btn_keep_both:
+            # 保留双方：另存冲突文件
+            try:
+                conflict_path = self.file_tracker.save_conflict_copy(file_path)
+                self.log_console.append(
+                    f"<font color='orange'>{chr(0x26a0)}\ufe0f 冲突文件已另存至: {conflict_path}</font>"
+                )
+                QMessageBox.information(
+                    self,  # type: ignore[arg-type]
+                    "冲突文件已保留",
+                    f"磁盘上的版本已另存到工程目录的 conflicts/ 文件夹：\n{conflict_path}\n\n"
+                    "您的编辑内容将覆盖原文件。",
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,  # type: ignore[arg-type]
+                    "错误",
+                    f"另存冲突文件失败:\n{e}",
+                )
+                return False
+        else:
+            # 覆盖保存：刷新追踪状态，避免 save_outline_tree 中重复备份
+            self.file_tracker.refresh_md5(file_path)
+        return True
+
+    def _confirm_save_outline_tree(self: "NovelCreatorWindow") -> bool:
+        """保存大纲树前检测 outline_tree.json 的外部变更。"""
+        if not self.workspace:
+            return True
+        tree_path = self.workspace.tree_json_file
+        return self._check_file_conflict(tree_path, "大纲树 (outline_tree.json)")
+
+    def _on_text_file_saved(self: "NovelCreatorWindow", full_path: str):
+        """正文文件保存成功后刷新追踪状态。"""
+        self.file_tracker.refresh_md5(full_path)
+
+    def _on_setting_file_saved(self: "NovelCreatorWindow", file_path: str):
+        """设定文件保存成功后刷新追踪状态。"""
+        self.file_tracker.refresh_md5(file_path)
+
+    def _on_outline_tree_saved(self: "NovelCreatorWindow"):
+        """大纲树保存成功后刷新追踪状态。"""
+        if not self.workspace:
+            return
+        self.file_tracker.refresh_md5(self.workspace.tree_json_file)
+
     def on_auto_export_www_toggled(self: "NovelCreatorWindow", checked: bool):
         self._auto_export_www_enabled = bool(checked)
         self._save_auto_export_www_enabled(self._auto_export_www_enabled)
@@ -121,6 +197,7 @@ class EditorMixin:
         }
         thread.success_signal.connect(self._on_html_export_success)
         thread.error_signal.connect(self._on_html_export_error)
+        thread.progress_signal.connect(lambda msg: self.log_console.append(f"<font color='gray'>{msg}</font>"))
 
         statusbar = self.statusBar()
         if statusbar is not None:
@@ -277,10 +354,18 @@ class EditorMixin:
                         rel_path = f"场景_{uuid.uuid4().hex[:8]}.md"
                         self.current_editing_node["file_path"] = rel_path
 
+                    full_path = os.path.join(self.workspace.text_path, rel_path)
+                    # 保存前检测正文文件外部变更
+                    if os.path.exists(full_path):
+                        if not self._check_file_conflict(full_path, f"正文 ({rel_path})"):
+                            return
+
                     try:
                         new_md5 = self.workspace.save_markdown_file(rel_path, content)
                         self.current_editing_node["md5"] = new_md5
                         self.current_editing_node["_status"] = "ok"
+                        # 刷新正文文件追踪状态
+                        self._on_text_file_saved(full_path)
                         # 安全地检查current_editing_item是否仍然有效并且是正确的类型
                         if self.current_editing_item:
                             try:
@@ -301,7 +386,11 @@ class EditorMixin:
                         return
 
                 try:
-                    self.workspace.save_outline_tree(self.outline_tree_data)
+                    # 保存前检测大纲树文件外部变更
+                    if not self._confirm_save_outline_tree():
+                        return
+                    self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
+                    self._on_outline_tree_saved()
                     self.log_console.append(
                         f"\U0001f4be 节点保存成功: "
                         f"{self.current_editing_node.get('title')}"
@@ -318,10 +407,18 @@ class EditorMixin:
             return
 
         if self.current_setting_path and os.path.exists(self.current_setting_path):
+            # 保存前检测设定文件外部变更
+            if not self._check_file_conflict(
+                self.current_setting_path,
+                f"设定 ({os.path.basename(self.current_setting_path)})"
+            ):
+                return
+
             try:
                 parsed_json = json.loads(self.summary_editor.toPlainText())
                 with open(self.current_setting_path, "w", encoding="utf-8") as f:
                     json.dump(parsed_json, f, ensure_ascii=False, indent=4)
+                self._on_setting_file_saved(self.current_setting_path)
                 self.log_console.append(
                     f"\U0001f4be 设定保存成功: "
                     f"{os.path.basename(self.current_setting_path)}"
@@ -386,12 +483,16 @@ class EditorMixin:
                             )
 
                 try:
+                    # 保存前检测大纲树文件外部变更
+                    if not self._confirm_save_outline_tree():
+                        return
                     with open(
                         self.workspace.tree_json_file, "w", encoding="utf-8"
                     ) as f:
                         json.dump(
                             self.outline_tree_data, f, ensure_ascii=False, indent=4
                         )
+                    self._on_outline_tree_saved()
 
                     self.log_console.append(
                         f"\U0001f5d1\ufe0f 成功删除节点: {node_title}"
@@ -427,8 +528,12 @@ class EditorMixin:
             if self.current_editing_node and self.content_editor.isEnabled():
                 self.save_current_node()
             else:
+                # 保存前检测大纲树文件外部变更
+                if not self._confirm_save_outline_tree():
+                    return
                 with self.loading_ui("正在保存大纲..."):
                     self.workspace.save_outline_tree(self.outline_tree_data)
+                self._on_outline_tree_saved()
 
             self.log_console.append(
                 "<b><font color='green'>"

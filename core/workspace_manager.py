@@ -108,11 +108,25 @@ class WorkspaceManager:
             logger.error(f"加载 outline_tree.json 失败: {e}")
             return {"nodes": []}
 
-    def save_outline_tree(self, tree_data: dict):
-        """保存小说目录树"""
+    def save_outline_tree(self, tree_data: dict, file_tracker=None):
+        """保存小说目录树。
+        :param file_tracker: 可选的 FileTracker 实例，用于自动备份外部修改。
+        """
         try:
+            # 自动备份：如果文件被外部修改，先将磁盘版本另存到 conflicts/
+            if file_tracker is not None and os.path.exists(self.tree_json_file):
+                if file_tracker.has_changed(self.tree_json_file):
+                    try:
+                        conflict_path = file_tracker.save_conflict_copy(self.tree_json_file)
+                        logger.warning(f"大纲树被外部修改，已自动备份至: {conflict_path}")
+                    except Exception as backup_err:
+                        logger.error(f"自动备份大纲树冲突文件失败: {backup_err}")
+
             with open(self.tree_json_file, 'w', encoding='utf-8') as f:
                 json.dump(tree_data, f, ensure_ascii=False, indent=4)
+
+            if file_tracker is not None:
+                file_tracker.refresh_md5(self.tree_json_file)
         except Exception as e:
             logger.error(f"保存 outline_tree.json 失败: {e}")
 

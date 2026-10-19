@@ -264,7 +264,7 @@ class NovelTreeMixin:
             self._regenerate_ids_and_files_for_copy(inserted_node)
             target_children.append(inserted_node)
 
-        self.workspace.save_outline_tree(self.outline_tree_data)
+        self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
         self._auto_export_html_if_enabled("粘贴节点")
         self.refresh_ui_from_workspace()
 
@@ -469,6 +469,8 @@ class NovelTreeMixin:
         self.current_editing_item = None  # 清除已删除的item引用
         self.novel_tree.setHeaderLabel("小说大纲结构")
         self.outline_tree_data = self.workspace.load_outline_tree()
+        # 追踪大纲树文件，用于保存前检测外部修改
+        self.file_tracker.track_file(self.workspace.tree_json_file)
 
         if "nodes" not in self.outline_tree_data:
             self.outline_tree_data["nodes"] = []
@@ -854,7 +856,7 @@ class NovelTreeMixin:
                 new_nodes.append(node_data)
 
         self.outline_tree_data["nodes"] = new_nodes
-        self.workspace.save_outline_tree(self.outline_tree_data)
+        self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
         self._auto_export_html_if_enabled("拖拽调整结构")
         
         if hasattr(self, '_pre_drag_tree_snapshot'):
@@ -921,7 +923,7 @@ class NovelTreeMixin:
             self.log_console.append("结构修复：未发现异常，无需修改。")
             return
 
-        self.workspace.save_outline_tree(self.outline_tree_data)
+        self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
         self._refresh_novel_tree()
 
         # 修复后自动展开相关节点，确保“+ 新增场景...”立即可见
@@ -1102,6 +1104,8 @@ class NovelTreeMixin:
                 if os.path.exists(full_path):
                     with open(full_path, "r", encoding="utf-8") as f:
                         self.content_editor.setText(f.read())
+                    # 追踪正文文件，用于保存前检测外部修改
+                    self.file_tracker.track_file(full_path)
                 else:
                     self.content_editor.setText(
                         f"# {real_node.get('title')}\n\n(文件尚未生成)"
@@ -1164,7 +1168,7 @@ class NovelTreeMixin:
             target_list.append(new_node)
 
             try:
-                self.workspace.save_outline_tree(self.outline_tree_data)
+                self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
                 self.log_console.append(f"成功添加{node_type}: {title}")
                 self._auto_export_html_if_enabled(f"新增{node_type}")
                 self.refresh_ui_from_workspace()
@@ -1206,7 +1210,7 @@ class NovelTreeMixin:
                 item.setText(0, clean_title)
 
                 if self.workspace and self.outline_tree_data:
-                    self.workspace.save_outline_tree(self.outline_tree_data)
+                    self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
                     self._auto_export_html_if_enabled("重命名节点")
                     self.log_console.append(
                         f"\U0001f504 节点已重命名: 【{old_title}】 -> 【{clean_title}】"
@@ -1480,7 +1484,7 @@ class NovelTreeMixin:
                     updated_count += 1
             
             if updated_count > 0 and self.workspace and self.outline_tree_data:
-                self.workspace.save_outline_tree(self.outline_tree_data)
+                self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
                 
                 # 如果当前UI右侧正文编辑器正在编辑刚才被覆盖的节点，自动刷新其内容
                 if self.current_editing_node and self.current_editing_node.get("id") in level3_updates:
@@ -1578,6 +1582,14 @@ class NovelTreeMixin:
                 if level == 3:
                     node["file_path"] = f"场景_{uuid.uuid4().hex[:8]}.md"
                     node["children"] = []
+                    # 立即创建对应的实体 .md 文件，避免加载时被 _verify_tree_md5 标记为 missing
+                    try:
+                        initial_content = f"# {node.get('title', '未命名场景')}\n\n"
+                        node["md5"] = self.workspace.save_markdown_file(
+                            node["file_path"], initial_content
+                        )
+                    except Exception:
+                        pass  # 文件创建失败不是致命错误，_verify_tree_md5 会在加载时标记为 missing
                 else:
                     process_nodes(node.get("children", []), level + 1)
 
@@ -1833,16 +1845,23 @@ class NovelTreeMixin:
                                 "children": [],
                                 "_status": "ok"
                             }
-                        # 如果是生成场景节点，添加文件路径
+                        # 如果是生成场景节点，添加文件路径并创建实体文件
                         if len(target_node.get("children", [])) + len(data["children"]) <= 3:
                             if target_node.get("children", []) and len(target_node["children"]) == 2:
                                 # 第三个子节点，应该是场景
                                 file_name = f"场景_{uuid.uuid4().hex[:8]}.md"
                                 new_child["file_path"] = file_name
+                                try:
+                                    initial_content = f"# {child.get('title', '未命名场景')}\n\n"
+                                    new_child["md5"] = self.workspace.save_markdown_file(
+                                        file_name, initial_content
+                                    )
+                                except Exception:
+                                    pass
                         children.append(new_child)
             
             # 保存大纲
-            self.workspace.save_outline_tree(self.outline_tree_data)
+            self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
             self.log_console.append("子节点生成成功！")
             self._auto_export_html_if_enabled("生成子节点")
             
@@ -2126,7 +2145,7 @@ class NovelTreeMixin:
 
             split_nodes = self._build_split_nodes_from_segments(real_node, valid_segments)
             parent_list[idx : idx + 1] = split_nodes
-            self.workspace.save_outline_tree(self.outline_tree_data)
+            self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
             self._auto_export_html_if_enabled("拆分场景")
             self.refresh_ui_from_workspace()
 
@@ -2482,7 +2501,7 @@ class NovelTreeMixin:
                 self.workspace.delete_pending_modify(node_id)
 
                 # 保存大纲树
-                self.workspace.save_outline_tree(self.outline_tree_data)
+                self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
                 self._auto_export_html_if_enabled("合并修改内容")
 
                 # 刷新UI
@@ -2607,7 +2626,7 @@ class NovelTreeMixin:
                 )
                 fail_count += 1
 
-        self.workspace.save_outline_tree(self.outline_tree_data)
+        self.workspace.save_outline_tree(self.outline_tree_data, self.file_tracker)
         self._auto_export_html_if_enabled("一键全部合并")
         self._refresh_novel_tree()
 

@@ -21,6 +21,7 @@ class _FakeThread:
         self.override_system_instruction = override_system_instruction
         self.success_signal = _FakeSignal()
         self.error_signal = _FakeSignal()
+        self.progress_signal = _FakeSignal()
         self.started = False
         self._running = running
         _FakeThread.instances.append(self)
@@ -64,7 +65,7 @@ class _FakeWorkspace:
     def __init__(self):
         self.saved_payloads = []
 
-    def save_outline_tree(self, payload):
+    def save_outline_tree(self, payload, file_tracker=None):
         self.saved_payloads.append(payload)
 
 
@@ -92,7 +93,7 @@ class _FakeBuilder:
     def __init__(self, workspace, **kwargs):
         self.workspace = workspace
 
-    def build_summary_prompt(self, current_node, tree_data, checked_paths):
+    def build_summary_prompt(self, current_node, tree_data, checked_paths, **kwargs):
         return [{"role": "user", "content": f"prompt for {current_node.get('id')}"}]
 
 

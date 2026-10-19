@@ -1144,6 +1144,7 @@ class ImportTextWorkspaceThread(QThread):
 class HtmlExportThread(QThread):
     success_signal = pyqtSignal(str)  # output_file
     error_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(str)
 
     def __init__(self, workspace, parent=None):
         super().__init__(parent)
@@ -1152,7 +1153,7 @@ class HtmlExportThread(QThread):
     def run(self):
         try:
             exporter = HtmlExporter(self.workspace)
-            output_file = exporter.export()
+            output_file = exporter.export(progress_callback=self.progress_signal.emit)
             self.success_signal.emit(output_file)
         except Exception as e:
             self.error_signal.emit(str(e))

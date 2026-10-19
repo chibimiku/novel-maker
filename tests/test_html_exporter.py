@@ -111,6 +111,41 @@ class HtmlExporterTests(unittest.TestCase):
             self.assertIn("第二章唯一场景。", second_html)
             self.assertNotIn("第一章第一节第一场。", second_html)
 
+    def test_export_tolerates_non_utf8_scene_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._build_workspace(td)
+            broken_scene_rel = "chapter1_scene3.md"
+            broken_scene_path = os.path.join(ws.text_path, broken_scene_rel)
+
+            with open(broken_scene_path, "w", encoding="utf-16") as f:
+                f.write("# 场景四\n\n这段内容来自 UTF-16 文件。")
+
+            tree = ws.load_outline_tree()
+            tree["nodes"][0]["children"][0]["children"].append(
+                {
+                    "id": "scene_4",
+                    "title": "场景4",
+                    "file_path": broken_scene_rel,
+                    "md5": ws.calculate_md5(broken_scene_path),
+                    "children": [],
+                }
+            )
+            ws.save_outline_tree(tree)
+
+            exporter = HtmlExporter(ws)
+            output_file = exporter.export()
+
+            self.assertTrue(os.path.exists(output_file))
+
+            chapter_dir = os.path.join(ws.workspace_path, "www", "chapters")
+            chapter_files = sorted(name for name in os.listdir(chapter_dir) if name.endswith(".html"))
+            first_page = os.path.join(chapter_dir, chapter_files[0])
+
+            with open(first_page, "r", encoding="utf-8") as f:
+                first_html = f.read()
+
+            self.assertIn("这段内容来自 UTF-16 文件。", first_html)
+
 
 if __name__ == "__main__":
     unittest.main()

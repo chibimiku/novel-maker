@@ -32,6 +32,7 @@ from ui.timeline_dialog import TimelineDialog
 # 导入核心逻辑层组件
 from core.llm_client import LLMClient
 from core.workspace_manager import WorkspaceManager
+from core.file_tracker import FileTracker
 
 # 导入 Mixin 子模块
 from ui.mixins import (
@@ -268,6 +269,8 @@ class NovelCreatorWindow(
         self._smart_setting_selection_enabled = self._get_smart_setting_selection_enabled()
         # 工作区是否启用 NSFW 文本模型配置
         self._workspace_is_nsfw = False
+        # 文件变更追踪器（保存前检测外部修改）
+        self.file_tracker = FileTracker()
 
         self.config = self._load_config()
         self.llm_client: LLMClient | None = LLMClient(self.config) if self.config else None

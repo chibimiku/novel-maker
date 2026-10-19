@@ -73,10 +73,14 @@ class GenerationMixin:
         ):
             return
 
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            self.log_console.append(
-                f"系统通知（托盘不可用）: {title} - {message}"
-            )
+        # 无 QApplication（单元测试/无 GUI 环境）时直接回退日志，
+        # 否则 QSystemTrayIcon 会在没有 QApplication 的情况下直接崩溃进程。
+        if QApplication.instance() is None or not QSystemTrayIcon.isSystemTrayAvailable():
+            log_console = getattr(self, "log_console", None)
+            if log_console is not None:
+                log_console.append(
+                    f"系统通知（托盘不可用）: {title} - {message}"
+                )
             return
 
         tray_icon = getattr(self, "_system_tray_icon", None)
@@ -1139,7 +1143,9 @@ class GenerationMixin:
             self.current_node_original_summary = result
 
         if should_write_back and self.workspace and self.outline_tree_data:
-            self.workspace.save_outline_tree(self.outline_tree_data)
+            self.workspace.save_outline_tree(
+                self.outline_tree_data, getattr(self, "file_tracker", None)
+            )
         if should_write_back:
             self.log_console.append("概要生成成功！已写回目标节点并保存。")
         else:

@@ -311,6 +311,9 @@ class SettingTreeMixin:
                     with open(new_file_path, "w", encoding="utf-8") as f:
                         json.dump(template_data, f, ensure_ascii=False, indent=4)
 
+                    # 追踪新创建的设定文件
+                    self.file_tracker.track_file(new_file_path)
+
                     self.log_console.append(f"成功创建设定文件: {new_file_path}")
                     self.refresh_ui_from_workspace()
                 except Exception as e:
@@ -379,6 +382,9 @@ class SettingTreeMixin:
             # --- 修改部分开始 ---
             self.current_editing_node = None
             self.current_setting_path = file_path
+
+            # 追踪设定文件，用于保存前检测外部修改
+            self.file_tracker.track_file(file_path)
 
             self.summary_editor.setEnabled(True)
             
@@ -617,9 +623,17 @@ class SettingTreeMixin:
         self: "NovelCreatorWindow", file_path: str, pending_id: str, result_text: str
     ):
         """应用设定合并结果到原文件。"""
+        # 保存前检测设定文件外部变更
+        if not self._check_file_conflict(
+            file_path,
+            f"设定 ({os.path.basename(file_path)})"
+        ):
+            return
+
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(result_text)
+            self._on_setting_file_saved(file_path)
             self.workspace.delete_pending_modify(pending_id)
 
             if self.current_setting_path == file_path:
@@ -1063,6 +1077,7 @@ class SettingTreeMixin:
             parsed_json = json.loads(index_content)
             with open(index_path, "w", encoding="utf-8") as f:
                 json.dump(parsed_json, f, ensure_ascii=False, indent=4)
+            self.file_tracker.refresh_md5(index_path)
 
             self.log_console.append(
                 f"<b><font color='green'>"
