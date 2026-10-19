@@ -5,7 +5,14 @@ import requests
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QComboBox, QTextEdit, 
                              QMessageBox, QTabWidget, QWidget, QFormLayout, QSpinBox, QCheckBox, QInputDialog, QDoubleSpinBox)
-from PyQt6.QtCore import Qt
+
+from core.config_store import load_raw_config, save_raw_config
+from core.model_config import (
+    ensure_providers,
+    load_catalog,
+    resolve_runtime,
+)
+from ui.model_manager_dialog import ModelManagerDialog
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -33,17 +40,8 @@ class SettingsDialog(QDialog):
         self.populate_data()
 
     def load_config(self) -> dict:
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                QMessageBox.warning(self, "警告", f"读取配置文件失败，将使用默认空配置。\n{e}")
-        return {
-            "text_api": {},
-            "image_api": {},
-            "task_completion_notification_enabled": True,
-        }
+        """读取配置文件（通过统一配置层，兼容缺失/损坏文件）。"""
+        return load_raw_config(self.config_path)
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -60,6 +58,22 @@ class SettingsDialog(QDialog):
         self.text_profile_combo.addItem("NSFW小说配置", "nsfw")
         self.text_profile_combo.currentIndexChanged.connect(self.on_text_profile_changed)
         self.text_layout.addRow("配置目标:", self.text_profile_combo)
+
+        self.model_service_label = QLabel("")
+        self.model_service_label.setWordWrap(True)
+        self.model_service_label.setStyleSheet("color: #8ab4f8;")
+        self.text_layout.addRow("当前模型:", self.model_service_label)
+        self.btn_open_model_service = QPushButton("🚀 模型服务管理（提供商 / 模型 / 参数）")
+        self.btn_open_model_service.setToolTip(
+            "在独立窗口中添加提供商、管理具体模型，并为每个模型单独配置"
+            "temperature / top_p / top_k 等采样参数与上下文窗口。"
+        )
+        self.btn_open_model_service.clicked.connect(self.open_model_service_dialog)
+        self.text_layout.addRow("", self.btn_open_model_service)
+        self._profile_runtime_bindings: dict[str, dict] = {
+            "normal": {},
+            "nsfw": {},
+        }
         
         self.txt_type_combo = QComboBox()
         self.txt_type_combo.addItems(["openai", "gemini"])
@@ -108,6 +122,24 @@ class SettingsDialog(QDialog):
         self.spin_model_context_size.setSingleStep(1024)
         self.spin_model_context_size.setSuffix(" tokens")
         self.text_layout.addRow("上下文大小 (Context):", self.spin_model_context_size)
+
+        # 连接信息与模型参数统一在“模型服务管理”里维护，
+        # 这里只做只读展示，避免两处配置源互相覆盖。
+        for legacy_widget in (
+            self.txt_type_combo,
+            self.txt_base_url_input,
+            self.txt_api_key_input,
+            self.btn_toggle_txt_api_key,
+            self.txt_model_combo,
+            self.btn_fetch_txt_models,
+            self.spin_timeout,
+            self.txt_model_capabilities_input,
+            self.spin_model_context_size,
+        ):
+            legacy_widget.setEnabled(False)
+            legacy_widget.setToolTip(
+                "连接信息与模型参数请通过上方「模型服务管理」维护。"
+            )
 
         self.cb_auto_continue_on_incomplete = QCheckBox("返回疑似截断时自动续请求")
         self.text_layout.addRow("自动续请求:", self.cb_auto_continue_on_incomplete)
@@ -586,11 +618,9 @@ class SettingsDialog(QDialog):
         profile["model_capabilities"] = self._normalize_capabilities(
             profile.get("model_capabilities", [])
         )
-        profile["model_meta_catalog"] = (
-            profile.get("model_meta_catalog", {})
-            if isinstance(profile.get("model_meta_catalog", {}), dict)
-            else {}
-        )
+        # 模型全集已迁移到 data/model_catalog.json，画像里不再保存整份目录，
+        # 否则 setting.json / recent_api_configs 会被重复的 300+ 模型元数据撑爆。
+        profile["model_meta_catalog"] = {}
         profile["world_context_compression_profile"] = self._normalize_compression_profile(
             profile.get("world_context_compression_profile", "balanced")
         )
@@ -695,13 +725,20 @@ class SettingsDialog(QDialog):
                 "capabilities": model_capabilities,
                 "context_size": model_context_size,
             }
+        # 不再把整份模型目录写进画像（目录已独立到 data/model_catalog.json）
+        model_meta_catalog: dict = {}
 
+        binding = self._profile_runtime_bindings.get(
+            self._current_text_profile_key, {}
+        )
         return {
             "type": self.txt_type_combo.currentText(),
             "base_url": self.txt_base_url_input.text().strip(),
             "api_key": self.txt_api_key_input.text().strip(),
             "model": model_name,
             "timeout": self.spin_timeout.value(),
+            "provider_id": binding.get("provider_id", ""),
+            "model_id": binding.get("model_id", ""),
             "model_capabilities": model_capabilities,
             "model_context_size": model_context_size,
             "world_context_compression_profile": compression_profile,
@@ -709,7 +746,7 @@ class SettingsDialog(QDialog):
             "children_summary_group_budget_ratio": children_group_budget_ratio,
             "auto_continue_on_incomplete": self.cb_auto_continue_on_incomplete.isChecked(),
             "auto_continue_max_rounds": int(self.spin_auto_continue_max_rounds.value()),
-            "model_meta_catalog": self.text_model_meta_catalog,
+            "model_meta_catalog": model_meta_catalog,
             "instructions": current_text_instruction,
             "instructions_history": self.text_instructions_history,
             "summary_instructions": current_summary_instruction,
@@ -831,6 +868,80 @@ class SettingsDialog(QDialog):
         )
         if idx >= 0:
             self.modify_instruction_combo.setCurrentIndex(idx)
+
+        self._profile_runtime_bindings[self._current_text_profile_key] = {
+            "provider_id": str(text_cfg.get("provider_id", "") or ""),
+            "model_id": str(text_cfg.get("model_id", "") or ""),
+        }
+        self._refresh_runtime_preview()
+
+    def _refresh_runtime_preview(self):
+        """展示当前画像实际生效的提供商/模型（来自 providers 二级配置）。"""
+        try:
+            normalized = ensure_providers(copy.deepcopy(self.config), load_catalog())
+        except Exception:
+            normalized = self.config
+        runtime = resolve_runtime(normalized, self._current_text_profile_key)
+        if runtime is None:
+            self.model_service_label.setText(
+                "⚠ 尚未配置模型。点击下方按钮添加提供商与模型。"
+            )
+            self.model_service_label.setStyleSheet("color: #ffb74d;")
+            self.txt_type_combo.setCurrentText("openai")
+            self.txt_base_url_input.setText("")
+            self.txt_api_key_input.setText("")
+            self.txt_model_combo.setCurrentText("")
+            self.spin_model_context_size.setValue(8192)
+            self.spin_timeout.setValue(120)
+            self.txt_model_capabilities_input.setText("")
+            return
+        self.model_service_label.setStyleSheet("color: #8ab4f8;")
+        self.model_service_label.setText(
+            f"<b>{runtime.label()}</b><br>"
+            f"上下文 {runtime.context_size:,} tokens · 最大输出 {runtime.max_output_tokens:,}<br>"
+            f"参数：{runtime.params_desc()}"
+        )
+        # 同步只读展示控件，保持与真实模型一致
+        self.txt_type_combo.setCurrentText(runtime.api_type)
+        self.txt_base_url_input.setText(runtime.base_url)
+        self.txt_api_key_input.setText(runtime.api_key)
+        self.txt_model_combo.setCurrentText(runtime.model_key)
+        self.spin_model_context_size.setValue(runtime.context_size)
+        self.spin_timeout.setValue(runtime.timeout)
+        self.txt_model_capabilities_input.setText(", ".join(runtime.capabilities))
+        self._profile_runtime_bindings[self._current_text_profile_key] = {
+            "provider_id": runtime.provider_id,
+            "model_id": runtime.model_id,
+        }
+
+    def open_model_service_dialog(self):
+        """打开模型服务管理窗口，关闭后只同步 providers 与模型绑定。
+
+        注意：模型管理窗口只修改提供商/模型与画像绑定，不涉及指令模板；
+        因此这里保留当前窗口中未保存的指令编辑，避免用户内容被覆盖。
+        """
+        self.text_api_profiles[self._current_text_profile_key] = (
+            self._collect_current_text_profile_from_ui()
+        )
+        dialog = ModelManagerDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.config = load_raw_config()
+        disk_profiles = self._extract_text_api_profiles()
+        for key in ("normal", "nsfw"):
+            disk_profile = disk_profiles.get(key, {})
+            profile = self.text_api_profiles.setdefault(key, {})
+            profile["provider_id"] = disk_profile.get("provider_id", "")
+            profile["model_id"] = disk_profile.get("model_id", "")
+        self._apply_text_profile_to_ui(
+            self.text_api_profiles.get(self._current_text_profile_key, {})
+        )
+        QMessageBox.information(
+            self,
+            "提示",
+            "模型配置已更新。\n点击「保存配置」后生效，或直接关闭本窗口由主界面重新加载。",
+        )
 
     def on_text_profile_changed(self, index):
         if self._is_switching_text_profile:
@@ -1197,6 +1308,12 @@ class SettingsDialog(QDialog):
         self.text_api_profiles[self._current_text_profile_key] = (
             self._collect_current_text_profile_from_ui()
         )
+        # 把两个画像的 provider/model 绑定写回（模型服务管理窗口维护的是唯一来源）
+        for key, profile in list(self.text_api_profiles.items()):
+            binding = self._profile_runtime_bindings.get(key, {})
+            if binding:
+                profile["provider_id"] = binding.get("provider_id", "")
+                profile["model_id"] = binding.get("model_id", "")
         normal_profile = self._normalize_text_profile(
             self.text_api_profiles.get("normal", {})
         )
@@ -1213,34 +1330,45 @@ class SettingsDialog(QDialog):
         merged_recent = [current_snapshot] + self.recent_api_configs
         self.recent_api_configs = self._deduplicate_recent_api_configs(merged_recent)[:20]
 
-        new_config = {
-            "proxy": {
-                "enabled": self.cb_enable_proxy.isChecked(),
-                "url": self.proxy_url_input.text().strip()
-            },
-            "text_api_profiles": text_api_profiles,
-            "text_api_active_profile": text_api_active_profile,
-            "text_generation_mode": text_api_active_profile,
-            "text_api": active_text_api,
-            "image_api": {
-                "type": self.img_type_combo.currentText(),
-                "base_url": self.img_base_url_input.text().strip(),
-                "api_key": self.img_api_key_input.text().strip(),
-                "model": self.img_model_combo.currentText().strip()
-            },
-            "task_completion_notification_enabled": (
-                self.cb_task_completion_notification.isChecked()
-            ),
-            "recent_api_configs": self.recent_api_configs,
-        }
-        
-        # 确保 conf 目录存在
-        os.makedirs(self.config_dir, exist_ok=True)
-        
+        # 关键：以磁盘上的现有配置为基础合并，保留 providers 等未知字段，
+        # 避免旧实现“整份重写”导致模型服务配置被清空。
+        new_config = copy.deepcopy(load_raw_config())
+        new_config.update(
+            {
+                "proxy": {
+                    "enabled": self.cb_enable_proxy.isChecked(),
+                    "url": self.proxy_url_input.text().strip(),
+                },
+                "text_api_profiles": text_api_profiles,
+                "text_api_active_profile": text_api_active_profile,
+                "text_generation_mode": text_api_active_profile,
+                "text_api": active_text_api,
+                "image_api": {
+                    "type": self.img_type_combo.currentText(),
+                    "base_url": self.img_base_url_input.text().strip(),
+                    "api_key": self.img_api_key_input.text().strip(),
+                    "model": self.img_model_combo.currentText().strip(),
+                },
+                "task_completion_notification_enabled": (
+                    self.cb_task_completion_notification.isChecked()
+                ),
+                "recent_api_configs": self.recent_api_configs,
+            }
+        )
+
+        # 物化 providers：旧配置第一次保存后就拥有完整的二级结构，
+        # 后续不再依赖运行时迁移。
         try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(new_config, f, ensure_ascii=False, indent=4)
-            QMessageBox.information(self, "保存成功", "系统配置已保存。\n配置将在关闭此窗口后立即生效。")
-            self.accept() # 关闭对话框并返回 accepted 状态
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", f"写入文件时发生错误:\n{e}")
+            new_config = ensure_providers(new_config, load_catalog())
+        except Exception:
+            pass
+
+        if not save_raw_config(new_config):
+            QMessageBox.critical(
+                self, "保存失败", "写入配置文件时发生错误，请检查文件权限。"
+            )
+            return
+        QMessageBox.information(
+            self, "保存成功", "系统配置已保存。\n配置将在关闭此窗口后立即生效。"
+        )
+        self.accept()  # 关闭对话框并返回 accepted 状态

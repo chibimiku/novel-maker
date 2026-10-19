@@ -128,11 +128,12 @@ class _FakeLLMClient:
         self.generate_calls = []
 
     def generate_text(self, prompt, override_system_instruction=None,
-                      progress_callback=None):
+                      progress_callback=None, task_meta=None):
         self.generate_calls.append({
             "prompt": prompt,
             "system": override_system_instruction,
             "progress_callback": progress_callback,
+            "task_meta": task_meta,
         })
         return self.raw_response
 

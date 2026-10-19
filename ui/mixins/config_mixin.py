@@ -11,7 +11,9 @@ from typing import Any
 from PyQt6.QtWidgets import QDialog, QInputDialog
 from PyQt6.QtCore import QByteArray, QRect
 
+from core.config_store import build_runtime_config, load_raw_config, save_raw_config
 from core.llm_client import LLMClient
+from core.model_config import resolve_runtime, validate_config
 from ui.settings_dialog import SettingsDialog
 
 class ConfigMixin:
@@ -481,7 +483,7 @@ class ConfigMixin:
         )
         self._save_modify_style_option(self._append_writing_style_on_modify)
 
-        self.llm_client = LLMClient(self.config) if self.config else None
+        self.llm_client = self._create_llm_client()
 
         if warnings:
             from PyQt6.QtWidgets import QMessageBox
@@ -491,38 +493,102 @@ class ConfigMixin:
             QMessageBox.warning(self, "Instruction 绑定告警", msg)  # type: ignore[arg-type]
 
     def _load_config(self: Any) -> dict:
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        config_path = os.path.join(base_dir, "conf", "setting.json")
+        """读取 + 归一化配置（自动迁移旧版 text_api 到 providers 二级结构）。"""
+        try:
+            raw = load_raw_config()
+        except Exception as e:
+            print(f"读取配置文件失败: {e}")
+            raw = {}
 
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                profiles = self._build_text_api_profiles(cfg)
-                active_key = "nsfw" if bool(getattr(self, "_workspace_is_nsfw", False)) else "normal"
-                cfg["text_api_profiles"] = profiles
-                cfg["text_api_active_profile"] = active_key
-                cfg["text_api"] = copy.deepcopy(profiles.get(active_key, profiles["normal"]))
-                cfg["text_generation_mode"] = active_key
-                cfg["text_api"]["text_generation_mode"] = active_key
-                cfg["task_completion_notification_enabled"] = bool(
-                    cfg.get("task_completion_notification_enabled", True)
-                )
-                return cfg
-            except Exception as e:
-                print(f"读取配置文件失败: {e}")
-        default_profiles = {
-            "normal": self._get_default_text_api_profile(),
-            "nsfw": self._get_default_text_api_profile(),
+        try:
+            prefer_nsfw = bool(getattr(self, "_workspace_is_nsfw", False))
+            cfg = build_runtime_config(raw, prefer_nsfw=prefer_nsfw)
+        except Exception as e:
+            print(f"配置迁移失败，使用默认配置: {e}")
+            cfg = build_runtime_config({}, prefer_nsfw=getattr(self, "_workspace_is_nsfw", False))
+
+        # 归一化各画像的 instruction / 压缩策略等行为配置
+        profiles = self._build_text_api_profiles(cfg)
+        active_key = str(cfg.get("text_api_active_profile", "normal"))
+        if active_key not in profiles:
+            active_key = "normal"
+        cfg["text_api_profiles"] = profiles
+        cfg["text_api_active_profile"] = active_key
+        cfg["text_generation_mode"] = active_key
+
+        # 重新生成向后兼容的 text_api 视图（保留运行期模型字段）
+        runtime_fields = {
+            key: cfg.get("text_api", {}).get(key)
+            for key in (
+                "type",
+                "base_url",
+                "api_key",
+                "model",
+                "model_context_size",
+                "model_max_output_tokens",
+                "model_capabilities",
+                "model_params",
+                "provider_id",
+                "model_id",
+                "provider_name",
+            )
         }
-        active_key = "nsfw" if bool(getattr(self, "_workspace_is_nsfw", False)) else "normal"
-        return {
-            "text_api_profiles": default_profiles,
-            "text_api_active_profile": active_key,
-            "text_api": copy.deepcopy(default_profiles[active_key]),
-            "text_generation_mode": active_key,
-            "task_completion_notification_enabled": True,
-        }
+        derived = copy.deepcopy(profiles.get(active_key, {}))
+        for key, value in runtime_fields.items():
+            if value is not None:
+                derived[key] = value
+        derived["text_generation_mode"] = active_key
+        cfg["text_api"] = derived
+        cfg["task_completion_notification_enabled"] = bool(
+            cfg.get("task_completion_notification_enabled", True)
+        )
+
+        issues = validate_config(cfg)
+        if issues:
+            print("模型配置告警:\n- " + "\n- ".join(issues))
+        return cfg
+
+    def _runtime_model(self: Any):
+        """返回当前生效的运行期模型（可能为 None）。"""
+        if not self.config:
+            return None
+        active = str(self.config.get("text_api_active_profile", "normal")).lower()
+        if active not in ("normal", "nsfw"):
+            active = "normal"
+        return resolve_runtime(self.config, active)
+
+    def _task_queue(self: Any):
+        """返回全局任务队列（已绑定当前工作区目录）。"""
+        from core.task_queue import get_task_queue
+
+        return get_task_queue()
+
+    def _configure_task_queue(self: Any):
+        """把任务队列的存储根目录切到当前工作区。"""
+        from core.task_queue import configure_task_queue, workspace_task_root
+
+        workspace = getattr(self, "workspace", None)
+        workspace_path = getattr(workspace, "workspace_path", None) if workspace else None
+        return configure_task_queue(workspace_task_root(workspace_path))
+
+    def _create_llm_client(self: Any):
+        """按当前配置与工作区创建 LLM 客户端（每次重建都会读取最新模型配置）。"""
+        if not self.config:
+            return None
+        workspace = getattr(self, "workspace", None)
+        workspace_path = getattr(workspace, "workspace_path", None) if workspace else None
+        return LLMClient(
+            self.config,
+            task_queue=self._task_queue(),
+            workspace_path=workspace_path,
+        )
+
+    def _persist_config(self: Any, updates: dict):
+        """合并写入配置文件，保留未知字段（providers / recent_api_configs 等）。"""
+        raw = load_raw_config()
+        merged = copy.deepcopy(raw)
+        merged.update(copy.deepcopy(updates))
+        return save_raw_config(merged)
 
     def _get_or_create_prompt_template(
         self: Any,
@@ -737,6 +803,32 @@ class ConfigMixin:
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.log_console.append("系统配置已更新，正在重新初始化模型客户端...")
             self.config = self._load_config()
-            self.llm_client = LLMClient(self.config) if self.config else None
+            self.llm_client = self._create_llm_client()
             self._save_workspace_instruction_profile()
-            self.log_console.append("模型客户端初始化完成！")
+            runtime = self._runtime_model()
+            if runtime is not None:
+                self.log_console.append(
+                    f"模型客户端初始化完成：{runtime.label()} "
+                    f"(context={runtime.context_size}, max_out={runtime.max_output_tokens}, "
+                    f"params={runtime.params_desc()})"
+                )
+            else:
+                self.log_console.append(
+                    "<font color='orange'>尚未配置可用的文本模型，请在「设置 → 模型服务」中添加。</font>"
+                )
+
+    def open_model_manager_dialog(self: Any):
+        """打开“提供商 → 模型”管理窗口。"""
+        from ui.model_manager_dialog import ModelManagerDialog
+
+        dialog = ModelManagerDialog(self)  # type: ignore[arg-type]
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config = self._load_config()
+            self.llm_client = self._create_llm_client()
+            runtime = self._runtime_model()
+            if runtime is not None:
+                self.log_console.append(
+                    f"<b><font color='green'>模型配置已更新：{runtime.label()} "
+                    f"(context={runtime.context_size}, max_out={runtime.max_output_tokens})</font></b>"
+                )
+            self.statusBar().showMessage("模型配置已更新", 3000)

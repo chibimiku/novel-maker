@@ -15,10 +15,11 @@ class _FakeSignal:
 class _FakeThread:
     instances = []
 
-    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None, running=False):
+    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None, running=False, task_meta=None):
         self.llm_client = llm_client
         self.prompt_content = prompt_content
         self.override_system_instruction = override_system_instruction
+        self.task_meta = task_meta
         self.success_signal = _FakeSignal()
         self.error_signal = _FakeSignal()
         self.progress_signal = _FakeSignal()
@@ -121,6 +122,8 @@ class _DummyWindow(GenerationMixin):
         self.restore_called = 0
         self._sender_obj = None
         self.is_batch_generating = False
+        self.task_actions = []
+        self.task_finished = []
 
     def _get_current_node_from_tree(self):
         return GenerationMixin._get_current_node_from_tree(self)
@@ -140,6 +143,17 @@ class _DummyWindow(GenerationMixin):
     def _restore_generate_ui_state(self):
         self.restore_called += 1
         self.generate_thread = None
+
+    # 任务队列相关钩子：单测里只记录调用，不做落盘
+    def _task_action_begin(self, action_type, title, **kwargs):
+        self.task_actions.append((action_type, title))
+        return "act-1"
+
+    def _task_action_finish(self, status=None, note=""):
+        self.task_finished.append((status, note))
+
+    def _task_meta(self, label, node=None, **extra):
+        return {"label": label}
 
     def sender(self):
         return self._sender_obj

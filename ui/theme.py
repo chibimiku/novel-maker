@@ -188,6 +188,7 @@ QTextEdit:disabled {{
 QTreeWidget {{
     background-color: {BG_SURFACE};
     color: {TEXT_PRIMARY};
+    alternate-background-color: {BG_ELEVATED};
     border: 1px solid {BORDER};
     border-radius: 6px;
     padding: 4px;
@@ -535,6 +536,32 @@ QToolTip {{
     padding: 4px 8px;
 }}
 
+/* ==================== 列表视图 ==================== */
+QListWidget {{
+    background-color: {BG_SURFACE};
+    color: {TEXT_PRIMARY};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 4px;
+    outline: 0px;
+    font-size: 13px;
+}}
+
+QListWidget::item {{
+    padding: 6px 6px;
+    border-radius: 4px;
+    margin: 1px 0px;
+}}
+
+QListWidget::item:hover {{
+    background-color: {BG_HOVER};
+}}
+
+QListWidget::item:selected {{
+    background-color: {BG_SELECTED};
+    color: white;
+}}
+
 /* ==================== 表格视图 ==================== */
 QTableWidget {{
     background-color: {BG_SURFACE};
@@ -543,6 +570,11 @@ QTableWidget {{
     border-radius: 6px;
     gridline-color: {BORDER};
     font-size: 13px;
+}}
+
+QTableCornerButton::section {{
+    background-color: {BG_BASE};
+    border: none;
 }}
 
 QTableWidget::item {{
@@ -584,6 +616,16 @@ QPlainTextEdit {{
 
 QPlainTextEdit:focus {{
     border-color: {ACCENT};
+}}
+
+/* ==================== 滚动区域 ==================== */
+QScrollArea {{
+    background-color: {BG_SURFACE};
+    border: none;
+}}
+
+QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
 }}
 
 /* ==================== 分组框 ==================== */

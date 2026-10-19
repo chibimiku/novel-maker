@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import QFileDialog, QMessageBox
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtCore import QUrl
 
-from core.llm_client import LLMClient
 from core.workspace_manager import WorkspaceManager
 from ui.import_text_dialog import ImportTextWorkspaceDialog
 from ui.workers import ImportTextWorkspaceThread
@@ -49,10 +48,17 @@ class WorkspaceMixin:
         self.workspace.set_is_nsfw(bool(checked))
         self._workspace_is_nsfw = bool(checked)
         self.config = self._load_config()
-        self.llm_client = LLMClient(self.config) if self.config else None
+        self.llm_client = self._create_llm_client()
         self._apply_workspace_instruction_profile()
         mode_name = "NSFW" if checked else "普通"
-        self.log_console.append(f"已切换工作区模式：{mode_name}（文本模型配置已重载）")
+        runtime = self._runtime_model()
+        model_desc = runtime.label() if runtime else "未配置模型"
+        sync_action = getattr(self, "_sync_nsfw_menu_action", None)
+        if callable(sync_action):
+            sync_action(bool(checked))
+        self.log_console.append(
+            f"已切换工作区模式：{mode_name}（文本模型配置已重载 → {model_desc}）"
+        )
 
     def _get_prompt_template(self: Any, template_name: str, default_content: str = "") -> str:
         """获取prompt模板"""
@@ -77,6 +83,14 @@ class WorkspaceMixin:
         
         if not selected_files or not workspace_path:
             return
+
+        if not self.llm_client:
+            QMessageBox.warning(
+                self,
+                "未配置",
+                "请先在「设置 → 模型服务」中配置文本模型，再使用从文本创建工作区。",
+            )
+            return
         
         if os.listdir(workspace_path):
             QMessageBox.warning(
@@ -86,7 +100,13 @@ class WorkspaceMixin:
             return
         
         self.log_console.append("开始从文本创建工作区...")
-        
+        self._task_action_begin(
+            "import",
+            f"从文本创建工作区（{len(selected_files)} 个文件）",
+            reuse=False,
+            meta={"workspace_path": workspace_path},
+        )
+
         worker = ImportTextWorkspaceThread(
             self.llm_client, 
             selected_files, 
@@ -98,18 +118,23 @@ class WorkspaceMixin:
         
         worker.progress_signal.connect(lambda msg: self.log_console.append(msg))
         worker.success_signal.connect(self._on_import_success)
-        worker.error_signal.connect(lambda msg: QMessageBox.critical(self, "错误", msg))
+        worker.error_signal.connect(self._on_import_error)
         
         worker.start()
     
     def _on_import_success(self: Any, workspace_path):
         """导入成功回调"""
+        self._task_action_finish()
         self._load_workspace_by_path(workspace_path)
         self.log_console.append("<font color='green'>工作区创建成功！</font>")
         self._send_system_notification(
             "导入完成",
             "从文本创建工作区任务已完成。",
         )
+
+    def _on_import_error(self: Any, message: str):
+        self._task_action_finish()
+        QMessageBox.critical(self, "错误", message)  # type: ignore[arg-type]
     
     def _process_text_files_with_llm(self: Any, selected_files, word_count, workspace):
         """使用LLM智能处理文本文件并转换为小说大纲结构"""
@@ -634,9 +659,20 @@ class WorkspaceMixin:
                 self.cb_workspace_nsfw.setChecked(self._workspace_is_nsfw)
                 self.cb_workspace_nsfw.blockSignals(False)
             self.config = self._load_config()
-            self.llm_client = LLMClient(self.config) if self.config else None
+            self._configure_task_queue()
+            self.llm_client = self._create_llm_client()
+            self._reset_task_action()
+            sync_action = getattr(self, "_sync_nsfw_menu_action", None)
+            if callable(sync_action):
+                sync_action(self._workspace_is_nsfw)
 
             self.log_console.append(f"成功加载工作区: {folder_path}")
+            runtime = self._runtime_model()
+            if runtime is not None:
+                self.log_console.append(
+                    f"当前文本模型: {runtime.label()} "
+                    f"(context={runtime.context_size}, max_out={runtime.max_output_tokens})"
+                )
             self.setWindowTitle(f"AI小说创作器 - {os.path.basename(folder_path)}")
             self._apply_workspace_instruction_profile()
 

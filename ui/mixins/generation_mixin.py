@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 from core.context_builder import ContextBuilder
 from core.setting_relevance import compute_local_relevance
 from core.setting_relevance_cache import SettingRelevanceCache
+from core.task_queue import TaskStatus
 from ui.utils import find_item_by_data, get_item_level, get_missing_level3_nodes
 from ui.workers import GenerateTaskThread, SettingSelectionThread
 
@@ -406,6 +407,11 @@ class GenerationMixin:
         self.save_current_node()
 
         node_title = current_node.get("title", "未知节点")
+        self._task_action_begin(
+            "generate",
+            f"生成正文：{node_title}",
+            node_ids=[current_node.get("id", "")],
+        )
         self.log_console.append(f"开始构建【{node_title}】的上下文...")
 
         statusbar = self.statusBar()
@@ -464,6 +470,7 @@ class GenerationMixin:
             use_cache,
             checked_paths,
             candidate_paths,
+            task_meta=self._task_meta("筛选设定", current_node),
         )
         self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
         self._setting_sel_thread.success_signal.connect(
@@ -527,7 +534,11 @@ class GenerationMixin:
         self.log_console.append("=================================================")
         self.log_console.append("发送请求至大语言模型，后台处理中，请稍候...")
 
-        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        self.generate_thread = GenerateTaskThread(
+            self.llm_client,
+            prompt_content,
+            task_meta=self._task_meta("生成正文", current_node),
+        )
         self.generate_thread.progress_signal.connect(self.on_generate_progress)
         self.generate_thread.success_signal.connect(self.on_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
@@ -583,6 +594,12 @@ class GenerationMixin:
         self.btn_delete.setEnabled(False)
 
         node_title = current_node.get("title", "未知节点")
+        self._task_action_begin(
+            "rewrite",
+            f"重写正文：{node_title}",
+            node_ids=[current_node.get("id", "")],
+            meta={"target_word_count": target_word_count},
+        )
         self.log_console.append(f"开始构建【{node_title}】的重写请求...")
 
         builder = self._create_context_builder()
@@ -631,6 +648,7 @@ class GenerationMixin:
             getattr(self, "_batch_gen_use_cache", True),
             checked_paths,
             candidate_paths,
+            task_meta=self._task_meta("筛选设定", current_node),
         )
         self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
         self._setting_sel_thread.success_signal.connect(
@@ -663,7 +681,11 @@ class GenerationMixin:
             "发送重写请求至大模型，后台处理中，请耐心稍候..."
         )
 
-        self.generate_thread = GenerateTaskThread(self.llm_client, prompt_content)
+        self.generate_thread = GenerateTaskThread(
+            self.llm_client,
+            prompt_content,
+            task_meta=self._task_meta("重写正文", current_node),
+        )
         self.generate_thread.progress_signal.connect(self.on_generate_progress)
         self.generate_thread.success_signal.connect(self.on_generate_success)
         self.generate_thread.error_signal.connect(self.on_generate_error)
@@ -710,7 +732,11 @@ class GenerationMixin:
 
         if self._is_batch_generation_context:
             self._is_batch_generation_context = False
+            # 批量被用户中途停止时，最后一个任务成功后在这里收尾
+            self._task_action_finish(TaskStatus.CANCELLED, "用户停止批量生成")
             return
+
+        self._task_action_finish()
 
         self._send_system_notification(
             "生成完成",
@@ -761,6 +787,11 @@ class GenerationMixin:
         self.save_current_node()
 
         node_title = current_node.get("title", "未知节点")
+        self._task_action_begin(
+            "summary",
+            f"重新生成概要：{node_title}",
+            node_ids=[current_node.get("id", "")],
+        )
         self.log_console.append(f"开始重新生成【{node_title}】的概要...")
         
         # 在状态栏显示信息
@@ -826,6 +857,7 @@ class GenerationMixin:
             getattr(self, "_batch_gen_use_cache", True),
             checked_paths,
             candidate_paths,
+            task_meta=self._task_meta("筛选设定", current_node),
         )
         self._setting_sel_thread.progress_signal.connect(self.on_generate_progress)
         self._setting_sel_thread.success_signal.connect(
@@ -869,6 +901,7 @@ class GenerationMixin:
             self.llm_client,
             prompt_content,
             self.llm_client.summary_system_instruction,
+            task_meta=self._task_meta("生成概要", current_node),
         )
         self.generate_thread.progress_signal.connect(self.on_generate_progress)
         self.generate_thread._summary_request_id = request_id  # type: ignore[attr-defined]
@@ -1004,6 +1037,20 @@ class GenerationMixin:
         self.batch_summary_before_records = []
         self.batch_summary_after_records = []
 
+        self._task_action_begin(
+            "batch_summary",
+            f"批量概要校验（{len(self.batch_summary_regen_queue)} 个节点）",
+            node_ids=[
+                node.get("id", "") for _item, node in self.batch_summary_regen_queue
+            ],
+            reuse=False,
+            meta={
+                "mode": "diff_only"
+                if self.batch_summary_regen_diff_only
+                else "overwrite"
+            },
+        )
+
         self.log_console.append(
             f"<font color='cyan'>🩺 开始批量校验概要，共 {len(self.batch_summary_regen_queue)} 个节点，"
             f"模式：{'仅生成Diff' if self.batch_summary_regen_diff_only else '直接覆盖概要'}...</font>"
@@ -1041,6 +1088,7 @@ class GenerationMixin:
                         f"<font color='orange'>Diff 文件写入失败：{e}</font>"
                     )
             self._restore_generate_ui_state()
+            self._task_action_finish()
             self.log_console.append(
                 "<b><font color='green'>🎉 批量概要校验完成！"
                 f"成功：{self.batch_summary_regen_success_count} 个，"
@@ -1174,6 +1222,7 @@ class GenerationMixin:
             )
             self._process_next_batch_summary_node()
             return
+        self._task_action_finish()
         self._send_system_notification(
             "概要生成完成",
             f"《{target_title}》概要已生成完成。",
@@ -1214,6 +1263,8 @@ class GenerationMixin:
                 f"<font color='orange'>⚠️ 节点【{title}】概要校验失败，跳过并处理下一个...</font>"
             )
             self._process_next_batch_summary_node()
+        else:
+            self._task_action_finish()
 
     def _restore_generate_ui_state(self: "NovelCreatorWindow"):
         if not self.is_batch_generating and not getattr(
@@ -1344,6 +1395,12 @@ class GenerationMixin:
         self.batch_generate_queue = valid_nodes.copy()
         self.is_batch_generating = True
         self._is_batch_generation_context = True
+        self._task_action_begin(
+            "batch_generate",
+            f"批量生成正文（{len(valid_nodes)} 个节点）",
+            node_ids=[node.get("id", "") for node in valid_nodes],
+            reuse=False,
+        )
         self.btn_batch_generate.setText("\U0001f6d1 停止批量生成")
         self.log_console.append(
             f"<font color='cyan'>🚀 开始依次生成勾选正文，共 {len(self.batch_generate_queue)} 个节点...</font>"
@@ -1394,12 +1451,19 @@ class GenerationMixin:
             self.batch_generate_queue = missing_nodes
             self.is_batch_generating = True
             self._is_batch_generation_context = True
+            self._task_action_begin(
+                "batch_generate",
+                f"批量生成缺失场景（{len(missing_nodes)} 个节点）",
+                node_ids=[node.get("id", "") for node in missing_nodes],
+                reuse=False,
+            )
             self.btn_batch_generate.setText("\U0001f6d1 停止批量生成")
             self._process_next_batch_node()
 
     def _process_next_batch_node(self: "NovelCreatorWindow"):
         if not self.is_batch_generating:
             self._is_batch_generation_context = False
+            self._task_action_finish(TaskStatus.CANCELLED, "用户停止批量生成")
             return
 
         if not self.batch_generate_queue:
@@ -1411,6 +1475,7 @@ class GenerationMixin:
             self._smart_setting_selection_enabled = self._get_smart_setting_selection_enabled()
             self._batch_gen_use_cache = True
             self._batch_gen_use_smart_select = False
+            self._task_action_finish()
             self.log_console.append(
                 "<b><font color='green'>"
                 "\U0001f389 批量生成任务全部完成！"

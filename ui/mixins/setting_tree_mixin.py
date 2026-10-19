@@ -523,6 +523,12 @@ class SettingTreeMixin:
         self.modifying_setting_nodes.add(pending_id)
         self.btn_save.setEnabled(False)
         display_name = os.path.basename(file_path)
+        self._task_action_begin(
+            "modify_setting",
+            f"修改设定：{display_name}",
+            node_ids=[pending_id],
+            description=requirement,
+        )
         self.log_console.append(
             f"<font color='cyan'>开始修改设定【{display_name}】...</font>"
         )
@@ -544,7 +550,12 @@ class SettingTreeMixin:
             append_writing_style
         )
         self.setting_modify_thread = GenerateTaskThread(
-            self.llm_client, prompt, modify_system_instruction
+            self.llm_client,
+            prompt,
+            modify_system_instruction,
+            task_meta=self._task_meta(
+                "修改设定", {"id": pending_id, "title": display_name}
+            ),
         )
         self.setting_modify_thread.progress_signal.connect(
             lambda msg: self._on_llm_progress(msg)
@@ -567,6 +578,7 @@ class SettingTreeMixin:
         original_text: str,
         requirement: str,
     ):
+        self._task_action_finish()
         if hasattr(self, "modifying_setting_nodes") and pending_id in self.modifying_setting_nodes:
             self.modifying_setting_nodes.remove(pending_id)
         try:
@@ -594,6 +606,7 @@ class SettingTreeMixin:
     def on_modify_setting_error(
         self: "NovelCreatorWindow", error_msg: str, pending_id: str
     ):
+        self._task_action_finish()
         if hasattr(self, "modifying_setting_nodes") and pending_id in self.modifying_setting_nodes:
             self.modifying_setting_nodes.remove(pending_id)
         self.log_console.append(f"<font color='red'>设定修改失败: {error_msg}</font>")
@@ -804,6 +817,13 @@ class SettingTreeMixin:
         self.batch_setting_modify_inflight = 0
         self.batch_setting_modify_threads = {}
         self.btn_save.setEnabled(False)
+        self._task_action_begin(
+            "batch_modify_settings",
+            f"批量修改设定（{len(self.batch_setting_modify_queue)} 个）",
+            description=requirement,
+            reuse=False,
+            meta={"workers": thread_count},
+        )
 
         self.log_console.append(
             f"<font color='cyan'>🚀 开始批量修改设定，共 {len(self.batch_setting_modify_queue)} 个，"
@@ -859,7 +879,12 @@ class SettingTreeMixin:
                 self.batch_setting_modify_append_writing_style
             )
             thread = GenerateTaskThread(
-                self.llm_client, prompt, modify_system_instruction
+                self.llm_client,
+                prompt,
+                modify_system_instruction,
+                task_meta=self._task_meta(
+                    "批量修改设定", {"id": pending_id, "title": os.path.basename(file_path)}
+                ),
             )
             thread.progress_signal.connect(lambda msg: self._on_llm_progress(msg))
             thread.success_signal.connect(
@@ -937,6 +962,7 @@ class SettingTreeMixin:
             return
 
         self.is_batch_modifying_settings = False
+        self._task_action_finish()
         self.btn_save.setEnabled(True)
         self.log_console.append(
             f"<b><font color='green'>🎉 批量设定修改完成！成功：{self.batch_setting_modify_success_count}，"
@@ -976,6 +1002,13 @@ class SettingTreeMixin:
                     f"启动设定生成引擎，模式：{mode}。后台处理中，请稍候..."
                 )
                 self.btn_save.setEnabled(False)
+                self._task_action_begin(
+                    "world_build",
+                    f"生成世界观设定：{idea.strip()[:24]}",
+                    description=idea.strip(),
+                    reuse=False,
+                    meta={"mode": mode},
+                )
 
                 default_p1 = (
                     "你是一个资深的小说世界观设计师，擅长根据简短的点子构建丰富的背景设定。"
@@ -1013,6 +1046,7 @@ class SettingTreeMixin:
                 self.wb_thread.start()
 
     def on_world_building_success(self: "NovelCreatorWindow"):
+        self._task_action_finish()
         self.log_console.append(
             "<b><font color='green'>"
             "\U0001f389 自动设定生成完毕！已将设定文件分配至对应目录。"
@@ -1029,6 +1063,7 @@ class SettingTreeMixin:
         self.btn_save.setEnabled(True)
 
     def on_world_building_error(self: "NovelCreatorWindow", err_msg: str):
+        self._task_action_finish()
         self.log_console.append(
             f"<font color='red'>世界观生成中断或失败: {err_msg}</font>"
         )

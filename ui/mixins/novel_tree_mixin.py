@@ -1562,6 +1562,12 @@ class NovelTreeMixin:
                     settings_text=settings_text,
                     prompt_tpl=prompt_tpl,
                 )
+                self._task_action_begin(
+                    "outline",
+                    f"生成三级大纲：{idea.strip()[:24]}",
+                    description=idea.strip(),
+                    reuse=False,
+                )
                 self.ob_thread.progress_signal.connect(
                     lambda msg: self.log_console.append(
                         f"<font color='cyan'>{msg}</font>"
@@ -1574,6 +1580,8 @@ class NovelTreeMixin:
                 self.ob_thread.start()
 
     def on_outline_building_success(self: "NovelCreatorWindow", outline_data):
+        self._task_action_finish()
+
         def process_nodes(nodes, level):
             for node in nodes:
                 if "id" not in node:
@@ -1901,6 +1909,7 @@ class NovelTreeMixin:
         self.generate_thread = None
 
     def on_outline_building_error(self: "NovelCreatorWindow", err_msg: str):
+        self._task_action_finish()
         self.log_console.append(
             f"<font color='red'>大纲生成失败: {err_msg}</font>"
         )
@@ -2362,6 +2371,12 @@ class NovelTreeMixin:
         self.log_console.append(f"<font color='cyan'>开始修改节点【{real_node.get('title')}】的内容...</font>")
         self.btn_save.setEnabled(False)
         self.modifying_nodes.add(node_id)
+        self._task_action_begin(
+            "modify",
+            f"修改内容：{node_title}",
+            node_ids=[node_id],
+            description=requirement,
+        )
 
         checked_paths = self.get_checked_settings()
         settings_text = ""
@@ -2407,7 +2422,10 @@ class NovelTreeMixin:
 
         # 发送请求
         self.modify_thread = GenerateTaskThread(
-            self.llm_client, prompt, modify_system_instruction
+            self.llm_client,
+            prompt,
+            modify_system_instruction,
+            task_meta=self._task_meta("修改内容", real_node),
         )
         self.modify_thread.progress_signal.connect(
             lambda msg: self._on_llm_progress(msg)
@@ -2418,6 +2436,7 @@ class NovelTreeMixin:
 
     def on_modify_success(self: "NovelCreatorWindow", result: str, real_node: dict, node_id: str, original_text: str, requirement: str):
         """修改成功回调"""
+        self._task_action_finish()
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
         try:
@@ -2458,6 +2477,7 @@ class NovelTreeMixin:
 
     def on_modify_error(self: "NovelCreatorWindow", error_msg: str, node_id: str):
         """修改失败回调"""
+        self._task_action_finish()
         if hasattr(self, 'modifying_nodes') and node_id in self.modifying_nodes:
             self.modifying_nodes.remove(node_id)
         getattr(self, '_issue_submitting_map', {}).pop(node_id, None)
@@ -3099,6 +3119,16 @@ class NovelTreeMixin:
         self.is_batch_modifying = True
         self.batch_modify_requirement = requirement
         self.batch_modify_max_workers_raw = thread_count
+        self._task_action_begin(
+            "batch_modify",
+            f"批量修改正文（{len(valid_nodes)} 个节点）",
+            node_ids=[
+                node.get("id", "") for _item, node in valid_nodes if node.get("id")
+            ],
+            description=requirement,
+            reuse=False,
+            meta={"workers": thread_count, "smart_select": bool(use_smart_select)},
+        )
 
         self._batch_modify_node_settings: dict[str, str] = {}
 
@@ -3197,6 +3227,7 @@ class NovelTreeMixin:
             use_cache,
             self.get_checked_settings(),
             candidate_paths,
+            task_meta=self._task_meta("筛选设定", node),
         )
         self._batch_modify_sel_thread.progress_signal.connect(
             self._on_batch_modify_smart_sel_progress
@@ -3397,7 +3428,11 @@ class NovelTreeMixin:
 """
         
             # 发送请求
-            thread = GenerateTaskThread(self.llm_client, prompt)
+            thread = GenerateTaskThread(
+                self.llm_client,
+                prompt,
+                task_meta=self._task_meta("批量修改正文", next_node),
+            )
             thread.progress_signal.connect(lambda msg: self._on_llm_progress(msg))
             thread.success_signal.connect(
                 lambda result, n=next_node, nid=node_id, o=original_text: self.on_batch_modify_success(result, n, nid, o)
@@ -3432,6 +3467,7 @@ class NovelTreeMixin:
             f"success={self.batch_modify_success_count} fail={self.batch_modify_fail_count}",
         )
         self.is_batch_modifying = False
+        self._task_action_finish()
         self.btn_save.setEnabled(True)
         self.log_console.append(
             f"<b><font color='green'>🎉 批量修改完成！成功：{self.batch_modify_success_count} 个，"

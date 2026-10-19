@@ -40,6 +40,7 @@ class OutlineBuildingThread(QThread):
                 prompt,
                 override_system_instruction=json_sys_prompt,
                 progress_callback=self.progress_signal.emit,
+                task_meta={"label": "生成三级大纲"},
             )
             
             if res_raw and res_raw.strip().startswith("> **生成失败:**"):
@@ -99,6 +100,7 @@ class WorldBuildingThread(QThread):
                 prompt_1,
                 override_system_instruction=json_sys_prompt,
                 progress_callback=self.progress_signal.emit,
+                task_meta={"label": "规划世界观分类"},
             )
 
             if list_res_raw and list_res_raw.strip().startswith("> **生成失败:**"):
@@ -146,6 +148,7 @@ class WorldBuildingThread(QThread):
                     prompt_2,
                     override_system_instruction=json_sys_prompt,
                     progress_callback=self.progress_signal.emit,
+                    task_meta={"label": "扩写世界观细节"},
                 )
                 detail_res = clean_json_string(detail_res_raw)
                 
@@ -217,6 +220,7 @@ class IndexGenerateThread(QThread):
                 prompt,
                 override_system_instruction=json_sys_prompt,
                 progress_callback=self.progress_signal.emit,
+                task_meta={"label": "生成设定索引"},
             )
             res = clean_json_string(res_raw)
             
@@ -248,6 +252,7 @@ class SettingSelectionThread(QThread):
         checked_paths: list,
         candidate_paths: list,
         parent=None,
+        task_meta: dict | None = None,
     ):
         super().__init__(parent)
         self.llm_client = llm_client
@@ -258,6 +263,7 @@ class SettingSelectionThread(QThread):
         self.use_cache = use_cache
         self.checked_paths = checked_paths
         self.candidate_paths = candidate_paths
+        self.task_meta = dict(task_meta or {})
 
     @staticmethod
     def _parse_smart_setting_selection_ids(raw_text: str) -> list:
@@ -425,6 +431,10 @@ class SettingSelectionThread(QThread):
                 selector_prompt.strip(),
                 override_system_instruction=selector_sys,
                 progress_callback=self.progress_signal.emit,
+                task_meta={
+                    **self.task_meta,
+                    "label": self.task_meta.get("label") or "筛选设定",
+                },
             )
             selected_ids = self._parse_smart_setting_selection_ids(selected_raw)
             selected_paths = [
@@ -463,11 +473,13 @@ class GenerateTaskThread(QThread):
     success_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None):
+    def __init__(self, llm_client, prompt_content, override_system_instruction=None, parent=None,
+                 task_meta: dict | None = None):
         super().__init__(parent)
         self.llm_client = llm_client
         self.prompt_content = prompt_content
         self.override_system_instruction = override_system_instruction
+        self.task_meta = dict(task_meta or {})
 
     def run(self):
         try:
@@ -475,6 +487,7 @@ class GenerateTaskThread(QThread):
                 self.prompt_content,
                 override_system_instruction=self.override_system_instruction,
                 progress_callback=self.progress_signal.emit,
+                task_meta=self.task_meta or None,
             )
             # 【防雪崩修复】：拦截 llm_client 返回的文本格式错误信息
             if result and result.strip().startswith("> **生成失败:**"):
@@ -924,6 +937,7 @@ class ImportTextWorkspaceThread(QThread):
                     response = self.llm_client.generate_text(
                         prompt,
                         progress_callback=self.progress_signal.emit,
+                        task_meta={"label": "导入文本分段解析"},
                     )
                     json_match = re.search(r'\{[\s\S]*\}', response)
 
@@ -1088,6 +1102,7 @@ class ImportTextWorkspaceThread(QThread):
             response = self.llm_client.generate_text(
                 prompt,
                 progress_callback=self.progress_signal.emit,
+                task_meta={"label": "提取文本设定"},
             )
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:

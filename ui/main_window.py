@@ -8,11 +8,11 @@ from contextlib import contextmanager
 from typing import Any
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTextEdit,
+                             QHBoxLayout, QTreeWidget, QTextEdit,
                              QPushButton, QSplitter, QMenuBar, QMenu, QTextBrowser,
                              QLabel, QCheckBox, QSpinBox, QAbstractItemView,
-                             QProxyStyle, QStyle, QSizePolicy, QScrollArea, QFrame,
-                             QToolButton)
+                             QSizePolicy, QScrollArea, QFrame,
+                             QToolButton, QMessageBox)
 from PyQt6.QtGui import (
     QKeySequence,
     QAction,
@@ -21,7 +21,8 @@ from PyQt6.QtGui import (
     QTextCharFormat,
     QPalette,
 )
-from PyQt6.QtCore import Qt, QTimer, QEvent
+from PyQt6.QtCore import Qt, QTimer, QEvent, QUrl
+from PyQt6.QtGui import QDesktopServices
 
 # 导入暗色主题配色常量
 from ui.theme import TEXT_SECONDARY
@@ -33,6 +34,7 @@ from ui.timeline_dialog import TimelineDialog
 from core.llm_client import LLMClient
 from core.workspace_manager import WorkspaceManager
 from core.file_tracker import FileTracker
+from ui.utils import get_item_level
 
 # 导入 Mixin 子模块
 from ui.mixins import (
@@ -42,6 +44,7 @@ from ui.mixins import (
     NovelTreeMixin,
     GenerationMixin,
     EditorMixin,
+    TaskMixin,
 )
 
 class NovelTreeWidget(QTreeWidget):
@@ -197,30 +200,13 @@ class SafeLogBrowser(QTextBrowser):
         self.setCurrentCharFormat(fmt)
 
 
-class CompactTreeStyle(QProxyStyle):
-    """紧凑树样式：缩小复选框、展开箭头与缩进，提升可视空间。"""
-    def __init__(self, base_style=None, indicator_size=12, indentation=14):
-        super().__init__(base_style)
-        self._indicator_size = indicator_size
-        self._indentation = indentation
-
-    def pixelMetric(self, metric, option=None, widget=None):
-        if metric in (
-            QStyle.PixelMetric.PM_IndicatorWidth,
-            QStyle.PixelMetric.PM_IndicatorHeight,
-            QStyle.PixelMetric.PM_SmallIconSize,
-        ):
-            return self._indicator_size
-        if metric == QStyle.PixelMetric.PM_TreeViewIndentation:
-            return self._indentation
-        return super().pixelMetric(metric, option, widget)
-
 class NovelCreatorWindow(
     EditorMixin,
     GenerationMixin,
     NovelTreeMixin,
     SettingTreeMixin,
     WorkspaceMixin,
+    TaskMixin,
     ConfigMixin,
     QMainWindow,
 ):
@@ -273,7 +259,8 @@ class NovelCreatorWindow(
         self.file_tracker = FileTracker()
 
         self.config = self._load_config()
-        self.llm_client: LLMClient | None = LLMClient(self.config) if self.config else None
+        self._configure_task_queue()
+        self.llm_client: LLMClient | None = self._create_llm_client()
 
         self.init_ui()
         self._ui_state_save_timer = QTimer(self)
@@ -323,44 +310,7 @@ class NovelCreatorWindow(
         # 显式创建 QMenuBar，避免 Pylance 认为其可能为 None
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
-        file_menu = QMenu('文件', self)
-        menubar.addMenu(file_menu)
-
-        new_action = QAction('新建工作区', self)
-        new_action.setShortcut(QKeySequence("Ctrl+N"))
-        file_menu.addAction(new_action)
-        new_action.triggered.connect(self.new_workspace)
-
-        load_action = QAction('加载工作区', self)
-        load_action.setShortcut(QKeySequence("Ctrl+O"))
-        file_menu.addAction(load_action)
-        load_action.triggered.connect(self.load_workspace)
-
-        reload_action = QAction('重载工作区', self)
-        reload_action.setShortcut(QKeySequence("Ctrl+R"))
-        file_menu.addAction(reload_action)
-        reload_action.triggered.connect(self.reload_workspace)
-
-        save_action = QAction('保存全部', self)
-        file_menu.addAction(save_action)
-        save_action.setShortcut(QKeySequence("Ctrl+S"))
-        save_action.triggered.connect(self.save_all)
-        
-        export_html_action = QAction('🌐 导出为可阅读网页 (HTML)', self)
-        file_menu.addAction(export_html_action)
-        export_html_action.setShortcut(QKeySequence("Ctrl+E"))
-        export_html_action.triggered.connect(self.export_to_html)
-
-        export_epub_action = QAction('📖 导出为 EPUB 电子书', self)
-        file_menu.addAction(export_epub_action)
-        export_epub_action.triggered.connect(self.export_to_epub)
-        
-        setting_menu = QMenu('设置', self)
-        menubar.addMenu(setting_menu)
-        settings_action = QAction('系统配置 (API/模型)', self)
-        setting_menu.addAction(settings_action)
-        settings_action.setShortcut(QKeySequence("Ctrl+P"))
-        settings_action.triggered.connect(self.open_settings_dialog)
+        self._build_menus(menubar)
 
         nsfw_corner_widget = QWidget(self)
         nsfw_corner_layout = QHBoxLayout(nsfw_corner_widget)
@@ -377,32 +327,6 @@ class NovelCreatorWindow(
         self.cb_workspace_nsfw.toggled.connect(self.on_workspace_nsfw_toggled)
         nsfw_corner_layout.addWidget(self.cb_workspace_nsfw)
         menubar.setCornerWidget(nsfw_corner_widget, Qt.Corner.TopRightCorner)
-
-        # 添加工具菜单
-        tool_menu = QMenu('工具', self)
-        menubar.addMenu(tool_menu)
-        import_text_action = QAction('从文本新建工作区', self)
-        tool_menu.addAction(import_text_action)
-        import_text_action.triggered.connect(self.new_workspace_from_text)
-        repair_outline_action = QAction('修复章节结构(补节后可新增场景)', self)
-        tool_menu.addAction(repair_outline_action)
-        repair_outline_action.triggered.connect(self.auto_fix_outline_for_scene_addition)
-        debug_log_action = QAction('显示 Debug Log', self)
-        tool_menu.addAction(debug_log_action)
-        debug_log_action.setCheckable(True)
-        debug_log_action.setChecked(self._debug_log_enabled)
-        debug_log_action.toggled.connect(self.set_debug_log_enabled)
-        timeline_action = QAction('时间线校对', self)
-        tool_menu.addAction(timeline_action)
-        timeline_action.triggered.connect(self.open_timeline_dialog)
-        proofread_action = QAction('小说校对（独立模块）', self)
-        tool_menu.addAction(proofread_action)
-        proofread_action.triggered.connect(self.open_proofread_tool_entry)
-
-        tool_menu.addSeparator()
-        batch_merge_all_action = QAction('一键全部合并待修改内容', self)
-        tool_menu.addAction(batch_merge_all_action)
-        batch_merge_all_action.triggered.connect(self.batch_merge_all_pending)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -429,10 +353,15 @@ class NovelCreatorWindow(
         self.novel_tree.setItemsExpandable(True)
         self.novel_tree.setRootIsDecorated(True)
         self.novel_tree.setExpandsOnDoubleClick(True)
-        self.novel_tree.setStyle(
-            CompactTreeStyle(self.novel_tree.style(), indicator_size=12, indentation=14)
+        # 说明：旧实现用 QProxyStyle(CompactTreeStyle) 缩小勾选框/缩进，
+        # 但 Python 侧创建的 QProxyStyle 在进程退出时会被析构，导致
+        # Windows 上出现 STATUS_STACK_BUFFER_OVERRUN 崩溃（退出码 0xC0000409）。
+        # 改用 QTreeView 自带的 indentation 与样式表，行为一致且不会崩溃。
+        self.novel_tree.setIndentation(14)
+        self.novel_tree.setStyleSheet(
+            "QTreeWidget { font-size: 12px; }"
+            "QTreeView::indicator { width: 12px; height: 12px; }"
         )
-        self.novel_tree.setStyleSheet("QTreeWidget { font-size: 12px; }")
 
         self.novel_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.novel_tree.customContextMenuRequested.connect(self.show_novel_context_menu)
@@ -643,6 +572,261 @@ class NovelCreatorWindow(
         self.log_console.setFixedHeight(150)
         self.log_console.append("系统初始化完成。")
         main_layout.addWidget(self.log_console, stretch=1)
+
+        # ================= 状态栏：任务队列入口 =================
+        statusbar = self.statusBar()
+        self.btn_task_queue = QPushButton("📋 任务队列")
+        self.btn_task_queue.setFlat(True)
+        self.btn_task_queue.setToolTip("查看每个动作下所有原子任务的输入/输出（Ctrl+T）")
+        self.btn_task_queue.clicked.connect(self.open_task_queue_dialog)
+        statusbar.addPermanentWidget(self.btn_task_queue)
+        self.task_status_label = QLabel("")
+        self.task_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; padding-right: 6px;")
+        statusbar.addPermanentWidget(self.task_status_label)
+        self._task_status_timer = QTimer(self)
+        self._task_status_timer.setInterval(5000)
+        self._task_status_timer.timeout.connect(self._update_task_status_label)
+        self._task_status_timer.start()
+        self._update_task_status_label()
+
+    # ================= 菜单 ================= #
+
+    def _build_menus(self, menubar: QMenuBar):
+        """统一构建菜单栏：文件 / 编辑 / 视图 / 生成 / 工具 / 设置 / 帮助。"""
+        self.menus: dict[str, QMenu] = {}
+
+        def _action(menu, text, slot, shortcut=None, checkable=False, checked=False,
+                    attr_name=None):
+            action = QAction(text, self)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            if checkable:
+                action.setCheckable(True)
+                action.setChecked(checked)
+            if slot is not None:
+                # 可勾选动作监听 toggled，保证程序化 setChecked 也能生效
+                if checkable:
+                    action.toggled.connect(slot)
+                else:
+                    action.triggered.connect(slot)
+            menu.addAction(action)
+            if attr_name:
+                setattr(self, attr_name, action)
+            return action
+
+        # ---------------- 文件 ----------------
+        file_menu = menubar.addMenu("文件")
+        self.menus["文件"] = file_menu
+        _action(file_menu, "新建工作区", self.new_workspace, "Ctrl+N",
+                attr_name="action_new_workspace")
+        _action(file_menu, "打开工作区…", self.load_workspace, "Ctrl+O",
+                attr_name="action_load_workspace")
+        _action(file_menu, "重载工作区", self.reload_workspace, "Ctrl+R",
+                attr_name="action_reload_workspace")
+        file_menu.addSeparator()
+        _action(file_menu, "保存全部", self.save_all, "Ctrl+S",
+                attr_name="action_save_all")
+        export_menu = file_menu.addMenu("导出")
+        self.menus["导出"] = export_menu
+        _action(export_menu, "🌐 导出为可阅读网页 (HTML)", self.export_to_html, "Ctrl+E",
+                attr_name="action_export_html")
+        _action(export_menu, "📖 导出为 EPUB 电子书", self.export_to_epub,
+                attr_name="action_export_epub")
+        file_menu.addSeparator()
+        _action(file_menu, "在资源管理器中打开工作区", self.open_workspace_folder,
+                attr_name="action_open_workspace_folder")
+        file_menu.addSeparator()
+        _action(file_menu, "退出", self.close, "Ctrl+Q", attr_name="action_quit")
+
+        # ---------------- 编辑 ----------------
+        edit_menu = menubar.addMenu("编辑")
+        self.menus["编辑"] = edit_menu
+        _action(edit_menu, "保存当前节点", self.save_current_node, "Ctrl+Shift+S",
+                attr_name="action_save_node")
+        _action(edit_menu, "删除当前节点", self.delete_current_node,
+                attr_name="action_delete_node")
+        edit_menu.addSeparator()
+        _action(edit_menu, "后退一步（撤销本节点修改）", self.undo_last_change, "Ctrl+Z",
+                attr_name="action_undo")
+        edit_menu.addSeparator()
+        _action(edit_menu, "全选大纲节点", self.select_all_nodes,
+                attr_name="action_select_all_nodes")
+        _action(edit_menu, "全不选大纲节点", self.select_none_nodes,
+                attr_name="action_select_none_nodes")
+
+        # ---------------- 视图 ----------------
+        view_menu = menubar.addMenu("视图")
+        self.menus["视图"] = view_menu
+        _action(view_menu, "世界观设定面板",
+                lambda checked: self.setting_tree.setVisible(checked),
+                checkable=True, checked=True, attr_name="action_view_settings")
+        _action(view_menu, "小说大纲面板",
+                lambda checked: self.novel_tree.setVisible(checked),
+                checkable=True, checked=True, attr_name="action_view_outline")
+        _action(view_menu, "编辑区",
+                lambda checked: self.editor_splitter.setVisible(checked),
+                checkable=True, checked=True, attr_name="action_view_editor")
+        _action(view_menu, "日志面板",
+                lambda checked: self.log_console.setVisible(checked),
+                checkable=True, checked=True, attr_name="action_view_log")
+        _action(view_menu, "Issue 面板",
+                lambda checked: self._set_issue_panel_visible(checked),
+                checkable=True, checked=False, attr_name="action_view_issue")
+        view_menu.addSeparator()
+        self.action_debug_log = QAction("显示 Debug Log", self)
+        self.action_debug_log.setCheckable(True)
+        self.action_debug_log.setChecked(self._debug_log_enabled)
+        self.action_debug_log.toggled.connect(self.set_debug_log_enabled)
+        view_menu.addAction(self.action_debug_log)
+        view_menu.addSeparator()
+        _action(view_menu, "重置界面布局", self.reset_window_layout,
+                attr_name="action_reset_layout")
+
+        # ---------------- 生成 ----------------
+        generate_menu = menubar.addMenu("生成")
+        self.menus["生成"] = generate_menu
+        _action(generate_menu, "结合上下文生成正文", self.generate_current_node, "Ctrl+G",
+                attr_name="action_generate")
+        _action(generate_menu, "基于原文重写（扩写/缩写）", self.rewrite_current_node,
+                "Ctrl+Shift+R", attr_name="action_rewrite")
+        _action(generate_menu, "重新生成概要", self.regenerate_summary,
+                attr_name="action_regenerate_summary")
+        generate_menu.addSeparator()
+        _action(generate_menu, "批量生成缺失场景", self.start_batch_generate,
+                attr_name="action_batch_generate")
+        _action(generate_menu, "依次生成勾选节点正文",
+                self._menu_batch_generate_checked,
+                attr_name="action_batch_generate_checked")
+        _action(generate_menu, "批量校验勾选节点概要",
+                self._menu_batch_summary_checked,
+                attr_name="action_batch_summary")
+        _action(generate_menu, "批量修改勾选节点正文",
+                self._menu_batch_modify_checked,
+                attr_name="action_batch_modify")
+
+        # ---------------- 工具 ----------------
+        tool_menu = menubar.addMenu("工具")
+        self.menus["工具"] = tool_menu
+        _action(tool_menu, "📋 任务队列（动作 / 任务追踪）", self.open_task_queue_dialog,
+                "Ctrl+T", attr_name="action_task_queue")
+        tool_menu.addSeparator()
+        _action(tool_menu, "小说校对（独立模块）", self.open_proofread_tool_entry,
+                attr_name="action_proofread")
+        _action(tool_menu, "时间线校对", self.open_timeline_dialog,
+                attr_name="action_timeline")
+        tool_menu.addSeparator()
+        _action(tool_menu, "修复章节结构（补节后可新增场景）",
+                self.auto_fix_outline_for_scene_addition,
+                attr_name="action_repair_outline")
+        _action(tool_menu, "一键全部合并待修改内容", self.batch_merge_all_pending,
+                attr_name="action_merge_all_pending")
+        tool_menu.addSeparator()
+        _action(tool_menu, "从文本新建工作区", self.new_workspace_from_text,
+                attr_name="action_new_workspace_from_text")
+        _action(tool_menu, "输入点子生成世界观设定",
+                lambda: self.open_world_building_dialog("init"),
+                attr_name="action_world_build")
+        _action(tool_menu, "生成三级大纲结构", self.open_outline_building_dialog,
+                attr_name="action_outline_build")
+
+        # ---------------- 设置 ----------------
+        setting_menu = menubar.addMenu("设置")
+        self.menus["设置"] = setting_menu
+        _action(setting_menu, "系统配置（网络 / 通知 / 指令）", self.open_settings_dialog,
+                "Ctrl+P", attr_name="action_settings")
+        _action(setting_menu, "模型服务（提供商 / 模型 / 参数）",
+                self.open_model_manager_dialog, "Ctrl+M",
+                attr_name="action_model_service")
+        setting_menu.addSeparator()
+        _action(setting_menu, "启用 NSFW 工作区配置",
+                self._menu_toggle_workspace_nsfw, checkable=True,
+                attr_name="action_nsfw_workspace")
+
+        # ---------------- 帮助 ----------------
+        help_menu = menubar.addMenu("帮助")
+        self.menus["帮助"] = help_menu
+        _action(help_menu, "使用说明（README）", self._open_readme,
+                attr_name="action_help")
+        _action(help_menu, "关于 AI 小说创作器", self._show_about,
+                attr_name="action_about")
+
+    # -- 菜单辅助动作 -------------------------------------------------
+    def _set_issue_panel_visible(self, checked: bool):
+        if checked and not self.issue_panel_frame.isVisible():
+            self._toggle_issue_panel()
+        elif not checked and self.issue_panel_frame.isVisible():
+            self._toggle_issue_panel()
+
+    def reset_window_layout(self):
+        """恢复默认分栏比例与面板可见性。"""
+        for widget in (self.setting_tree, self.novel_tree):
+            widget.setVisible(True)
+        self.editor_splitter.setVisible(True)
+        self.log_console.setVisible(True)
+        self.main_splitter.setSizes([180, 430, 590])
+        self.editor_splitter.setSizes([300, 700])
+        for name in ("action_view_settings", "action_view_outline",
+                     "action_view_editor", "action_view_log"):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(True)
+                action.blockSignals(False)
+        self.log_console.append("界面布局已重置。")
+
+    def _menu_batch_generate_checked(self):
+        nodes = self._collect_checked_novel_nodes()
+        level3 = [(item, node) for item, node in nodes if get_item_level(item) == 3]
+        if not level3:
+            QMessageBox.information(
+                self, "提示", "请先在大纲树中勾选至少一个 3 级场景节点。"
+            )
+            return
+        self.start_batch_generate_checked_nodes(nodes)
+
+    def _menu_batch_summary_checked(self):
+        nodes = self._collect_checked_novel_nodes()
+        level3 = [(item, node) for item, node in nodes if get_item_level(item) == 3]
+        if not level3:
+            QMessageBox.information(
+                self, "提示", "请先在大纲树中勾选至少一个 3 级场景节点。"
+            )
+            return
+        self.start_batch_regenerate_summaries_checked_nodes(nodes)
+
+    def _menu_batch_modify_checked(self):
+        nodes = self._collect_checked_novel_nodes()
+        if not nodes:
+            QMessageBox.information(
+                self, "提示", "请先在大纲树中勾选要修改的节点。"
+            )
+            return
+        self.open_batch_modify_request_dialog(nodes)
+
+    def _sync_nsfw_menu_action(self, checked: bool):
+        action = getattr(self, "action_nsfw_workspace", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(bool(checked))
+            action.blockSignals(False)
+
+    def _open_readme(self):
+        readme = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "README.md")
+        if os.path.exists(readme):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(readme))
+        else:
+            QMessageBox.information(self, "使用说明", "未找到 README.md。")
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            "关于 AI 小说创作器",
+            "AI 小说创作器（novel-maker）\n\n"
+            "PyQt6 桌面端 AI 辅助小说创作工具。\n"
+            "支持提供商 → 模型两级配置、按模型计算 token 预算、"
+            "动作/任务队列追踪。\n\n"
+            "版本：1.1.0",
+        )
 
     # ================= UI 刷新总调度 ================= #
 
@@ -914,6 +1098,22 @@ class NovelCreatorWindow(
             rows = min(count, 6)
             self.issue_panel_frame.setFixedHeight(40 + rows * 110 + 12)
             self.issue_toggle_btn.setArrowType(Qt.ArrowType.DownArrow)
+        action = getattr(self, "action_view_issue", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(self.issue_panel_frame.isVisible())
+            action.blockSignals(False)
+
+    def _menu_toggle_workspace_nsfw(self, checked: bool):
+        if not self.workspace:
+            QMessageBox.information(self, "提示", "请先加载工作区。")
+            action = getattr(self, "action_nsfw_workspace", None)
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(bool(self._workspace_is_nsfw))
+                action.blockSignals(False)
+            return
+        self.cb_workspace_nsfw.setChecked(bool(checked))
 
 
 if __name__ == '__main__':
