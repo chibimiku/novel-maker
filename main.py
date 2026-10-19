@@ -39,7 +39,7 @@ def main():
     
     # 可选：设置应用程序的全局属性
     app.setApplicationName("AI Novel Creator")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
     
     # 应用暗色主题
     app.setStyle("Fusion")  # Fusion 风格是暗色主题的最佳基础
