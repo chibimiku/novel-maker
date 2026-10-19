@@ -6,6 +6,7 @@ import os
 import sys
 from typing import Any
 
+from core.config_store import build_runtime_config
 from core.llm_client import LLMClient
 from core.workspace_manager import WorkspaceManager
 
@@ -47,8 +48,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     config = _load_json(config_path)
+    # 兼容旧版只有 text_api 的配置：统一迁移为 provider → model 二级结构
+    config = build_runtime_config(config)
     workspace = WorkspaceManager(workspace_path)
-    llm_client = LLMClient(config)
+    llm_client = LLMClient(config, workspace_path=workspace_path)
     engine = create_default_engine(workspace=workspace, llm_client=llm_client, config=config)
 
     if args.mode == "find":

@@ -76,6 +76,7 @@ docs/build/
 # 本地配置文件（特别为你添加）
 conf/setting.json
 conf/sys_state.json
+conf/token_calibration.json
 config.json
 settings.json
 *.local.json
@@ -85,6 +86,9 @@ settings.json
 .env.development
 .env.production
 credentials.json
+
+# 应用运行时数据（任务队列等）
+data/task_queue/
 
 # 其他常见忽略
 *.bak

@@ -1,0 +1,4 @@
+# 开发 / 测试依赖（运行程序本身只需 requirements.txt）
+-r requirements.txt
+
+pytest>=8.0
