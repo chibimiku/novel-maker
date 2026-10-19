@@ -3129,6 +3129,7 @@ class NovelTreeMixin:
             reuse=False,
             meta={"workers": thread_count, "smart_select": bool(use_smart_select)},
         )
+        self._plan_tasks("批量修改正文", [node for _item, node in valid_nodes])
 
         self._batch_modify_node_settings: dict[str, str] = {}
 

@@ -63,6 +63,76 @@ class FakeOpenAI:
 
 
 # ---------------------------------------------------------------------------
+# 假的 google-genai 新版 SDK
+# ---------------------------------------------------------------------------
+
+class FakeGeminiResponse:
+    def __init__(self, text, finish_reason="STOP", prompt_tokens=10, completion_tokens=5):
+        self.text = text
+        self.candidates = [types.SimpleNamespace(finish_reason=finish_reason)]
+        self.usage_metadata = types.SimpleNamespace(
+            prompt_token_count=prompt_tokens,
+            candidates_token_count=completion_tokens,
+            total_token_count=prompt_tokens + completion_tokens,
+        )
+
+
+class FakeGeminiChat:
+    def __init__(self, responses, calls, model, config, history):
+        self._responses = list(responses)
+        self._calls = calls
+        self.model = model
+        self.config = config
+        self.history = history
+
+    def send_message(self, message):
+        self._calls.append({"message": message, "model": self.model, "config": self.config})
+        if not self._responses:
+            raise AssertionError("Gemini 请求次数超过预期")
+        return self._responses.pop(0)
+
+
+class FakeGeminiChats:
+    def __init__(self, responses, calls):
+        self._responses = responses
+        self._calls = calls
+
+    def create(self, model, config, history):
+        return FakeGeminiChat(self._responses, self._calls, model, config, history)
+
+
+class FakeGeminiClient:
+    instances = []
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.chats = FakeGeminiChats(FakeGeminiClient.responses, FakeGeminiClient.calls)
+        FakeGeminiClient.instances.append(self)
+
+
+def install_fake_genai(monkeypatch, responses):
+    import sys
+    import types as pytypes
+
+    FakeGeminiClient.responses = list(responses)
+    FakeGeminiClient.calls = []
+    FakeGeminiClient.instances = []
+    fake_google = pytypes.ModuleType("google")
+    fake_genai = pytypes.ModuleType("google.genai")
+    fake_types = pytypes.SimpleNamespace(
+        GenerateContentConfig=lambda **kwargs: ("config", kwargs),
+        Content=lambda role, parts: ("content", role, parts),
+        Part=lambda text: ("part", text),
+    )
+    fake_genai.Client = FakeGeminiClient
+    fake_genai.types = fake_types
+    fake_google.genai = fake_genai
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    return FakeGeminiClient
+
+
+# ---------------------------------------------------------------------------
 # 配置 fixture
 # ---------------------------------------------------------------------------
 
@@ -360,6 +430,65 @@ class LLMClientTests(unittest.TestCase):
         )
         self.assertIn("GPT-4o", runtime.label())
         self.assertEqual(runtime.token_budget().max_output_tokens, 4096)
+
+
+# ---------------------------------------------------------------------------
+# Gemini（google-genai 新版 SDK）
+# ---------------------------------------------------------------------------
+
+def test_gemini_uses_new_sdk_and_sends_config(monkeypatch, tmp_path):
+    install_fake_genai(monkeypatch, [FakeGeminiResponse("你好，世界")])
+    cfg = make_config(
+        api_type="gemini",
+        supported_params=["temperature", "max_tokens"],
+        params={"temperature": 0.4, "max_tokens": 500},
+    )
+    queue = TaskQueue(str(tmp_path / "queue"))
+    client = LLMClient(cfg, task_queue=queue)
+    client._save_calibration = lambda: None
+
+    result = client.generate_text("写一段")
+
+    assert result == "你好，世界"
+    assert FakeGeminiClient.instances[0].api_key == "sk-test"
+    call = FakeGeminiClient.calls[0]
+    assert call["model"] == "test-model"
+    config_kwargs = call["config"][1]
+    assert config_kwargs["system_instruction"] == "你是系统提示"
+    assert config_kwargs["max_output_tokens"] == 500
+    assert config_kwargs["temperature"] == 0.4
+
+    action = queue.load_action(queue.list_actions()[0]["action_id"])
+    task = action["tasks"][0]
+    assert task["api_type"] == "gemini"
+    assert task["output_text"] == "你好，世界"
+    assert task["usage"]["prompt_tokens"] == 10
+
+
+def test_gemini_continuation_on_max_tokens(monkeypatch, tmp_path):
+    install_fake_genai(
+        monkeypatch,
+        [
+            FakeGeminiResponse("前半段", finish_reason="MAX_TOKENS"),
+            FakeGeminiResponse("后半段", finish_reason="STOP"),
+        ],
+    )
+    cfg = make_config(api_type="gemini", supported_params=["temperature"], params={"temperature": 0.4})
+    queue = TaskQueue(str(tmp_path / "queue"))
+    client = LLMClient(cfg, task_queue=queue)
+    client._save_calibration = lambda: None
+
+    assert client.generate_text("写长文") == "前半段后半段"
+    assert len(FakeGeminiClient.calls) == 2
+    action = queue.load_action(queue.list_actions()[0]["action_id"])
+    assert len(action["tasks"][0]["attempts"]) == 1
+
+
+def test_finish_reason_normalization():
+    assert LLMClient._normalize_finish_reason("FinishReason.MAX_TOKENS") == "length"
+    assert LLMClient._normalize_finish_reason("STOP") == "stop"
+    assert LLMClient._normalize_finish_reason(None) is None
+    assert LLMClient._normalize_finish_reason("SAFETY") == "content_filter"
 
 
 if __name__ == "__main__":

@@ -390,6 +390,12 @@ class TaskQueue:
             if action is None:
                 self._active_action_id = None
                 return ""
+            # 动作收尾时，仍未执行的排队任务标记为“已取消”
+            for task in action.get("tasks", []):
+                if task.get("status") == TaskStatus.PENDING:
+                    task["status"] = TaskStatus.CANCELLED
+                    task["error"] = task.get("error") or "动作结束时该任务尚未执行"
+                    task["finished_at"] = now_iso()
             if status is None:
                 statuses = [task.get("status") for task in action.get("tasks", [])]
                 if not statuses:
@@ -398,8 +404,10 @@ class TaskQueue:
                     status = TaskStatus.RUNNING
                 elif all(item == TaskStatus.SUCCESS for item in statuses):
                     status = TaskStatus.SUCCESS
-                elif any(item == TaskStatus.SUCCESS for item in statuses):
+                elif any(item == TaskStatus.FAILED for item in statuses):
                     status = TaskStatus.FAILED
+                elif any(item == TaskStatus.CANCELLED for item in statuses):
+                    status = TaskStatus.CANCELLED
                 else:
                     status = statuses[-1] if statuses else TaskStatus.FAILED
             action["status"] = status
@@ -434,8 +442,13 @@ class TaskQueue:
         user_prompt: str = "",
         context_messages: list | None = None,
         extra: dict | None = None,
+        task_id: str | None = None,
     ) -> str:
-        """创建一个排队中的原子任务，返回 task_id。"""
+        """创建一个排队中的原子任务，返回 task_id。
+
+        传入 ``task_id`` 时表示“认领”一个已规划（pending）的任务：复用原记录，
+        补全模型/提示词等字段，保留原序号与创建时间。
+        """
         with self._lock:
             self._load_index()
             target_action_id = action_id or self._active_action_id
@@ -450,8 +463,19 @@ class TaskQueue:
                 action = self._get_action(target_action_id)
             assert action is not None
 
-            task_id = f"tk_{uuid.uuid4().hex[:12]}"
-            seq = len(action.get("tasks", [])) + 1
+            existing_task = None
+            if task_id:
+                for candidate in action.get("tasks", []):
+                    if candidate.get("task_id") == task_id:
+                        existing_task = candidate
+                        break
+                if existing_task is None:
+                    # 允许跨动作认领（动作被切换后仍能补全记录）
+                    owner, existing_task = self._resolve_task(task_id, None)
+                    if existing_task is not None and owner is not None:
+                        action = owner
+                        target_action_id = owner["action_id"]
+
             model_info = {
                 "provider_id": provider_id or getattr(runtime, "provider_id", ""),
                 "provider_name": provider_name or getattr(runtime, "provider_name", ""),
@@ -465,10 +489,7 @@ class TaskQueue:
                 if isinstance(params, dict)
                 else dict(getattr(runtime, "params", {}) or {})
             )
-            task = {
-                "task_id": task_id,
-                "action_id": target_action_id,
-                "seq": seq,
+            fields = {
                 "label": str(label or "模型请求"),
                 "node_id": str(node_id) if node_id else "",
                 "node_title": str(node_title) if node_title else "",
@@ -483,7 +504,6 @@ class TaskQueue:
                 "estimated_output_tokens": 0,
                 "usage": {},
                 "status": TaskStatus.PENDING,
-                "created_at": now_iso(),
                 "started_at": "",
                 "finished_at": "",
                 "duration_ms": None,
@@ -495,7 +515,26 @@ class TaskQueue:
                 "attempts": [],
                 "extra": copy.deepcopy(extra) if isinstance(extra, dict) else {},
             }
-            action.setdefault("tasks", []).append(task)
+
+            if existing_task is not None:
+                # 认领已规划任务：保留 task_id / seq / created_at
+                existing_task.update(fields)
+                if not existing_task.get("node_id"):
+                    existing_task["node_id"] = str(node_id) if node_id else ""
+                if not existing_task.get("node_title"):
+                    existing_task["node_title"] = str(node_title) if node_title else ""
+                result_task_id = existing_task["task_id"]
+            else:
+                result_task_id = f"tk_{uuid.uuid4().hex[:12]}"
+                task = {
+                    "task_id": result_task_id,
+                    "action_id": target_action_id,
+                    "seq": len(action.get("tasks", [])) + 1,
+                    "created_at": now_iso(),
+                    **fields,
+                }
+                action.setdefault("tasks", []).append(task)
+
             models = action.setdefault("models", [])
             label_text = model_info["model"] or ""
             if label_text and label_text not in models:
@@ -509,7 +548,30 @@ class TaskQueue:
                 if str(node_id) not in node_ids:
                     node_ids.append(str(node_id))
             self._persist_action(action)
-            return task_id
+            return result_task_id
+
+    def plan_task(
+        self,
+        label: str,
+        *,
+        action_id: str | None = None,
+        node_id: str | None = None,
+        node_title: str | None = None,
+        extra: dict | None = None,
+    ) -> str:
+        """预先创建一个 pending 任务（批量动作开始时使用）。
+
+        实际发起请求时通过 ``create_task(..., task_id=...)`` 认领并补全输入，
+        这样界面上能提前看到完整的任务清单。
+        """
+        return self.create_task(
+            label,
+            action_id=action_id,
+            node_id=node_id,
+            node_title=node_title,
+            user_prompt="（排队中，尚未执行）",
+            extra={**(extra or {}), "planned": True},
+        )
 
     def _find_task(self, action_id: str, task_id: str) -> tuple[dict | None, dict | None]:
         action = self._get_action(action_id)

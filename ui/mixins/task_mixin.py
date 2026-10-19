@@ -52,7 +52,41 @@ class TaskMixin:
             pass
         finally:
             self._active_task_action_id = None
+            self._planned_task_map = {}
             self._update_task_status_label()
+
+    def _plan_task(self: Any, label: str, node: dict | None = None) -> str:
+        """为批量动作预先登记一个 pending 任务，返回 task_id。"""
+        action_id = getattr(self, "_active_task_action_id", None)
+        if not action_id:
+            return ""
+        node = node if isinstance(node, dict) else {}
+        node_id = str(node.get("id", "") or "")
+        try:
+            task_id = self._task_queue().plan_task(
+                label,
+                action_id=action_id,
+                node_id=node_id,
+                node_title=str(node.get("title", "") or ""),
+            )
+        except Exception:
+            return ""
+        planned = getattr(self, "_planned_task_map", None)
+        if planned is None:
+            planned = {}
+            self._planned_task_map = planned
+        planned[(label, node_id)] = task_id
+        return task_id
+
+    def _plan_tasks(self: Any, label: str, nodes: list[dict]) -> list[str]:
+        """批量登记 pending 任务，让界面在动作开始时就能看到完整清单。"""
+        task_ids = [
+            task_id
+            for task_id in (self._plan_task(label, node) for node in nodes or [])
+            if task_id
+        ]
+        self._update_task_status_label()
+        return task_ids
 
     def _task_action_note(self, note: str):
         action_id = getattr(self, "_active_task_action_id", None)
@@ -78,6 +112,12 @@ class TaskMixin:
             meta["node_id"] = node.get("id", "")
             meta["node_title"] = node.get("title", "")
         meta.update(extra)
+        planned = getattr(self, "_planned_task_map", None)
+        if planned:
+            key = (label, str(meta.get("node_id", "") or ""))
+            task_id = planned.pop(key, None)
+            if task_id:
+                meta["task_id"] = task_id
         return meta
 
     def _task_status_summary(self: Any) -> str:
@@ -110,4 +150,5 @@ class TaskMixin:
     def _reset_task_action(self: Any):
         """切换工作区等场景下丢弃当前动作引用（不结束已落盘动作）。"""
         self._active_task_action_id = None
+        self._planned_task_map = {}
         self._update_task_status_label()

@@ -73,6 +73,51 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.load_action(action_id)["status"], TaskStatus.FAILED)
 
     # -- 任务 ---------------------------------------------------------
+    def test_plan_and_claim_task(self):
+        action_id = self._create_action()
+        planned = self.queue.plan_task(
+            "生成正文", action_id=action_id, node_id="n1", node_title="第1节"
+        )
+        action = self.queue.load_action(action_id)
+        self.assertEqual(len(action["tasks"]), 1)
+        self.assertEqual(action["tasks"][0]["task_id"], planned)
+        self.assertEqual(action["tasks"][0]["status"], TaskStatus.PENDING)
+        self.assertIn("排队", action["tasks"][0]["user_prompt"])
+
+        claimed = self.queue.create_task(
+            "生成正文",
+            action_id=action_id,
+            node_id="n1",
+            node_title="第1节",
+            user_prompt="真正发出去的提示词",
+            task_id=planned,
+        )
+        self.assertEqual(claimed, planned)
+        action = self.queue.load_action(action_id)
+        self.assertEqual(len(action["tasks"]), 1)
+        task = action["tasks"][0]
+        self.assertEqual(task["seq"], 1)
+        self.assertEqual(task["user_prompt"], "真正发出去的提示词")
+        self.assertEqual(task["status"], TaskStatus.PENDING)
+
+    def test_finish_action_cancels_pending_tasks(self):
+        action_id = self._create_action()
+        done = self._create_task(action_id, node_id="n1")
+        self.queue.complete_task(done, "ok")
+        pending = self.queue.plan_task("生成正文", action_id=action_id, node_id="n2")
+        self.queue.finish_action(action_id)
+        action = self.queue.load_action(action_id)
+        by_id = {task["task_id"]: task for task in action["tasks"]}
+        self.assertEqual(by_id[done]["status"], TaskStatus.SUCCESS)
+        self.assertEqual(by_id[pending]["status"], TaskStatus.CANCELLED)
+        self.assertEqual(action["status"], TaskStatus.CANCELLED)
+
+    def test_claim_unknown_task_creates_new(self):
+        action_id = self._create_action()
+        task_id = self._create_task(action_id, task_id="tk_does_not_exist")
+        self.assertNotEqual(task_id, "tk_does_not_exist")
+        self.assertEqual(len(self.queue.load_action(action_id)["tasks"]), 1)
+
     def test_task_lifecycle_and_fields(self):
         action_id = self._create_action()
         task_id = self._create_task(action_id)

@@ -114,7 +114,7 @@ class LLMClient:
         self.auto_continue_max_rounds = max(0, min(10, rounds))
 
         self._text_clients: dict[str, OpenAI] = {}
-        self._gemini_client = None
+        self._gemini_clients: dict[str, object] = {}
         self._last_usage: dict = {}
         self._estimator = TokenEstimator(self._load_calibration())
         if self.runtime is None:
@@ -308,6 +308,7 @@ class LLMClient:
                 user_prompt=original_prompt,
                 context_messages=original_context,
                 extra=extra,
+                task_id=meta.get("task_id"),
             )
         except Exception:  # pragma: no cover - 记录失败不影响生成
             logger.debug("创建任务记录失败", exc_info=True)
@@ -729,6 +730,48 @@ class LLMClient:
                 total[key] = int(total.get(key, 0)) + int(value)
 
     # -- Gemini 接口 --------------------------------------------------
+    @staticmethod
+    def _normalize_finish_reason(raw_reason) -> str | None:
+        """把不同 SDK 的 finish_reason 归一化为 openai 风格。"""
+        if raw_reason is None:
+            return None
+        text = getattr(raw_reason, "name", None) or str(raw_reason)
+        lowered = str(text).lower()
+        if "max_tokens" in lowered:
+            return "length"
+        if "stop" in lowered:
+            return "stop"
+        if "safety" in lowered or "block" in lowered:
+            return "content_filter"
+        return lowered
+
+    @staticmethod
+    def _gemini_types():
+        from google.genai import types
+
+        return types
+
+    def _gemini_client(self, runtime: RuntimeModel):
+        """创建 google-genai 新版客户端（客户端可复用）。"""
+        from google import genai
+
+        key = runtime.provider_id or runtime.model_key
+        client = self._gemini_clients.get(key)
+        if client is None:
+            client = genai.Client(api_key=runtime.api_key)
+            self._gemini_clients[key] = client
+        return client
+
+    def _gemini_config(self, runtime: RuntimeModel, prepared: PreparedRequest):
+        types = self._gemini_types()
+        generation_config = runtime.gemini_generation_config()
+        if not generation_config.get("max_output_tokens"):
+            generation_config["max_output_tokens"] = prepared.budget.max_output_tokens
+        return types.GenerateContentConfig(
+            system_instruction=prepared.system_prompt,
+            **generation_config,
+        )
+
     def _generate_gemini(
         self,
         runtime: RuntimeModel,
@@ -736,22 +779,23 @@ class LLMClient:
         progress_callback,
         task_id: str | None,
     ) -> tuple[str, dict, list[dict]]:
-        from google import genai
+        types = self._gemini_types()
+        client = self._gemini_client(runtime)
+        config = self._gemini_config(runtime, prepared)
 
-        genai.configure(api_key=runtime.api_key)
         history = []
         for message in prepared.messages[1:-1]:
             role = "user" if message.get("role") == "user" else "model"
-            history.append({"role": role, "parts": [message.get("content", "")]})
+            history.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part(text=message.get("content", ""))],
+                )
+            )
 
-        model = genai.GenerativeModel(
-            model_name=runtime.model_key,
-            system_instruction=prepared.system_prompt,
+        chat = client.chats.create(
+            model=runtime.model_key, config=config, history=history
         )
-        chat = model.start_chat(history=history)
-        generation_config = runtime.gemini_generation_config()
-        if not generation_config.get("max_output_tokens"):
-            generation_config["max_output_tokens"] = prepared.budget.max_output_tokens
 
         attempts: list[dict] = []
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -760,9 +804,7 @@ class LLMClient:
         continuation_round = 0
 
         while True:
-            response = chat.send_message(
-                current_prompt, generation_config=generation_config
-            )
+            response = chat.send_message(current_prompt)
             part = getattr(response, "text", "") or ""
             full_result += part
             self._accumulate_gemini_usage(usage_total, response)
@@ -771,7 +813,9 @@ class LLMClient:
             try:
                 candidates = getattr(response, "candidates", None) or []
                 if candidates:
-                    finish_reason = str(getattr(candidates[0], "finish_reason", None))
+                    finish_reason = self._normalize_finish_reason(
+                        getattr(candidates[0], "finish_reason", None)
+                    )
             except Exception:  # pragma: no cover
                 finish_reason = None
 
@@ -862,12 +906,13 @@ def test_runtime(runtime: RuntimeModel, prompt: str = "用一句话介绍你自�
     try:
         if runtime.api_type == "gemini":
             from google import genai
+            from google.genai import types
 
-            genai.configure(api_key=runtime.api_key)
-            model = genai.GenerativeModel(model_name=runtime.model_key)
-            response = model.generate_content(
-                prompt,
-                generation_config={"max_output_tokens": 64},
+            client = genai.Client(api_key=runtime.api_key)
+            response = client.models.generate_content(
+                model=runtime.model_key,
+                contents=prompt,
+                config=types.GenerateContentConfig(max_output_tokens=64),
             )
             text = getattr(response, "text", "") or ""
         else:

@@ -216,6 +216,41 @@ def test_quick_model_menu_lists_provider_models(window):
     assert any("测试提供商" in action.text() for action in actions if action.menu())
 
 
+def test_planned_tasks_are_claimed(window):
+    win, queue = window
+    action_id = win._task_action_begin(
+        "batch_generate", "批量生成正文（2 个节点）", reuse=False
+    )
+    planned = win._plan_tasks(
+        "生成正文",
+        [{"id": "n1", "title": "第1节"}, {"id": "n2", "title": "第2节"}],
+    )
+    assert len(planned) == 2
+    action = queue.load_action(action_id)
+    assert len(action["tasks"]) == 2
+    assert all(task["status"] == TaskStatus.PENDING for task in action["tasks"])
+
+    meta = win._task_meta("生成正文", {"id": "n1", "title": "第1节"})
+    assert meta["task_id"] == planned[0]
+    # 同一个节点的第二次请求不再复用计划任务
+    assert "task_id" not in win._task_meta("生成正文", {"id": "n1", "title": "第1节"})
+
+    claimed = queue.create_task(
+        "生成正文",
+        action_id=action_id,
+        node_id="n1",
+        user_prompt="实际请求",
+        task_id=meta["task_id"],
+    )
+    assert claimed == planned[0]
+    assert queue.load_action(action_id)["tasks"][0]["user_prompt"] == "实际请求"
+
+    win._task_action_finish()
+    final = queue.load_action(action_id)
+    statuses = {task["status"] for task in final["tasks"]}
+    assert TaskStatus.CANCELLED in statuses
+
+
 def test_switch_active_model_reloads_client(window, monkeypatch):
     win, _queue = window
     saved = {}

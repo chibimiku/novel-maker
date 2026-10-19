@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from PyQt6.QtCore import Qt
 
-from core.task_queue import TaskQueue, TaskStatus
+from core.task_queue import TaskQueue
 from ui.task_queue_dialog import TaskQueueDialog
 
 

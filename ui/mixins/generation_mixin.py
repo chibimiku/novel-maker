@@ -1056,6 +1056,9 @@ class GenerationMixin:
                 else "overwrite"
             },
         )
+        self._plan_tasks(
+            "生成概要", [node for _item, node in self.batch_summary_regen_queue]
+        )
 
         self.log_console.append(
             f"<font color='cyan'>🩺 开始批量校验概要，共 {len(self.batch_summary_regen_queue)} 个节点，"
@@ -1407,6 +1410,7 @@ class GenerationMixin:
             node_ids=[node.get("id", "") for node in valid_nodes],
             reuse=False,
         )
+        self._plan_tasks("生成正文", valid_nodes)
         self.btn_batch_generate.setText("\U0001f6d1 停止批量生成")
         self.log_console.append(
             f"<font color='cyan'>🚀 开始依次生成勾选正文，共 {len(self.batch_generate_queue)} 个节点...</font>"
@@ -1463,6 +1467,7 @@ class GenerationMixin:
                 node_ids=[node.get("id", "") for node in missing_nodes],
                 reuse=False,
             )
+            self._plan_tasks("生成正文", missing_nodes)
             self.btn_batch_generate.setText("\U0001f6d1 停止批量生成")
             self._process_next_batch_node()
 
