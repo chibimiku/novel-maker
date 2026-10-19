@@ -58,7 +58,10 @@ def window(qapp, tmp_path, monkeypatch):
 
     queue = TaskQueue(str(tmp_path / "queue"))
     monkeypatch.setattr(
-        config_mixin_module, "load_raw_config", lambda: copy.deepcopy(FIXTURE_CONFIG)
+        config_mixin_module, "load_raw_config", lambda path=None: copy.deepcopy(FIXTURE_CONFIG)
+    )
+    monkeypatch.setattr(
+        config_mixin_module, "save_raw_config", lambda cfg, path=None: True
     )
     monkeypatch.setattr(
         ConfigMixin, "_load_sys_state", lambda self: {"recent_workspaces": []}
@@ -199,3 +202,32 @@ def test_llm_client_uses_model_context_window(window):
     assert win.llm_client.text_context_size == 100000
     assert win.llm_client.token_budget().max_output_tokens == 4000
     assert win.llm_client.runtime.model_key == "test-model"
+
+
+def test_quick_model_menu_lists_provider_models(window):
+    win, _queue = window
+    win._populate_quick_model_menu()
+    actions = win.menu_quick_model.actions()
+    assert any("普通" in action.text() for action in actions)
+    submenus = [action.menu() for action in actions if action.menu() is not None]
+    assert submenus, "应至少有一个提供商子菜单"
+    model_texts = [item.text() for item in submenus[0].actions()]
+    assert any("Test Model" in text for text in model_texts)
+    assert any("测试提供商" in action.text() for action in actions if action.menu())
+
+
+def test_switch_active_model_reloads_client(window, monkeypatch):
+    win, _queue = window
+    saved = {}
+
+    def fake_save(config, path=None):
+        saved["config"] = copy.deepcopy(config)
+        return True
+
+    monkeypatch.setattr("ui.mixins.config_mixin.save_raw_config", fake_save)
+    assert win.switch_active_model("pv_test", "md_test") is True
+    profile = saved["config"]["text_api_profiles"]["normal"]
+    assert profile["provider_id"] == "pv_test"
+    assert profile["model_id"] == "md_test"
+    assert win.llm_client is not None
+    assert "已切换模型" in "\n".join(win.log_console.toPlainText().splitlines())

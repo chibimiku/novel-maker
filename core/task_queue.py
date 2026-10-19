@@ -296,6 +296,8 @@ class TaskQueue:
             action["status"] = TaskStatus.SUCCESS
             action["finished_at"] = now_iso()
             self._persist_action(action)
+            if self._active_action_id == action_id:
+                self._active_action_id = None
             changed = True
         if changed:
             self._write_index()

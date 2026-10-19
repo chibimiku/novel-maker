@@ -147,6 +147,33 @@ def test_catalog_picker_filters(qapp):
     picker.close()
 
 
+def test_fetch_models_from_provider(dialog, monkeypatch):
+    import ui.model_manager_dialog as module
+    from PyQt6.QtWidgets import QMessageBox
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "fresh-model"}, {"id": "gpt-4o"}]}
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        return FakeResponse()
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+
+    dialog._fetch_models_from_provider()
+    models = [model["model"] for model in dialog.providers[0]["models"]]
+    assert "fresh-model" in models
+    assert models.count("gpt-4o") == 1  # 已存在不重复
+    assert captured["url"].endswith("/models")
+
+
 def test_budget_preview_scales_with_context(dialog):
     dialog.model_context_spin.setValue(8000)
     dialog.model_max_output_spin.setValue(1000)

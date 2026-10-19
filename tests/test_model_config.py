@@ -104,7 +104,13 @@ class SupportedParamsTests(unittest.TestCase):
         self.assertIn("top_k", infer_supported_params("gemini-2.5-pro", "gemini"))
 
     def test_claude_supports_top_k_via_openai_compatible(self):
-        self.assertIn("top_k", infer_supported_params("anthropic/claude-sonnet-4", "openai"))
+        params = infer_supported_params("anthropic/claude-sonnet-4", "openai")
+        self.assertIn("top_k", params)
+
+    def test_claude_has_no_frequency_penalty(self):
+        params = infer_supported_params("anthropic/claude-sonnet-4", "openai")
+        self.assertNotIn("frequency_penalty", params)
+        self.assertNotIn("presence_penalty", params)
 
     def test_local_gateways_add_repetition_penalty(self):
         params = infer_supported_params("qwen2.5-14b-instruct-vllm", "openai")

@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
+import requests
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -264,10 +266,16 @@ class ModelManagerDialog(QDialog):
         self.btn_add_catalog_model.clicked.connect(self._add_models_from_catalog)
         self.btn_add_custom_model = QPushButton("➕ 自定义模型")
         self.btn_add_custom_model.clicked.connect(self._add_custom_model)
+        self.btn_fetch_models = QPushButton("🔌 拉取提供商模型")
+        self.btn_fetch_models.setToolTip(
+            "调用提供商的 /models 接口，把返回的模型批量加入当前提供商。"
+        )
+        self.btn_fetch_models.clicked.connect(self._fetch_models_from_provider)
         self.btn_remove_model = QPushButton("🗑️ 删除模型")
         self.btn_remove_model.clicked.connect(self._remove_model)
         model_buttons.addWidget(self.btn_add_catalog_model)
         model_buttons.addWidget(self.btn_add_custom_model)
+        model_buttons.addWidget(self.btn_fetch_models)
         model_buttons.addWidget(self.btn_remove_model)
         model_buttons.addStretch()
         model_layout.addLayout(model_buttons)
@@ -320,7 +328,8 @@ class ModelManagerDialog(QDialog):
         params_layout.addLayout(basic_form)
 
         supported_group = QGroupBox("该模型支持的参数")
-        supported_layout = QHBoxLayout(supported_group)
+        supported_outer = QVBoxLayout(supported_group)
+        supported_layout = QHBoxLayout()
         self.supported_checkboxes: dict[str, QCheckBox] = {}
         for name in PARAM_ORDER:
             checkbox = QCheckBox(name)
@@ -328,6 +337,14 @@ class ModelManagerDialog(QDialog):
             self.supported_checkboxes[name] = checkbox
             supported_layout.addWidget(checkbox)
         supported_layout.addStretch()
+        supported_outer.addLayout(supported_layout)
+        supported_hint = QLabel(
+            "勾选表示该模型支持该参数；还需要在下方“参数值”里勾选「启用」并填写数值，"
+            "参数才会真正随请求发送。"
+        )
+        supported_hint.setWordWrap(True)
+        supported_hint.setStyleSheet("color: gray;")
+        supported_outer.addWidget(supported_hint)
         params_layout.addWidget(supported_group)
 
         values_group = QGroupBox("参数值")
@@ -890,6 +907,83 @@ class ModelManagerDialog(QDialog):
         self._current_model_index = max(0, len(provider.get("models", [])) - 1)
         self._refresh_model_table(self._current_model_index)
         self.status_label.setText(f"已添加 {added} 个模型。")
+
+    def _fetch_models_from_provider(self):
+        """调用提供商的 /models 接口，批量补充模型。"""
+        provider = self._current_provider()
+        if provider is None:
+            QMessageBox.information(self, "提示", "请先选择或新建一个提供商。")
+            return
+        self._store_provider_form()
+        if provider.get("type") != "openai":
+            QMessageBox.information(
+                self,
+                "提示",
+                "只有 OpenAI 兼容接口支持 /models 自动拉取；"
+                "Gemini 请使用「自定义模型」手动填写。",
+            )
+            return
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            QMessageBox.warning(self, "缺少 API Key", "请先填写该提供商的 API Key。")
+            return
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        url = base_url if base_url.endswith("/models") else f"{base_url}/models"
+        proxies = None
+        proxy_cfg = self.raw_config.get("proxy", {}) if isinstance(self.raw_config, dict) else {}
+        if proxy_cfg.get("enabled") and proxy_cfg.get("url"):
+            proxies = {"http": proxy_cfg["url"], "https": proxy_cfg["url"]}
+
+        self.status_label.setText("正在拉取模型列表...")
+        self.btn_fetch_models.setEnabled(False)
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=15,
+                proxies=proxies,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            self.status_label.setText("拉取失败")
+            QMessageBox.warning(
+                self,
+                "拉取失败",
+                f"无法从提供商获取模型列表：\n{exc}\n\n可以改用「从全集添加」或「自定义模型」。",
+            )
+            return
+        finally:
+            self.btn_fetch_models.setEnabled(True)
+
+        items = data.get("data", []) if isinstance(data, dict) else []
+        model_ids = [
+            str(item.get("id", "")).strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        existing = {model.get("model") for model in provider.get("models", [])}
+        added = 0
+        for model_key in model_ids:
+            if model_key in existing:
+                continue
+            provider.setdefault("models", []).append(
+                normalize_model(
+                    {"model": model_key}, self.catalog, api_type=provider.get("type", "openai")
+                )
+            )
+            added += 1
+        self._current_model_index = max(0, len(provider.get("models", [])) - 1)
+        self._refresh_model_table(self._current_model_index)
+        self.status_label.setText(
+            f"接口返回 {len(model_ids)} 个模型，新增 {added} 个。"
+        )
+        QMessageBox.information(
+            self,
+            "拉取完成",
+            f"接口返回 {len(model_ids)} 个模型，新增 {added} 个。\n"
+            "请检查自动填充的上下文窗口是否需要调整。",
+        )
 
     def _add_custom_model(self):
         provider = self._current_provider()

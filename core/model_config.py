@@ -97,20 +97,20 @@ PARAM_DEFS: dict[str, dict[str, Any]] = {
     "frequency_penalty": {
         "label": "频率惩罚 (frequency_penalty)",
         "type": "float",
-        "default": 0.0,
+        "default": None,
         "min": -2.0,
         "max": 2.0,
         "step": 0.05,
-        "hint": "降低重复用词，0 表示不干预。",
+        "hint": "降低重复用词；默认不发送，需要时手动启用。",
     },
     "presence_penalty": {
         "label": "存在惩罚 (presence_penalty)",
         "type": "float",
-        "default": 0.0,
+        "default": None,
         "min": -2.0,
         "max": 2.0,
         "step": 0.05,
-        "hint": "鼓励引入新话题。",
+        "hint": "鼓励引入新话题；默认不发送，需要时手动启用。",
     },
     "repetition_penalty": {
         "label": "重复惩罚 (repetition_penalty)",
@@ -316,6 +316,13 @@ def infer_supported_params(
         or "top-k" in caps
     ):
         params.append("top_k")
+
+    # Anthropic 原生接口不支持 frequency/presence penalty（经 OpenRouter 转发同样会报错）
+    if "claude" in lowered or "anthropic" in lowered:
+        params = [
+            p for p in params if p not in ("frequency_penalty", "presence_penalty")
+        ]
+
     if any(marker in lowered for marker in ("vllm", "ollama", "lmstudio", "sglang")):
         for extra in ("top_k", "repetition_penalty", "min_p"):
             if extra not in params:

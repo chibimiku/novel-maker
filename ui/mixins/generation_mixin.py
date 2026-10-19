@@ -391,6 +391,9 @@ class GenerationMixin:
     def generate_current_node(self: "NovelCreatorWindow"):
         current_node = self._get_current_node_from_tree() or self.current_editing_node
         if not current_node or not self.outline_tree_data:
+            self.log_console.append(
+                "<font color='orange'>请先在大纲树中选择一个节点，再使用【生成正文】。</font>"
+            )
             return
 
         if not self.llm_client:
@@ -558,6 +561,9 @@ class GenerationMixin:
     def rewrite_current_node(self: "NovelCreatorWindow"):
         current_node = self._get_current_node_from_tree() or self.current_editing_node
         if not current_node:
+            self.log_console.append(
+                "<font color='orange'>请先在大纲树中选择一个节点，再使用【重写正文】。</font>"
+            )
             return
 
         target_content = self.content_editor.toPlainText().strip()

@@ -286,8 +286,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -304,8 +302,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -322,8 +318,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -339,8 +333,6 @@
       "params": [
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -356,8 +348,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -374,8 +364,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -392,8 +380,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -410,8 +396,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -428,8 +412,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -446,8 +428,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -464,8 +444,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -482,8 +460,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -500,8 +476,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -518,8 +492,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]
@@ -5894,8 +5866,6 @@
         "top_p",
         "top_k",
         "max_tokens",
-        "frequency_penalty",
-        "presence_penalty",
         "seed",
         "stop"
       ]

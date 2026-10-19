@@ -737,6 +737,8 @@ class NovelCreatorWindow(
         _action(setting_menu, "模型服务（提供商 / 模型 / 参数）",
                 self.open_model_manager_dialog, "Ctrl+M",
                 attr_name="action_model_service")
+        self.menu_quick_model = setting_menu.addMenu("快速切换模型")
+        self.menu_quick_model.aboutToShow.connect(self._populate_quick_model_menu)
         setting_menu.addSeparator()
         _action(setting_menu, "启用 NSFW 工作区配置",
                 self._menu_toggle_workspace_nsfw, checkable=True,
@@ -751,6 +753,50 @@ class NovelCreatorWindow(
                 attr_name="action_about")
 
     # -- 菜单辅助动作 -------------------------------------------------
+    def _populate_quick_model_menu(self):
+        """动态生成“快速切换模型”子菜单。"""
+        menu = self.menu_quick_model
+        menu.clear()
+        config = self.config or {}
+        providers = config.get("providers", []) or []
+        active_key = str(config.get("text_api_active_profile", "normal"))
+        profiles = config.get("text_api_profiles") or {}
+        profile = profiles.get(active_key) or {}
+        current_provider = profile.get("provider_id")
+        current_model = profile.get("model_id")
+
+        header = menu.addAction(
+            f"当前画像：{'NSFW' if active_key == 'nsfw' else '普通'}"
+        )
+        header.setEnabled(False)
+        if not providers:
+            empty_action = menu.addAction("（尚未配置模型，点击打开模型服务）")
+            empty_action.triggered.connect(self.open_model_manager_dialog)
+            return
+
+        for provider in providers:
+            models = provider.get("models", []) or []
+            if not models:
+                continue
+            submenu = menu.addMenu(provider.get("name") or provider.get("id", ""))
+            for model in models:
+                display = model.get("display_name") or model.get("model", "")
+                context = int(model.get("context_size", 0) or 0)
+                action = submenu.addAction(f"{display}  ({context:,} ctx)")
+                action.setCheckable(True)
+                action.setChecked(
+                    provider.get("id") == current_provider
+                    and model.get("id") == current_model
+                )
+                action.triggered.connect(
+                    lambda checked=False, p=provider.get("id", ""), m=model.get("id", ""): (
+                        self.switch_active_model(p, m)
+                    )
+                )
+        menu.addSeparator()
+        manage_action = menu.addAction("管理模型服务…")
+        manage_action.triggered.connect(self.open_model_manager_dialog)
+
     def _set_issue_panel_visible(self, checked: bool):
         if checked and not self.issue_panel_frame.isVisible():
             self._toggle_issue_panel()

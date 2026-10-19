@@ -832,3 +832,43 @@ class ConfigMixin:
                     f"(context={runtime.context_size}, max_out={runtime.max_output_tokens})</font></b>"
                 )
             self.statusBar().showMessage("模型配置已更新", 3000)
+
+    def switch_active_model(self: Any, provider_id: str, model_id: str) -> bool:
+        """快速切换当前画像使用的模型（写入配置并重建客户端）。"""
+        raw = load_raw_config()
+        if not isinstance(raw, dict):
+            return False
+        active = "nsfw" if bool(getattr(self, "_workspace_is_nsfw", False)) else str(
+            raw.get("text_api_active_profile", "normal")
+        )
+        if active not in ("normal", "nsfw"):
+            active = "normal"
+        profiles = raw.setdefault("text_api_profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            raw["text_api_profiles"] = profiles
+        profile = profiles.setdefault(active, {})
+        if not isinstance(profile, dict):
+            profile = {}
+            profiles[active] = profile
+        profile["provider_id"] = provider_id
+        profile["model_id"] = model_id
+        if not save_raw_config(raw):
+            self.log_console.append(
+                "<font color='red'>切换模型失败：无法写入 conf/setting.json。</font>"
+            )
+            return False
+        self.config = self._load_config()
+        self.llm_client = self._create_llm_client()
+        runtime = self._runtime_model()
+        if runtime is not None:
+            self.log_console.append(
+                f"<b>已切换模型：{runtime.label()} "
+                f"(context={runtime.context_size}, max_out={runtime.max_output_tokens}, "
+                f"params={runtime.params_desc()})</b>"
+            )
+        else:
+            self.log_console.append(
+                "<font color='orange'>切换后没有找到可用模型，请检查模型服务配置。</font>"
+            )
+        return True
