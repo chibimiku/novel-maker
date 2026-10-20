@@ -121,6 +121,11 @@ class LLMClient:
             logger.warning("没有可用的文本模型配置（providers 为空）")
 
     # -- 基础信息 -----------------------------------------------------
+    @property
+    def profile(self) -> dict:
+        """当前画像的行为配置（指令 / 压缩策略 / 续写等）。"""
+        return dict(self._profile)
+
     def _resolve_profile(self, profile_key: str) -> dict:
         profiles = self.config.get("text_api_profiles", {})
         if isinstance(profiles, dict):
