@@ -45,6 +45,7 @@ from ui.mixins import (
     GenerationMixin,
     EditorMixin,
     TaskMixin,
+    AgentMixin,
 )
 
 class NovelTreeWidget(QTreeWidget):
@@ -207,6 +208,7 @@ class NovelCreatorWindow(
     SettingTreeMixin,
     WorkspaceMixin,
     TaskMixin,
+    AgentMixin,
     ConfigMixin,
     QMainWindow,
 ):
@@ -573,8 +575,13 @@ class NovelCreatorWindow(
         self.log_console.append("系统初始化完成。")
         main_layout.addWidget(self.log_console, stretch=1)
 
-        # ================= 状态栏：任务队列入口 =================
+        # ================= 状态栏：Agent / 任务队列入口 =================
         statusbar = self.statusBar()
+        self.btn_agent_console = QPushButton("🤖 Agent")
+        self.btn_agent_console.setFlat(True)
+        self.btn_agent_console.setToolTip("输入命令 → 自动规划步骤 → 逐步执行（Ctrl+Shift+A）")
+        self.btn_agent_console.clicked.connect(self.open_agent_console)
+        statusbar.addPermanentWidget(self.btn_agent_console)
         self.btn_task_queue = QPushButton("📋 任务队列")
         self.btn_task_queue.setFlat(True)
         self.btn_task_queue.setToolTip("查看每个动作下所有原子任务的输入/输出（Ctrl+T）")
@@ -707,6 +714,9 @@ class NovelCreatorWindow(
         # ---------------- 工具 ----------------
         tool_menu = menubar.addMenu("工具")
         self.menus["工具"] = tool_menu
+        _action(tool_menu, "🤖 Agent 控制台（命令 → 计划 → 执行）",
+                self.open_agent_console, "Ctrl+Shift+A",
+                attr_name="action_agent_console")
         _action(tool_menu, "📋 任务队列（动作 / 任务追踪）", self.open_task_queue_dialog,
                 "Ctrl+T", attr_name="action_task_queue")
         tool_menu.addSeparator()

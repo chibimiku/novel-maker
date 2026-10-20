@@ -129,6 +129,27 @@ def test_add_models_from_catalog(dialog, monkeypatch):
     assert added["context_size"] == 1048576
 
 
+def test_preset_deepseek_and_qwen(dialog):
+    from ui.model_manager_dialog import PROVIDER_PRESETS
+
+    deepseek = next(p for p in PROVIDER_PRESETS if p["name"] == "DeepSeek 官方")
+    dialog._add_preset_provider(deepseek)
+    provider = dialog.providers[-1]
+    assert provider["name"] == "DeepSeek 官方"
+    assert provider["base_url"] == "https://api.deepseek.com"
+    models = {model["model"]: model for model in provider["models"]}
+    assert "deepseek-chat" in models
+    assert models["deepseek-chat"]["context_size"] == 163840
+
+    qwen = next(p for p in PROVIDER_PRESETS if "千问" in p["name"])
+    dialog._add_preset_provider(qwen)
+    provider = dialog.providers[-1]
+    assert "dashscope.aliyuncs.com" in provider["base_url"]
+    models = {model["model"]: model for model in provider["models"]}
+    assert "qwen-plus" in models
+    assert models["qwen-plus"]["context_size"] == 1000000
+
+
 def test_binding_change_updates_profile(dialog):
     dialog.profile_combo.setCurrentIndex(1)  # nsfw
     assert dialog.profiles["nsfw"]["provider_id"] == "pv_a"

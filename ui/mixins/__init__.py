@@ -9,6 +9,7 @@ from ui.mixins.novel_tree_mixin import NovelTreeMixin
 from ui.mixins.generation_mixin import GenerationMixin
 from ui.mixins.editor_mixin import EditorMixin
 from ui.mixins.task_mixin import TaskMixin
+from ui.mixins.agent_mixin import AgentMixin
 
 __all__ = [
     "ConfigMixin",
@@ -18,4 +19,5 @@ __all__ = [
     "GenerationMixin",
     "EditorMixin",
     "TaskMixin",
+    "AgentMixin",
 ]

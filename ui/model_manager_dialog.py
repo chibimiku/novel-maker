@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -66,6 +67,46 @@ from core.token_budget import TokenBudget
 
 
 PROFILE_LABELS = {"normal": "普通小说画像", "nsfw": "NSFW 小说画像"}
+
+#: 常用提供商预设：一键添加，模型先取常见默认值，之后仍可自由增删改
+PROVIDER_PRESETS: list[dict] = [
+    {
+        "name": "DeepSeek 官方",
+        "type": "openai",
+        "base_url": "https://api.deepseek.com",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+    },
+    {
+        "name": "阿里云百炼（千问）",
+        "type": "openai",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "models": ["qwen-plus", "qwen-max", "qwen-turbo", "qwen3-max"],
+    },
+    {
+        "name": "OpenRouter",
+        "type": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": ["openai/gpt-4o", "anthropic/claude-sonnet-4.5", "deepseek/deepseek-chat"],
+    },
+    {
+        "name": "OpenAI 官方",
+        "type": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "models": ["gpt-4o", "gpt-4.1-mini"],
+    },
+    {
+        "name": "Moonshot Kimi",
+        "type": "openai",
+        "base_url": "https://api.moonshot.cn/v1",
+        "models": ["moonshot-v1-8k", "kimi-k2"],
+    },
+    {
+        "name": "本地 Ollama",
+        "type": "openai",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "models": ["qwen3:8b", "qwen2.5:14b"],
+    },
+]
 
 
 class CatalogPickerDialog(QDialog):
@@ -198,11 +239,15 @@ class ModelManagerDialog(QDialog):
         provider_buttons = QHBoxLayout()
         self.btn_add_provider = QPushButton("➕ 新增")
         self.btn_add_provider.clicked.connect(self._add_provider)
+        self.btn_preset_provider = QPushButton("⚡ 预设")
+        self.btn_preset_provider.setToolTip("一键添加 DeepSeek / 千问 / OpenRouter 等常用提供商")
+        self.btn_preset_provider.clicked.connect(self._show_preset_menu)
         self.btn_remove_provider = QPushButton("🗑️ 删除")
         self.btn_remove_provider.clicked.connect(self._remove_provider)
         self.btn_dup_provider = QPushButton("📄 复制")
         self.btn_dup_provider.clicked.connect(self._duplicate_provider)
         provider_buttons.addWidget(self.btn_add_provider)
+        provider_buttons.addWidget(self.btn_preset_provider)
         provider_buttons.addWidget(self.btn_dup_provider)
         provider_buttons.addWidget(self.btn_remove_provider)
         provider_layout.addLayout(provider_buttons)
@@ -624,6 +669,45 @@ class ModelManagerDialog(QDialog):
             QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
         )
         self.btn_toggle_key.setText("隐藏" if checked else "显示")
+
+    def _show_preset_menu(self):
+        menu = QMenu(self)
+        for preset in PROVIDER_PRESETS:
+            action = menu.addAction(f"{preset['name']}  ·  {preset['base_url']}")
+            action.triggered.connect(
+                lambda checked=False, item=preset: self._add_preset_provider(item)
+            )
+        menu.exec(
+            self.btn_preset_provider.mapToGlobal(
+                self.btn_preset_provider.rect().bottomLeft()
+            )
+        )
+
+    def _add_preset_provider(self, preset: dict):
+        self._store_provider_form()
+        api_type = str(preset.get("type", "openai"))
+        models = [
+            normalize_model({"model": name}, self.catalog, api_type=api_type)
+            for name in preset.get("models", [])
+        ]
+        provider = normalize_provider(
+            {
+                "id": new_id("pv"),
+                "name": preset.get("name", "预设提供商"),
+                "type": api_type,
+                "base_url": preset.get("base_url", ""),
+                "api_key": "",
+                "timeout": 120,
+                "models": models,
+            },
+            self.catalog,
+        )
+        self.providers.append(provider)
+        self._refresh_provider_list(len(self.providers) - 1)
+        self.provider_api_key_input.setFocus()
+        self.status_label.setText(
+            f"已添加预设【{preset.get('name', '')}】，请填写 API Key 后再保存。"
+        )
 
     def _add_provider(self):
         self._store_provider_form()
